@@ -22,6 +22,11 @@ export default defineConfig({
   preview: {
     headers: { "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" },
   },
+  build: {
+    rollupOptions: {
+      input: path.resolve(__dirname, "app.html"),
+    },
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),
