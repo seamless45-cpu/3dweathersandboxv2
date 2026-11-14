@@ -10,6 +10,8 @@ const EYE_HEIGHT_M = 1.7;
 const DEFAULT_YAW = 0.0; // Facing North (-Z) across open plains
 const DEFAULT_PITCH = 0.2; // ~11.5 degrees upward so sky occupies ~75% of viewport
 const DEFAULT_FOV = 64;
+export const GROUND_WALK_SPEED_KMH = 120;
+const GROUND_WALK_SPEED_MS = GROUND_WALK_SPEED_KMH / 3.6;
 
 export class ObserverCameraController {
   public camera: THREE.PerspectiveCamera;
@@ -29,6 +31,9 @@ export class ObserverCameraController {
   private orbitTarget = new THREE.Vector3(0, 4200, -1500);
 
   private keysPressed = new Set<string>();
+  private keyboardControlsEnabled = true;
+  private joystickForward = 0;
+  private joystickStrafe = 0;
   private isDragging = false;
   private prevPointerX = 0;
   private prevPointerY = 0;
@@ -68,6 +73,16 @@ export class ObserverCameraController {
     window.removeEventListener('keyup', this.onKeyUp);
   }
 
+  public setKeyboardControlsEnabled(enabled: boolean): void {
+    this.keyboardControlsEnabled = enabled;
+    if (!enabled) this.keysPressed.clear();
+  }
+
+  public setJoystickInput(forward: number, strafe: number): void {
+    this.joystickForward = Math.max(-1, Math.min(1, forward));
+    this.joystickStrafe = Math.max(-1, Math.min(1, strafe));
+  }
+
   public resetToGroundObserver(): void {
     this.mode = 'ground';
     this.posX = DEFAULT_X;
@@ -101,38 +116,45 @@ export class ObserverCameraController {
   }
 
   public nudgeMove(forward: number, strafe: number, dt: number): void {
-    const speed = this.mode === 'ground' ? 35.0 : 950.0; // Fast walk/jog on ground, aircraft speed elevated
+    const speed = this.mode === 'ground' ? GROUND_WALK_SPEED_MS : 950.0;
+    const length = Math.hypot(forward, strafe) || 1;
+    const f = forward / length;
+    const s = strafe / length;
     const sinY = Math.sin(this.yaw);
     const cosY = Math.cos(this.yaw);
-    this.posX += (-sinY * forward + cosY * strafe) * speed * dt;
-    this.posZ += (-cosY * forward - sinY * strafe) * speed * dt;
+    this.posX += (-sinY * f + cosY * s) * speed * dt;
+    this.posZ += (-cosY * f - sinY * s) * speed * dt;
     this.clampPosition();
   }
 
   public update(dt: number): void {
     if (this.mode !== 'orbit') {
-      let forward = 0;
-      let strafe = 0;
+      let forward = this.joystickForward;
+      let strafe = this.joystickStrafe;
       let vert = 0;
 
-      if (this.keysPressed.has('KeyW') || this.keysPressed.has('ArrowUp')) forward += 1;
-      if (this.keysPressed.has('KeyS') || this.keysPressed.has('ArrowDown')) forward -= 1;
-      if (this.keysPressed.has('KeyD') || this.keysPressed.has('ArrowRight')) strafe += 1;
-      if (this.keysPressed.has('KeyA') || this.keysPressed.has('ArrowLeft')) strafe -= 1;
-      if (this.keysPressed.has('KeyE') || this.keysPressed.has('Space')) vert += 1;
-      if (this.keysPressed.has('KeyQ') || this.keysPressed.has('ShiftLeft')) vert -= 1;
+      if (this.keyboardControlsEnabled) {
+        if (this.keysPressed.has('KeyW') || this.keysPressed.has('ArrowUp')) forward += 1;
+        if (this.keysPressed.has('KeyS') || this.keysPressed.has('ArrowDown')) forward -= 1;
+        if (this.keysPressed.has('KeyD') || this.keysPressed.has('ArrowRight')) strafe += 1;
+        if (this.keysPressed.has('KeyA') || this.keysPressed.has('ArrowLeft')) strafe -= 1;
+        if (this.keysPressed.has('KeyE') || this.keysPressed.has('Space')) vert += 1;
+        if (this.keysPressed.has('KeyQ') || this.keysPressed.has('ShiftLeft')) vert -= 1;
+      }
 
-      const sprint = this.keysPressed.has('ShiftRight') ? 3.5 : 1.0;
-      const baseSpeed = this.mode === 'ground' ? 18.0 * sprint : 1100.0 * sprint;
+      const len = Math.hypot(forward, strafe);
+      if (len > 1) {
+        forward /= len;
+        strafe /= len;
+      }
+      const sprint = this.mode === 'ground' || !this.keysPressed.has('ShiftRight') ? 1.0 : 1.5;
+      const baseSpeed = this.mode === 'ground' ? GROUND_WALK_SPEED_MS : 1100.0 * sprint;
 
       if (forward !== 0 || strafe !== 0) {
-        const len = Math.hypot(forward, strafe);
-        const f = forward / len;
-        const s = strafe / len;
         const sinY = Math.sin(this.yaw);
         const cosY = Math.cos(this.yaw);
-        this.posX += (-sinY * f + cosY * s) * baseSpeed * dt;
-        this.posZ += (-cosY * f - sinY * s) * baseSpeed * dt;
+        this.posX += (-sinY * forward + cosY * strafe) * baseSpeed * dt;
+        this.posZ += (-cosY * forward - sinY * strafe) * baseSpeed * dt;
       }
 
       this.clampPosition();
@@ -230,9 +252,16 @@ export class ObserverCameraController {
   };
 
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) {
+    if (!this.keyboardControlsEnabled) return;
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) {
       return;
     }
+    const movementKey = [
+      'KeyW', 'KeyA', 'KeyS', 'KeyD',
+      'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+      'KeyE', 'KeyQ', 'Space', 'ShiftLeft', 'ShiftRight',
+    ].includes(e.code);
+    if (movementKey) e.preventDefault();
     this.keysPressed.add(e.code);
   };
 

@@ -9,6 +9,8 @@ import {
   Play,
   RotateCcw,
   Sliders,
+  Volume2,
+  VolumeX,
   Zap,
 } from 'lucide-react';
 import { CameraMode } from '../render/cameraController';
@@ -34,6 +36,8 @@ interface TopToolbarProps {
   onHideUI: () => void;
   telemetry: SimulationTelemetrySnapshot;
   perf: PerformanceMetrics;
+  audioEnabled: boolean;
+  onToggleAudio: () => void | Promise<void>;
 }
 
 const SPEED_OPTIONS = [1, 5, 12, 25, 45];
@@ -69,6 +73,8 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   onHideUI,
   telemetry,
   perf,
+  audioEnabled,
+  onToggleAudio,
 }) => {
   const statusColor =
     telemetry.organization === 'Supercell Thunderstorm'
@@ -239,6 +245,21 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
           <span className="font-mono bg-white/10 px-1 rounded text-[9px]">
             {telemetry.totalFlashes + telemetry.totalTLEs}
           </span>
+        </button>
+
+        <button
+          onClick={() => { void onToggleAudio(); }}
+          aria-pressed={audioEnabled}
+          aria-label={audioEnabled ? 'Mute sound' : 'Enable sound'}
+          title={audioEnabled ? 'Mute wind, rain and thunder' : 'Enable synthesized storm ambience and thunder'}
+          className={`flex items-center gap-1 px-2 py-1 rounded border text-[10px] transition cursor-pointer ${
+            audioEnabled
+              ? 'bg-emerald-500/20 border-emerald-400/30 text-emerald-100'
+              : 'bg-slate-900/80 border-white/10 text-slate-300 hover:bg-slate-800'
+          }`}
+        >
+          {audioEnabled ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
+          <span className="hidden sm:inline">Sound</span>
         </button>
 
         <button

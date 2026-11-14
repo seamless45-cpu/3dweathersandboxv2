@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Eye, Move } from 'lucide-react';
+import { Eye } from 'lucide-react';
+import { StormAudio } from './audio/stormAudio';
 import { CameraMode } from './render/cameraController';
 import { AtmosphericSceneEngine } from './render/sceneEngine';
 import { AtmosphereSimulationCoordinator } from './sim/atmosphereCoordinator';
@@ -14,12 +15,21 @@ import {
 import { EventMonitor } from './ui/EventMonitor';
 import { SettingsDrawer } from './ui/SettingsDrawer';
 import { TopToolbar } from './ui/TopToolbar';
+import { VirtualJoystick } from './ui/VirtualJoystick';
+
+function detectMobileControls(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia('(pointer: coarse) and (max-width: 768px)').matches;
+}
 
 export function App() {
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const coordinatorRef = useRef<AtmosphereSimulationCoordinator | null>(null);
   const perfMgrRef = useRef<AdaptivePerformanceManager | null>(null);
   const engineRef = useRef<AtmosphericSceneEngine | null>(null);
+  const audioRef = useRef<StormAudio | null>(null);
+  const joystickRef = useRef({ forward: 0, strafe: 0 });
+  const [mobileControls, setMobileControls] = useState(detectMobileControls);
+  const [audioEnabled, setAudioEnabled] = useState(false);
 
   // Simulation playback & UI state
   const [paused, setPaused] = useState(false);
@@ -30,7 +40,6 @@ export function App() {
   const [monitorOpen, setMonitorOpen] = useState(false);
   const [uiHidden, setUiHidden] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [touchPadOpen, setTouchPadOpen] = useState(false);
 
   // Lazy-init simulation coordinator & performance manager once
   if (!coordinatorRef.current) {
@@ -60,12 +69,30 @@ export function App() {
   simSpeedRef.current = simSpeed;
 
   useEffect(() => {
+    const media = window.matchMedia('(pointer: coarse) and (max-width: 768px)');
+    const update = () => setMobileControls(media.matches);
+    update();
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
+    engineRef.current?.cameraCtrl.setKeyboardControlsEnabled(!mobileControls);
+    if (!mobileControls) {
+      joystickRef.current = { forward: 0, strafe: 0 };
+      engineRef.current?.cameraCtrl.setJoystickInput(0, 0);
+    }
+  }, [mobileControls]);
+
+  useEffect(() => {
     const container = canvasHostRef.current;
     const coordinator = coordinatorRef.current!;
     const perfMgr = perfMgrRef.current!;
     if (!container) return;
 
     const engine = new AtmosphericSceneEngine(container, coordinator, perfMgr);
+    engine.cameraCtrl.setKeyboardControlsEnabled(!mobileControls);
+    engine.cameraCtrl.setJoystickInput(joystickRef.current.forward, joystickRef.current.strafe);
     engineRef.current = engine;
 
     const handleResize = () => {
@@ -118,6 +145,12 @@ export function App() {
       );
       const tPhys1 = performance.now();
 
+      engine.cameraCtrl.setJoystickInput(joystickRef.current.forward, joystickRef.current.strafe);
+      audioRef.current?.syncLightning(coordinator.lightning.activeDischarges, {
+        x: engine.cameraCtrl.posX,
+        y: engine.cameraCtrl.posY,
+        z: engine.cameraCtrl.posZ,
+      });
       engine.renderFrame(realDtSec, coordinator, perfMgr);
       const tRend1 = performance.now();
 
@@ -135,6 +168,7 @@ export function App() {
       if (uiSyncAccum >= 0.16) {
         uiSyncAccum = 0;
         setTelemetry(coordinator.getTelemetrySnapshot());
+        audioRef.current?.setEnvironment(coordinator.config.surfaceWindSpeedMS, coordinator.observerRainMMHr);
         setPerf({ ...perfMgr.metrics });
         setFov(engine.cameraCtrl.fov);
       }
@@ -221,9 +255,26 @@ export function App() {
     }
   }, []);
 
-  const nudgeStep = (fwd: number, str: number) => {
-    engineRef.current?.cameraCtrl.nudgeMove(fwd, str, 0.25);
-  };
+  const handleJoystickMove = useCallback((vector: { forward: number; strafe: number }) => {
+    joystickRef.current = vector;
+    engineRef.current?.cameraCtrl.setJoystickInput(vector.forward, vector.strafe);
+  }, []);
+
+  const handleToggleAudio = useCallback(async () => {
+    if (audioEnabled) {
+      audioRef.current?.disable();
+      setAudioEnabled(false);
+      return;
+    }
+    const audio = audioRef.current ?? new StormAudio();
+    audioRef.current = audio;
+    setAudioEnabled(await audio.enable());
+  }, [audioEnabled]);
+
+  useEffect(() => () => {
+    audioRef.current?.dispose();
+    audioRef.current = null;
+  }, []);
 
   const latestEvent = telemetry.events[0] ?? null;
 
@@ -264,6 +315,8 @@ export function App() {
             onHideUI={() => setUiHidden(true)}
             telemetry={telemetry}
             perf={perf}
+            audioEnabled={audioEnabled}
+            onToggleAudio={handleToggleAudio}
           />
 
           {/* Middle Floating Collapsible Drawers */}
@@ -315,49 +368,11 @@ export function App() {
               </span>
               <span className="text-slate-600 hidden lg:inline">·</span>
               <span className="text-slate-400 hidden lg:inline">
-                Drag sky to look · WASD walk · Scroll FOV · H hide UI
+                {mobileControls
+                  ? 'Drag sky to look · joystick to move'
+                  : 'WASD / arrows · 120 km/h · drag to look · H hide UI'}
               </span>
-
-              <button
-                onClick={() => setTouchPadOpen((t) => !t)}
-                title="Toggle On-Screen Walk Pad"
-                className="sm:hidden ml-1 p-0.5 rounded bg-white/10 text-slate-200 cursor-pointer"
-              >
-                <Move className="w-3 h-3" />
-              </button>
             </div>
-
-            {/* Compact Touch Walk Pad (when toggled on mobile/tablet) */}
-            {touchPadOpen && (
-              <div className="pointer-events-auto grid grid-cols-3 gap-1 bg-slate-950/75 border border-white/15 rounded p-1 text-[10px] font-mono">
-                <div />
-                <button
-                  onClick={() => nudgeStep(1, 0)}
-                  className="px-2 py-1 rounded bg-white/10 active:bg-sky-500/40 text-slate-100"
-                >
-                  W
-                </button>
-                <div />
-                <button
-                  onClick={() => nudgeStep(0, -1)}
-                  className="px-2 py-1 rounded bg-white/10 active:bg-sky-500/40 text-slate-100"
-                >
-                  A
-                </button>
-                <button
-                  onClick={() => nudgeStep(-1, 0)}
-                  className="px-2 py-1 rounded bg-white/10 active:bg-sky-500/40 text-slate-100"
-                >
-                  S
-                </button>
-                <button
-                  onClick={() => nudgeStep(0, 1)}
-                  className="px-2 py-1 rounded bg-white/10 active:bg-sky-500/40 text-slate-100"
-                >
-                  D
-                </button>
-              </div>
-            )}
 
             {/* Compact Latest Autonomous Discharge Pill (when Event Monitor drawer is closed) */}
             {!monitorOpen && latestEvent && (
@@ -378,6 +393,7 @@ export function App() {
           </footer>
         </div>
       )}
+      {mobileControls && !uiHidden && <VirtualJoystick onMove={handleJoystickMove} />}
     </div>
   );
 }

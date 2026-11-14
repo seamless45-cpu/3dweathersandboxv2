@@ -362,17 +362,25 @@ export class AutonomousLightningEngine {
       continuingCurrentMs = hasContinuingCurrent ? 30 + this.rand() * 55 : 0;
     }
 
-    // Charge Transferred (C) & Peak Current (kA) derived from E-field excess & channel reservoir volume
-    const baseChargeC =
-      (3.5 + channelLengthKm * 0.65) *
-      cand.ratio *
-      (classification === 'Positive CG (+CG)' ? 2.4 : 1.0) *
-      (hasContinuingCurrent ? 1.45 : 1.0);
-    const chargeTransferredC = Math.min(145.0, baseChargeC);
-    const peakCurrentKA =
-      (classification === 'Positive CG (+CG)' ? 68 : 26) *
-      cand.ratio *
-      (0.75 + 0.55 * this.rand());
+    // Estimate return-stroke current from field overdrive, then integrate I·dt
+    // (1 kA·ms = 1 C) for a charge transfer consistent with the stroke waveform.
+    const peakCurrentKA = Math.max(
+      8,
+      Math.min(
+        250,
+        (classification === 'Positive CG (+CG)' ? 68 : 26) *
+          Math.sqrt(Math.max(0.25, cand.ratio)) *
+          (0.78 + 0.42 * this.rand())
+      )
+    );
+    const returnStrokeMs = 0.75 + Math.min(1.2, channelLengthKm * 0.035);
+    const continuingCurrentKA = hasContinuingCurrent
+      ? Math.max(0.25, Math.min(1.15, 0.28 + peakCurrentKA * 0.008))
+      : 0;
+    const chargeTransferredC = Math.min(
+      145.0,
+      peakCurrentKA * returnStrokeMs + continuingCurrentKA * continuingCurrentMs
+    );
 
     const sourceAltKm = Math.max(2.0, initY / 1000.0);
     const chargeMomentChangeCKm = hitGround
