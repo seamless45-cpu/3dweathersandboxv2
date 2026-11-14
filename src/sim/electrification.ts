@@ -20,7 +20,17 @@ export interface BreakdownCandidate {
 }
 
 export function breakdownThresholdKVm(rhoKgM3: number): number {
+  // Empirical cloud-air runaway/breakdown threshold scaled to local air density.
   return 206.0 * (rhoKgM3 / 1.225);
+}
+
+export function mixedPhaseChargeReversalFraction(lwcGKg: number, temperatureK: number): number {
+  // Laboratory charging polarity depends on both temperature and liquid-water
+  // content. This smooth reversal curve is an empirical bulk parameterization,
+  // not a claim to resolve individual ice-graupel collisions.
+  const temperatureC = temperatureK - PHYS.T_FREEZE;
+  const reversalLwc = Math.max(0.45, Math.min(1.8, 1.15 + (temperatureC + 15) * 0.022));
+  return 1 / (1 + Math.exp(-(lwcGKg - reversalLwc) * 2.4));
 }
 
 export class AtmosphericElectrificationEngine {
@@ -52,9 +62,13 @@ export class AtmosphericElectrificationEngine {
     cfg: AtmosphereConfig
   ): BreakdownCandidate[] {
     const inst = sounding.instability;
+    const mixedPhaseTemperatureK = sounding.sampleAtAltitude(
+      inst.freezingLevel + Math.min(1800, Math.max(500, (inst.homogeneousFreezeLevel - inst.freezingLevel) * 0.35))
+    ).tempK;
     let anyElectrifiedCell = false;
 
-    // 1. Update Charge Separation per Convective Cell via Non-Inductive (Takahashi) & Inductive Physics
+    // 1. Update charge separation from mixed-phase ice/graupel collisions and
+    // field-enhanced inductive charging. The polarity reversal depends on T and LWC.
     for (const cell of cells) {
       const hasMixedPhase =
         cell.cloudTopM > inst.freezingLevel + 400 &&
@@ -62,35 +76,39 @@ export class AtmosphericElectrificationEngine {
         cell.cloudIceGKg > 0.04;
 
       if (hasMixedPhase && cell.updraftMaxMS > 2.2) {
+        const temperatureWindow = Math.exp(-Math.pow((mixedPhaseTemperatureK - 258.15) / 17.0, 2));
         const collisionKernel =
           cell.graupelGKg *
           cell.cloudIceGKg *
           Math.min(2.4, 0.28 + cell.supercooledWaterGKg * 1.55) *
           Math.min(2.8, cell.updraftMaxMS / 10.0) *
+          temperatureWindow *
           cfg.chargeSeparationGain;
 
-        const highLwcAnomalousFactor = Math.min(0.65, cell.supercooledWaterGKg / 3.4);
-
+        const reversalFraction = mixedPhaseChargeReversalFraction(
+          cell.supercooledWaterGKg,
+          mixedPhaseTemperatureK
+        );
+        const mainLayerSign = 1.0 - 2.0 * reversalFraction;
+        const upperShare = 1.0 - 0.36 * Math.min(0.9, reversalFraction);
+        const lowerShare = 0.14 + 0.36 * Math.min(0.9, reversalFraction);
+        const totalPositiveShare = upperShare + lowerShare;
         const dqTotal = 0.115 * collisionKernel * dt;
-        const fracUpperPos = 1.0 - 0.36 * highLwcAnomalousFactor;
-        const fracLowerPos = 0.36 * highLwcAnomalousFactor + 0.14;
-        const sumPos = fracUpperPos + fracLowerPos;
+        const upperDelta = -mainLayerSign * dqTotal * (upperShare / totalPositiveShare);
+        const lowerDelta = -mainLayerSign * dqTotal * (lowerShare / totalPositiveShare);
+        const mainDelta = mainLayerSign * dqTotal;
 
-        cell.upperPosChargeNCm3 = Math.min(
-          5.2,
-          cell.upperPosChargeNCm3 + dqTotal * (fracUpperPos / sumPos)
-        );
-        cell.lowerPosChargeNCm3 = Math.min(
-          3.1,
-          cell.lowerPosChargeNCm3 + dqTotal * (fracLowerPos / sumPos)
-        );
-        cell.mainNegChargeNCm3 = Math.max(-5.6, cell.mainNegChargeNCm3 - dqTotal);
+        // The transferred charge is pairwise balanced: upper + lower + main = 0
+        // before the independent corona/precipitation leakage terms are applied.
+        cell.upperPosChargeNCm3 = Math.max(-5.4, Math.min(5.4, cell.upperPosChargeNCm3 + upperDelta));
+        cell.lowerPosChargeNCm3 = Math.max(-3.4, Math.min(3.4, cell.lowerPosChargeNCm3 + lowerDelta));
+        cell.mainNegChargeNCm3 = Math.max(-5.8, Math.min(5.8, cell.mainNegChargeNCm3 + mainDelta));
 
         if (cell.peakElectricFieldKVm > 35.0) {
           const indRate = 0.004 * (cell.peakElectricFieldKVm / 100.0) * cell.graupelGKg * dt;
-          cell.upperPosChargeNCm3 = Math.min(5.4, cell.upperPosChargeNCm3 + indRate * 0.7);
-          cell.lowerPosChargeNCm3 = Math.min(3.3, cell.lowerPosChargeNCm3 + indRate * 0.3);
-          cell.mainNegChargeNCm3 = Math.max(-5.8, cell.mainNegChargeNCm3 - indRate);
+          cell.upperPosChargeNCm3 = Math.max(-5.6, Math.min(5.6, cell.upperPosChargeNCm3 - mainLayerSign * indRate * 0.7));
+          cell.lowerPosChargeNCm3 = Math.max(-3.5, Math.min(3.5, cell.lowerPosChargeNCm3 - mainLayerSign * indRate * 0.3));
+          cell.mainNegChargeNCm3 = Math.max(-6.0, Math.min(6.0, cell.mainNegChargeNCm3 + mainLayerSign * indRate));
         }
 
         if (cell.anvilRadiusM > 2200) {

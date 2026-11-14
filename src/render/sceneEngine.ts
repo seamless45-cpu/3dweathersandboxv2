@@ -56,7 +56,6 @@ export class AtmosphericSceneEngine {
   private width = 1;
   private height = 1;
   private dpr = 1;
-  private currentVolumetricScale = 0.68;
   private frameIndex = 0;
   private realTimeElapsed = 0;
   private windOffset = new THREE.Vector3();
@@ -221,7 +220,6 @@ export class AtmosphericSceneEngine {
   }
 
   public allocateRenderTargets(volScale: number): void {
-    this.currentVolumetricScale = volScale;
     const pixelW = Math.max(2, Math.floor(this.width * this.dpr));
     const pixelH = Math.max(2, Math.floor(this.height * this.dpr));
     const volW = Math.max(2, Math.floor(pixelW * volScale));

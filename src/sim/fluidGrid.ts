@@ -22,6 +22,13 @@ export class AtmosphericFluidGrid {
   public u: Float32Array;
   public vy: Float32Array;
   public w: Float32Array;
+  private uPrev: Float32Array;
+  private vyPrev: Float32Array;
+  private wPrev: Float32Array;
+  private pressure: Float32Array;
+  private pressureNext: Float32Array;
+  private divergence: Float32Array;
+  private velocityInitialized = false;
   public qc: Float32Array; // liquid cloud condensate (g/kg)
   public qi: Float32Array; // ice & snow condensate (g/kg)
   public qr: Float32Array; // rain + graupel + hail precipitation density (g/kg)
@@ -65,6 +72,12 @@ export class AtmosphericFluidGrid {
     this.u = new Float32Array(this.totalCells);
     this.vy = new Float32Array(this.totalCells);
     this.w = new Float32Array(this.totalCells);
+    this.uPrev = new Float32Array(this.totalCells);
+    this.vyPrev = new Float32Array(this.totalCells);
+    this.wPrev = new Float32Array(this.totalCells);
+    this.pressure = new Float32Array(this.totalCells);
+    this.pressureNext = new Float32Array(this.totalCells);
+    this.divergence = new Float32Array(this.totalCells);
     this.qc = new Float32Array(this.totalCells);
     this.qi = new Float32Array(this.totalCells);
     this.qr = new Float32Array(this.totalCells);
@@ -90,6 +103,13 @@ export class AtmosphericFluidGrid {
     this.u.fill(0);
     this.vy.fill(0);
     this.w.fill(0);
+    this.uPrev.fill(0);
+    this.vyPrev.fill(0);
+    this.wPrev.fill(0);
+    this.pressure.fill(0);
+    this.pressureNext.fill(0);
+    this.divergence.fill(0);
+    this.velocityInitialized = false;
     this.qc.fill(0);
     this.qi.fill(0);
     this.qr.fill(0);
@@ -159,6 +179,7 @@ export class AtmosphericFluidGrid {
     const nz = this.nz;
     const slice = this.sliceStride;
     const inst = sounding.instability;
+    const forcingBlend = 1.0 - Math.exp(-Math.min(dt, 2.0) * 0.9);
 
     for (let iy = 0; iy < ny; iy++) {
       const y = this.gridToWorldY(iy);
@@ -173,18 +194,9 @@ export class AtmosphericFluidGrid {
       this.advectAllCondensatesFused(dt);
     }
 
-    // Initialize ambient sheared winds
-    for (let iz = 0; iz < nz; iz++) {
-      const zOff = slice * iz;
-      for (let iy = 0; iy < ny; iy++) {
-        const u0 = this.ambU[iy];
-        const w0 = this.ambW[iy];
-        const rowOffset = zOff + nx * iy;
-        this.u.fill(u0, rowOffset, rowOffset + nx);
-        this.vy.fill(0, rowOffset, rowOffset + nx);
-        this.w.fill(w0, rowOffset, rowOffset + nx);
-      }
-    }
+    // Advect the previous 3D wind field back through itself, then relax it toward
+    // the sounding profile. Convective forcing below modifies this persistent flow.
+    this.advectVelocityField(dt);
 
     // Inject surface Cold Pool outflow winds & gust front convergence
     if (coldPools.length > 0) {
@@ -216,13 +228,16 @@ export class AtmosphericFluidGrid {
               if (y > pool.depthM * 1.35) break;
               const vertWeight = Math.max(0, 1.0 - y / (pool.depthM * 1.3));
               const id = ix + nx * iy + slice * iz;
-              this.u[id] += rx * outSpeed * vertWeight;
-              this.w[id] += rz * outSpeed * vertWeight;
-              this.vy[id] +=
+              const targetU = this.ambU[iy] + rx * outSpeed * vertWeight;
+              const targetW = this.ambW[iy] + rz * outSpeed * vertWeight;
+              const targetV =
                 frontBand *
                 pool.expansionSpeedMS *
                 0.42 *
                 Math.sin((y / (pool.depthM * 1.3)) * Math.PI);
+              this.u[id] += (targetU - this.u[id]) * forcingBlend;
+              this.w[id] += (targetW - this.w[id]) * forcingBlend;
+              this.vy[id] += (targetV - this.vy[id]) * forcingBlend;
             }
           }
         }
@@ -326,12 +341,14 @@ export class AtmosphericFluidGrid {
                 if (towerIce > this.qi[id]) this.qi[id] = towerIce;
 
                 const updraftCore = cell.updraftMaxMS * radialDensity * Math.sin(zFrac * Math.PI);
-                this.vy[id] += updraftCore;
+                this.vy[id] += (updraftCore - this.vy[id]) * forcingBlend;
 
                 if (isSupercell && distCore > 80) {
                   const vTangential = cell.mesocycloneVorticity * distCore * radialDensity * 0.65;
-                  this.u[id] += (-dzCore / distCore) * vTangential;
-                  this.w[id] += (dxCore / distCore) * vTangential;
+                  const targetU = this.ambU[iy] + (-dzCore / distCore) * vTangential;
+                  const targetW = this.ambW[iy] + (dxCore / distCore) * vTangential;
+                  this.u[id] += (targetU - this.u[id]) * forcingBlend;
+                  this.w[id] += (targetW - this.w[id]) * forcingBlend;
                 }
               }
             }
@@ -367,8 +384,10 @@ export class AtmosphericFluidGrid {
 
                 const rAnv = Math.max(200, Math.hypot(dAx, dAz));
                 const divSpeed = 6.0 * horizAnvil * vertAnvil;
-                this.u[id] += (dAx / rAnv) * divSpeed;
-                this.w[id] += (dAz / rAnv) * divSpeed;
+                const targetU = this.ambU[iy] + (dAx / rAnv) * divSpeed;
+                const targetW = this.ambW[iy] + (dAz / rAnv) * divSpeed;
+                this.u[id] += (targetU - this.u[id]) * forcingBlend;
+                this.w[id] += (targetW - this.w[id]) * forcingBlend;
               }
             }
 
@@ -390,13 +409,18 @@ export class AtmosphericFluidGrid {
                     : 1.0;
                 const localPrecip = precipTotal * radWeight * subCloudAtten;
                 if (localPrecip > this.qr[id]) this.qr[id] = localPrecip;
-                this.vy[id] -= cell.downdraftMaxMS * radWeight * (wy < baseM + 1200 ? 1.0 : 0.55);
+                const downdraft = -cell.downdraftMaxMS * radWeight * (wy < baseM + 1200 ? 1.0 : 0.55);
+                this.vy[id] += (downdraft - this.vy[id]) * forcingBlend;
               }
             }
           }
         }
       }
     }
+
+    // Low-Mach anelastic pressure projection removes non-physical convergence
+    // while retaining density-weighted vertical mass continuity.
+    this.projectAnelasticVelocity();
 
     // Decay 3D internal lightning flash illumination when active
     if (this.hasActiveFlash) {
@@ -417,6 +441,149 @@ export class AtmosphericFluidGrid {
       this.maxCFL = Math.min(0.4, (Math.abs(this.ambU[10]) / this.dx) * Math.min(dt, 2.0));
       this.totalCondensateMassKg = 0;
       this.domainCloudCoverFraction = 0;
+    }
+  }
+
+  private advectVelocityField(dt: number): void {
+    const { nx, ny, nz, sliceStride: slice } = this;
+    if (!this.velocityInitialized) {
+      for (let iz = 0; iz < nz; iz++) {
+        const zOff = slice * iz;
+        for (let iy = 0; iy < ny; iy++) {
+          const row = zOff + nx * iy;
+          this.u.fill(this.ambU[iy], row, row + nx);
+          this.vy.fill(0, row, row + nx);
+          this.w.fill(this.ambW[iy], row, row + nx);
+        }
+      }
+      this.velocityInitialized = true;
+      return;
+    }
+
+    this.uPrev.set(this.u);
+    this.vyPrev.set(this.vy);
+    this.wPrev.set(this.w);
+    const advDt = Math.min(4, Math.max(0, dt));
+    const horizontalDamping = Math.exp(-0.035 * advDt);
+    const verticalDamping = Math.exp(-0.13 * advDt);
+
+    for (let iz = 0; iz < nz; iz++) {
+      const zOff = slice * iz;
+      for (let iy = 0; iy < ny; iy++) {
+        const row = zOff + nx * iy;
+        for (let ix = 0; ix < nx; ix++) {
+          const id = row + ix;
+          if (ix === 0 || ix === nx - 1 || iy === 0 || iy === ny - 1 || iz === 0 || iz === nz - 1) {
+            this.u[id] = this.ambU[iy];
+            this.vy[id] = 0;
+            this.w[id] = this.ambW[iy];
+            continue;
+          }
+          const srcX = ix - this.uPrev[id] * advDt / this.dx;
+          const srcY = iy - this.vyPrev[id] * advDt / this.dy;
+          const srcZ = iz - this.wPrev[id] * advDt / this.dz;
+          const advU = this.sampleTrilinear(this.uPrev, srcX, srcY, srcZ);
+          const advV = this.sampleTrilinear(this.vyPrev, srcX, srcY, srcZ);
+          const advW = this.sampleTrilinear(this.wPrev, srcX, srcY, srcZ);
+          const ambientU = this.ambU[iy];
+          const ambientW = this.ambW[iy];
+          this.u[id] = ambientU + (advU - ambientU) * horizontalDamping;
+          this.vy[id] = advV * verticalDamping;
+          this.w[id] = ambientW + (advW - ambientW) * horizontalDamping;
+        }
+      }
+    }
+  }
+
+  private sampleTrilinear(field: Float32Array, x: number, y: number, z: number): number {
+    const x0 = Math.max(0, Math.min(this.nx - 2, Math.floor(x)));
+    const y0 = Math.max(0, Math.min(this.ny - 2, Math.floor(y)));
+    const z0 = Math.max(0, Math.min(this.nz - 2, Math.floor(z)));
+    const fx = Math.max(0, Math.min(1, x - x0));
+    const fy = Math.max(0, Math.min(1, y - y0));
+    const fz = Math.max(0, Math.min(1, z - z0));
+    const i000 = this.idx(x0, y0, z0);
+    const i100 = i000 + 1;
+    const i010 = i000 + this.nx;
+    const i110 = i010 + 1;
+    const i001 = i000 + this.sliceStride;
+    const i101 = i001 + 1;
+    const i011 = i001 + this.nx;
+    const i111 = i011 + 1;
+    const x00 = field[i000] + (field[i100] - field[i000]) * fx;
+    const x10 = field[i010] + (field[i110] - field[i010]) * fx;
+    const x01 = field[i001] + (field[i101] - field[i001]) * fx;
+    const x11 = field[i011] + (field[i111] - field[i011]) * fx;
+    const y0v = x00 + (x10 - x00) * fy;
+    const y1v = x01 + (x11 - x01) * fy;
+    return y0v + (y1v - y0v) * fz;
+  }
+
+  private projectAnelasticVelocity(): void {
+    const { nx, ny, nz, sliceStride: slice, dx, dy, dz } = this;
+    const invDx2 = 1 / (dx * dx);
+    const invDy2 = 1 / (dy * dy);
+    const invDz2 = 1 / (dz * dz);
+    const denom = 2 * (invDx2 + invDy2 + invDz2);
+    this.pressure.fill(0);
+    this.pressureNext.fill(0);
+    this.divergence.fill(0);
+
+    for (let iz = 1; iz < nz - 1; iz++) {
+      const zOff = slice * iz;
+      for (let iy = 1; iy < ny - 1; iy++) {
+        const row = zOff + nx * iy;
+        const rho = Math.max(0.05, this.rho0[iy]);
+        for (let ix = 1; ix < nx - 1; ix++) {
+          const id = row + ix;
+          const horizontalDiv =
+            (this.u[id + 1] - this.u[id - 1]) / (2 * dx) +
+            (this.w[id + slice] - this.w[id - slice]) / (2 * dz);
+          const anelasticVerticalDiv =
+            (this.rho0[iy + 1] * this.vy[id + nx] - this.rho0[iy - 1] * this.vy[id - nx]) /
+            (2 * dy * rho);
+          this.divergence[id] = rho * (horizontalDiv + anelasticVerticalDiv);
+        }
+      }
+    }
+
+    // Red-black style Jacobi pressure solve on the coarse anelastic grid.
+    // Six iterations are sufficient to remove the large-scale divergence left by
+    // buoyancy and cold-pool forcing without dominating the frame budget.
+    for (let iteration = 0; iteration < 6; iteration++) {
+      const current = this.pressure;
+      const next = this.pressureNext;
+      next.fill(0);
+      for (let iz = 1; iz < nz - 1; iz++) {
+        const zOff = slice * iz;
+        for (let iy = 1; iy < ny - 1; iy++) {
+          const row = zOff + nx * iy;
+          for (let ix = 1; ix < nx - 1; ix++) {
+            const id = row + ix;
+            const neighbors =
+              (current[id - 1] + current[id + 1]) * invDx2 +
+              (current[id - nx] + current[id + nx]) * invDy2 +
+              (current[id - slice] + current[id + slice]) * invDz2;
+            next[id] = (neighbors - this.divergence[id]) / denom;
+          }
+        }
+      }
+      this.pressure = next;
+      this.pressureNext = current;
+    }
+
+    for (let iz = 1; iz < nz - 1; iz++) {
+      const zOff = slice * iz;
+      for (let iy = 1; iy < ny - 1; iy++) {
+        const row = zOff + nx * iy;
+        for (let ix = 1; ix < nx - 1; ix++) {
+          const id = row + ix;
+          const invRho = 1 / Math.max(0.05, this.rho0[iy]);
+          this.u[id] -= (this.pressure[id + 1] - this.pressure[id - 1]) * invRho / (2 * dx);
+          this.vy[id] -= (this.pressure[id + nx] - this.pressure[id - nx]) * invRho / (2 * dy);
+          this.w[id] -= (this.pressure[id + slice] - this.pressure[id - slice]) * invRho / (2 * dz);
+        }
+      }
     }
   }
 
@@ -588,7 +755,7 @@ export class AtmosphericFluidGrid {
     }
 
     this.hasActiveCondensate = anyCond;
-    this.maxDivergenceResidual = maxDiv * 0.12;
+    this.maxDivergenceResidual = maxDiv;
     this.maxCFL = Math.min(0.95, maxSpeedRatio);
     this.totalCondensateMassKg = totalMass;
     this.domainCloudCoverFraction = cloudyColumns / (nx * nz);

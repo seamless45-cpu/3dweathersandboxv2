@@ -439,7 +439,7 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
             </div>
 
             <SliderRow
-              label="Takahashi Ice-Graupel Charging"
+              label="Mixed-Phase Charge Separation"
               value={config.chargeSeparationGain}
               min={0.4}
               max={1.6}
@@ -449,7 +449,7 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
               onChange={(v) => onUpdateConfig({ chargeSeparationGain: v })}
             />
             <p className="text-[9.5px] text-slate-400 leading-tight">
-              All lightning &amp; TLEs initiate autonomously when local 3D |E| exceeds the RREA runaway breakdown threshold E_init(ρ).
+              Ice-graupel charge polarity reverses with mixed-phase temperature and supercooled liquid water; lightning initiates when the density-scaled local breakdown field is exceeded.
             </p>
           </div>
         )}
