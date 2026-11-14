@@ -1,0 +1,463 @@
+export const FULLSCREEN_QUAD_VERT = /* glsl */ `
+  out vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
+
+/**
+ * Ray-marches the live 3D simulation volume texture (uVolTex):
+ *   R = condensed cloud water + ice density
+ *   G = precipitation core & rain shaft / virga density
+ *   B = glaciation / anvil ice fraction (0 = liquid cumulus cauliflower, 1 = fibrous ice anvil)
+ *   A = 3D internal lightning scattering field
+ * Outputs vec4(scatteredRadiance.rgb, transmittance).
+ */
+export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
+  precision highp float;
+  precision highp sampler3D;
+
+  uniform sampler3D uVolTex;
+  uniform sampler2D uDepthTex;
+
+  uniform mat4 uInvProj;
+  uniform mat4 uInvView;
+  uniform vec3 uCameraPos;
+  uniform float uNear;
+  uniform float uFar;
+
+  uniform vec3 uSunDir;
+  uniform float uTime;
+  uniform vec3 uWindOffset;
+  uniform float uDomainSize;
+  uniform float uMaxAlt;
+  uniform int uMaxSteps;
+  uniform float uCloudDetail;
+  uniform float uTurbulence;
+  uniform float uShadowsEnabled;
+  uniform float uFrameJitter;
+
+  // Up to 3 simultaneous 3D lightning light sources: xyz = world pos, w = radiant intensity
+  uniform vec4 uBoltLight0;
+  uniform vec4 uBoltLight1;
+  uniform vec4 uBoltLight2;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  // Fast 3D hash & gradient/cellular noise for sub-voxel cumulonimbus cauliflower & anvil detail
+  float hash13(vec3 p3) {
+    p3 = fract(p3 * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+
+  float noise3D(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n000 = hash13(i + vec3(0.0, 0.0, 0.0));
+    float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
+    float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
+    float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
+    float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
+    float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
+    float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
+    float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
+
+    float nx00 = mix(n000, n100, f.x);
+    float nx10 = mix(n010, n110, f.x);
+    float nx01 = mix(n001, n101, f.x);
+    float nx11 = mix(n011, n111, f.x);
+
+    float nxy0 = mix(nx00, nx10, f.y);
+    float nxy1 = mix(nx01, nx11, f.y);
+    return mix(nxy0, nxy1, f.z);
+  }
+
+  // Inverted 3D cellular Worley approximation for crisp cauliflower cumulus congestus turrets
+  float worleyBillow3D(vec3 p) {
+    vec3 id = floor(p);
+    vec3 fd = fract(p);
+    float minDist = 1.0;
+    for (int z = -1; z <= 1; z++) {
+      for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+          vec3 neighbor = vec3(float(x), float(y), float(z));
+          vec3 rnd = vec3(
+            hash13(id + neighbor),
+            hash13(id + neighbor + 17.3),
+            hash13(id + neighbor + 43.7)
+          );
+          vec3 diff = neighbor + rnd - fd;
+          float d = dot(diff, diff);
+          minDist = min(minDist, d);
+        }
+      }
+    }
+    return 1.0 - sqrt(clamp(minDist, 0.0, 1.0));
+  }
+
+  float linearizeDepth(float depthSample) {
+    float zNdc = depthSample * 2.0 - 1.0;
+    return (2.0 * uNear * uFar) / (uFar + uNear - zNdc * (uFar - uNear));
+  }
+
+  vec3 worldToVolumeUVW(vec3 wp) {
+    return vec3(
+      (wp.x + uDomainSize * 0.5) / uDomainSize,
+      wp.y / uMaxAlt,
+      (wp.z + uDomainSize * 0.5) / uDomainSize
+    );
+  }
+
+  // Samples physically synchronized cloud & precipitation density at worldPos
+  vec4 sampleAtmosphereVolume(vec3 wp, float distKm) {
+    vec3 uvw = worldToVolumeUVW(wp);
+    if (
+      uvw.x <= 0.005 || uvw.x >= 0.995 ||
+      uvw.y <= 0.002 || uvw.y >= 0.995 ||
+      uvw.z <= 0.005 || uvw.z >= 0.995
+    ) {
+      return vec4(0.0);
+    }
+
+    // Softly fade outermost 4% domain boundary to avoid box edges
+    float edgeFade =
+      smoothstep(0.005, 0.055, uvw.x) * smoothstep(0.995, 0.945, uvw.x) *
+      smoothstep(0.005, 0.055, uvw.z) * smoothstep(0.995, 0.945, uvw.z);
+
+    vec4 raw = texture(uVolTex, uvw);
+    raw.rg *= edgeFade;
+
+    if (raw.r < 0.008 && raw.g < 0.008) {
+      return vec4(0.0, 0.0, raw.b, raw.a);
+    }
+
+    float baseCloud = raw.r;
+    float basePrecip = raw.g;
+    float iceFrac = raw.b;
+
+    // Distance LOD reduces high-frequency noise aliasing far away while keeping crisp close detail
+    float lodFade = clamp(1.0 - distKm / 34.0, 0.2, 1.0);
+    vec3 advPos = (wp + uWindOffset) * (0.00085 * uCloudDetail);
+
+    float cloudDensity = 0.0;
+    if (baseCloud > 0.008) {
+      // Liquid cumulus/congestus towers use bulbous 3D Worley + Perlin;
+      // Glaciated Cb capillatus anvils stretch horizontally into fibrous ice filaments!
+      float billow = worleyBillow3D(advPos * 1.15);
+      float fbm1 = noise3D(advPos * 2.45);
+      float fbm2 = noise3D(advPos * 5.3 - vec3(0.0, uTime * 0.04, 0.0));
+
+      vec3 anvilCoord = vec3(advPos.x * 0.65, advPos.y * 2.8, advPos.z * 0.65);
+      float fibrous = noise3D(anvilCoord * 2.2) * 0.65 + noise3D(anvilCoord * 4.8) * 0.35;
+
+      float structureNoise = mix(
+        billow * 0.62 + fbm1 * 0.26 + fbm2 * 0.12 * lodFade,
+        fibrous * 0.72 + fbm1 * 0.28,
+        iceFrac
+      );
+
+      // Erode outer cloud margins while keeping deep convective cores solid and voluminous!
+      float erosionStrength = mix(0.56, 0.36, iceFrac) * uTurbulence * (1.0 - baseCloud * 0.65);
+      cloudDensity = clamp((baseCloud - (1.0 - structureNoise) * erosionStrength) / max(0.22, 1.0 - erosionStrength * 0.6), 0.0, 1.0);
+      cloudDensity *= cloudDensity * (3.0 - 2.0 * cloudDensity);
+    }
+
+    // Rain shafts & virga curtains with vertical streak anisotropy
+    float precipDensity = 0.0;
+    if (basePrecip > 0.008) {
+      vec3 streakCoord = vec3(wp.x * 0.0028 - uWindOffset.x * 0.0008, wp.y * 0.00035 + uTime * 0.18, wp.z * 0.0028 - uWindOffset.z * 0.0008);
+      float streak = 0.72 + 0.28 * noise3D(streakCoord * 3.0);
+      precipDensity = basePrecip * streak * 0.42;
+    }
+
+    return vec4(cloudDensity, precipDensity, iceFrac, raw.a);
+  }
+
+  // Dual-lobe Henyey-Greenstein phase function (forward silver lining + backscatter)
+  float hgPhase(float cosTheta, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(0.02, 1.0 + g2 - 2.0 * g * cosTheta), 1.5));
+  }
+
+  float dualLobePhase(float cosTheta, float iceFrac) {
+    float gFwd = mix(0.68, 0.78, iceFrac);
+    float fwd = hgPhase(cosTheta, gFwd);
+    float back = hgPhase(cosTheta, -0.28);
+    return mix(back, fwd, 0.72);
+  }
+
+  // Multi-step solar optical depth toward sun for realistic self-shadowing & dark storm bases
+  float marchSunLight(vec3 pos) {
+    if (uShadowsEnabled < 0.5) return 0.65;
+    float opticalDepth = 0.0;
+    vec3 lDir = normalize(vec3(uSunDir.x, max(0.08, uSunDir.y), uSunDir.z));
+    float stepLen = 360.0;
+    for (int i = 1; i <= 4; i++) {
+      vec3 sp = pos + lDir * (stepLen * float(i) * float(i) * 0.55);
+      vec3 uvw = worldToVolumeUVW(sp);
+      if (uvw.y > 1.0 || uvw.x < 0.0 || uvw.x > 1.0 || uvw.z < 0.0 || uvw.z > 1.0) break;
+      vec4 sv = texture(uVolTex, uvw);
+      opticalDepth += (sv.r * 1.35 + sv.g * 0.65) * (stepLen * 0.0018);
+    }
+    // Dual-octave multiple scattering approximation (Schneider 2015) so deep clouds retain realistic internal glow
+    float primary = exp(-opticalDepth * 2.1);
+    float multiScatter = exp(-opticalDepth * 0.48) * 0.42;
+    return max(primary, multiScatter);
+  }
+
+  // Intersect ray with horizontal slab [yMin, yMax]
+  vec2 intersectAltitudeSlab(vec3 ro, vec3 rd, float yMin, float yMax) {
+    if (abs(rd.y) < 1e-5) {
+      if (ro.y >= yMin && ro.y <= yMax) return vec2(0.0, 48000.0);
+      return vec2(1.0, -1.0);
+    }
+    float t0 = (yMin - ro.y) / rd.y;
+    float t1 = (yMax - ro.y) / rd.y;
+    return vec2(min(t0, t1), max(t0, t1));
+  }
+
+  vec3 evaluateBoltIllumination(vec3 pos, float localGridFlash) {
+    vec3 boltCol = vec3(0.74, 0.82, 1.0) * (localGridFlash * 3.8);
+
+    if (uBoltLight0.w > 0.01) {
+      float dKm = length(pos - uBoltLight0.xyz) * 0.001;
+      boltCol += vec3(0.78, 0.85, 1.0) * (uBoltLight0.w / (0.35 + dKm * dKm * 0.22));
+    }
+    if (uBoltLight1.w > 0.01) {
+      float dKm = length(pos - uBoltLight1.xyz) * 0.001;
+      boltCol += vec3(0.78, 0.85, 1.0) * (uBoltLight1.w / (0.35 + dKm * dKm * 0.22));
+    }
+    if (uBoltLight2.w > 0.01) {
+      float dKm = length(pos - uBoltLight2.xyz) * 0.001;
+      boltCol += vec3(0.82, 0.86, 1.0) * (uBoltLight2.w / (0.35 + dKm * dKm * 0.22));
+    }
+    return boltCol;
+  }
+
+  void main() {
+    // Reconstruct world-space ray from screen UV
+    vec4 clip = vec4(vUv * 2.0 - 1.0, -1.0, 1.0);
+    vec4 eye = uInvProj * clip;
+    eye = vec4(eye.xy, -1.0, 0.0);
+    vec3 rd = normalize((uInvView * eye).xyz);
+    vec3 ro = uCameraPos;
+
+    // Read terrain depth so rays terminate accurately at foreground hills & mountains
+    float rawDepth = texture(uDepthTex, vUv).r;
+    bool hitGeometry = rawDepth < 0.99995;
+    float maxGeomDist = 52000.0;
+    if (hitGeometry) {
+      // Convert view-Z linear depth to world ray distance
+      vec4 viewRay = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+      viewRay /= viewRay.w;
+      float viewRayFactor = length(viewRay.xyz) / abs(viewRay.z);
+      maxGeomDist = linearizeDepth(rawDepth) * viewRayFactor;
+    }
+
+    // Intersect ray with atmospheric cloud & rain volume [30m .. 17,900m]
+    vec2 slab = intersectAltitudeSlab(ro, rd, 30.0, uMaxAlt - 50.0);
+    float tStart = max(0.0, slab.x);
+    float tEnd = min(min(slab.y, maxGeomDist), 44000.0);
+
+    if (tEnd <= tStart) {
+      fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      return;
+    }
+
+    // Interleaved gradient blue-noise per-pixel jitter to eliminate ray-march slicing artifacts
+    float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)) + uFrameJitter));
+
+    float marchSpan = tEnd - tStart;
+    float baseStep = clamp(marchSpan / float(uMaxSteps), 95.0, 520.0);
+    float t = tStart + ign * baseStep;
+
+    float cosTheta = dot(rd, uSunDir);
+    float sunElev = clamp(uSunDir.y, 0.02, 1.0);
+    vec3 sunRadiance = mix(vec3(1.0, 0.58, 0.32), vec3(1.0, 0.97, 0.92), smoothstep(0.04, 0.42, sunElev)) * 3.15;
+    vec3 skyAmbientTop = mix(vec3(0.18, 0.24, 0.36), vec3(0.34, 0.48, 0.68), sunElev);
+    vec3 skyAmbientBottom = mix(vec3(0.10, 0.13, 0.18), vec3(0.18, 0.22, 0.29), sunElev);
+
+    vec3 accumLight = vec3(0.0);
+    float transmittance = 1.0;
+
+    for (int i = 0; i < 96; i++) {
+      if (i >= uMaxSteps || t >= tEnd || transmittance < 0.012) break;
+
+      vec3 pos = ro + rd * t;
+      float distKm = t * 0.001;
+
+      // Coarse check on raw 3D texture for fast empty-space skipping!
+      vec3 uvw = worldToVolumeUVW(pos);
+      if (uvw.x <= 0.005 || uvw.x >= 0.995 || uvw.z <= 0.005 || uvw.z >= 0.995 || uvw.y >= 0.995) {
+        t += baseStep * 2.2;
+        continue;
+      }
+
+      vec4 coarse = texture(uVolTex, uvw);
+      if (coarse.r < 0.008 && coarse.g < 0.008) {
+        // Empty sky voxel -> skip ahead rapidly!
+        t += baseStep * 2.1;
+        continue;
+      }
+
+      vec4 vol = sampleAtmosphereVolume(pos, distKm);
+      float cloudD = vol.r;
+      float precipD = vol.g;
+      float iceFrac = vol.b;
+      float localFlash = vol.a;
+
+      float totalExtinction = cloudD * 0.0046 + precipD * 0.0014;
+      if (totalExtinction > 0.00004) {
+        float stepDt = baseStep;
+        float stepTrans = exp(-totalExtinction * stepDt);
+
+        float sunVis = marchSunLight(pos);
+        float phase = dualLobePhase(cosTheta, iceFrac);
+        // Powder effect highlights billowing cloud edges
+        float powder = 1.0 - 0.45 * exp(-cloudD * 5.5);
+
+        float altFrac = clamp(pos.y / 13000.0, 0.0, 1.0);
+        vec3 ambient = mix(skyAmbientBottom, skyAmbientTop, altFrac) * mix(0.85, 0.38, precipD * 1.4);
+
+        vec3 direct = sunRadiance * sunVis * phase * powder * 2.45;
+        vec3 lightningGlow = evaluateBoltIllumination(pos, localFlash);
+
+        // Blend crisp white-slate cloud scattering with misty gray-blue rain shaft scattering
+        vec3 mediumAlbedo = mix(vec3(0.98, 0.98, 1.0), vec3(0.58, 0.64, 0.72), clamp(precipD / max(0.01, cloudD + precipD), 0.0, 0.85));
+        vec3 voxelScattering = mediumAlbedo * (ambient + direct + lightningGlow);
+
+        // Analytical energy-conserving step integration
+        vec3 integScatter = voxelScattering * (1.0 - stepTrans);
+        accumLight += transmittance * integScatter;
+        transmittance *= stepTrans;
+      }
+
+      t += baseStep;
+    }
+
+    // Distance atmospheric perspective blend on distant clouds (> 18 km) so clouds sit naturally INSIDE the atmosphere!
+    float meanDistFactor = clamp((tStart * 0.001) / 36.0, 0.0, 0.68);
+    vec3 horizonAerial = mix(vec3(0.52, 0.66, 0.84), vec3(0.70, 0.80, 0.92), sunElev) * (0.55 + 0.45 * sunElev);
+    accumLight = mix(accumLight, horizonAerial * (1.0 - transmittance), meanDistFactor * 0.55);
+
+    fragColor = vec4(accumLight, transmittance);
+  }
+`;
+
+/**
+ * Sky Dome Background Shader rendered behind geometry inside sceneRT:
+ * Physically inspired Rayleigh + Mie daylight atmosphere, solar disc & aureole,
+ * horizon haze, rain overcast dimming, and subtle flash scattering.
+ */
+export const SKY_DOME_VERT = /* glsl */ `
+  varying vec3 vWorldDir;
+  void main() {
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vWorldDir = wp.xyz - cameraPosition;
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }
+`;
+
+export const SKY_DOME_FRAG = /* glsl */ `
+  precision highp float;
+
+  uniform vec3 uSunDir;
+  uniform float uRainHaze;
+  uniform float uLightningFlash;
+
+  varying vec3 vWorldDir;
+
+  void main() {
+    vec3 rd = normalize(vWorldDir);
+    float sunElev = clamp(uSunDir.y, 0.02, 1.0);
+    float zenith = clamp(rd.y, 0.0, 1.0);
+
+    // Rayleigh zenith-to-horizon gradient
+    vec3 zenithCol = mix(vec3(0.08, 0.18, 0.38), vec3(0.12, 0.34, 0.72), smoothstep(0.02, 0.45, sunElev));
+    vec3 horizonCol = mix(vec3(0.72, 0.56, 0.44), vec3(0.62, 0.76, 0.92), smoothstep(0.04, 0.38, sunElev));
+
+    // Overcast rain-induced haze desaturation near observer
+    zenithCol = mix(zenithCol, vec3(0.20, 0.25, 0.32), uRainHaze * 0.75);
+    horizonCol = mix(horizonCol, vec3(0.32, 0.37, 0.44), uRainHaze * 0.82);
+
+    float horizonCurve = pow(1.0 - zenith, 3.2);
+    vec3 sky = mix(zenithCol, horizonCol, horizonCurve);
+
+    // Mie solar aureole & crisp sun disc
+    float cosSun = dot(rd, uSunDir);
+    float mieGlow = pow(max(0.0, cosSun), 12.0) * 0.28 + pow(max(0.0, cosSun), 160.0) * 0.85;
+    float sunDisc = smoothstep(0.99965, 0.99992, cosSun) * 6.0;
+    vec3 sunTint = mix(vec3(1.0, 0.55, 0.28), vec3(1.0, 0.96, 0.88), smoothstep(0.04, 0.4, sunElev));
+
+    sky += sunTint * (mieGlow + sunDisc) * (1.0 - uRainHaze * 0.88);
+
+    // Subtle global atmospheric scattering flash during intense return strokes
+    sky += vec3(0.36, 0.42, 0.58) * uLightningFlash * (0.25 + 0.45 * horizonCurve);
+
+    // Ground below horizon fallback
+    if (rd.y < -0.02) {
+      sky = mix(sky, horizonCol * 0.55, smoothstep(-0.02, -0.25, rd.y));
+    }
+
+    gl_FragColor = vec4(sky, 1.0);
+  }
+`;
+
+/**
+ * Final Composite, Temporal Volumetric Smoothing, Lightning Bloom & Dynamic Exposure Pass.
+ */
+export const COMPOSITE_POST_FRAG = /* glsl */ `
+  precision highp float;
+
+  uniform sampler2D uSceneTex;
+  uniform sampler2D uVolCloudTex;
+  uniform sampler2D uPrevVolTex;
+  uniform vec2 uTexelSize;
+  uniform float uExposure;
+  uniform float uTemporalBlend;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  vec3 acesToneMap(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+  }
+
+  void main() {
+    vec3 baseScene = texture(uSceneTex, vUv).rgb;
+
+    // 5-tap edge-preserving upsample of volumetric cloud buffer + temporal accumulation
+    vec4 volCenter = texture(uVolCloudTex, vUv);
+    vec4 volN = texture(uVolCloudTex, vUv + vec2(0.0, uTexelSize.y));
+    vec4 volS = texture(uVolCloudTex, vUv - vec2(0.0, uTexelSize.y));
+    vec4 volE = texture(uVolCloudTex, vUv + vec2(uTexelSize.x, 0.0));
+    vec4 volW = texture(uVolCloudTex, vUv - vec2(uTexelSize.x, 0.0));
+    vec4 volCurr = volCenter * 0.44 + (volN + volS + volE + volW) * 0.14;
+
+    vec4 volHistory = texture(uPrevVolTex, vUv);
+    // Clamp history neighborhood to prevent ghosting during fast camera pans or lightning flashes!
+    vec4 volMin = min(volCenter, min(min(volN, volS), min(volE, volW))) - vec4(0.06);
+    vec4 volMax = max(volCenter, max(max(volN, volS), max(volE, volW))) + vec4(0.06);
+    vec4 clampedHist = clamp(volHistory, volMin, volMax);
+
+    vec4 volFinal = mix(volCurr, clampedHist, uTemporalBlend);
+
+    // Composite volumetric cloud & rain scattering; bloom is handled by a dedicated multi-pass pipeline.
+    vec3 combined = baseScene * volFinal.a + volFinal.rgb;
+
+    vec3 mapped = acesToneMap(combined * uExposure);
+    mapped = pow(mapped, vec3(1.0 / 2.2));
+
+    fragColor = vec4(mapped, 1.0);
+  }
+`;
