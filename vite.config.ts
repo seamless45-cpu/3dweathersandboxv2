@@ -10,6 +10,8 @@ const __dirname = path.dirname(__filename);
 
 // https://vite.dev/config/
 export default defineConfig({
+  // GitHub Pages serves this project from /<repository-name>/; local preview is at /.
+  base: process.env.GITHUB_ACTIONS === "true" ? "/3dweathersandboxv2/" : "/",
   plugins: [react(), tailwindcss(), viteSingleFile()],
   server: {
     host: "0.0.0.0",
