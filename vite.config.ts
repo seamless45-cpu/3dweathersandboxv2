@@ -15,6 +15,10 @@ export default defineConfig({
     host: "0.0.0.0",
     // Arena serves previews from dynamic *.e2b.app hostnames.
     allowedHosts: [".e2b.app"],
+    headers: { "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" },
+  },
+  preview: {
+    headers: { "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" },
   },
   resolve: {
     alias: {
