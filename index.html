@@ -7,9 +7,21 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <title>3D Autonomous Atmospheric, Convective & Electrical Simulation</title>
+    <style>
+      html, body, #root { width: 100%; height: 100%; margin: 0; background: #030712; }
+      #startup-fallback { box-sizing: border-box; min-height: 100%; display: grid; place-content: center; padding: 2rem; color: #e2e8f0; font: 14px/1.5 system-ui, sans-serif; text-align: center; }
+      #startup-fallback p { max-width: 32rem; color: #94a3b8; }
+    </style>
   </head>
   <body class="bg-slate-950 text-slate-100 overflow-hidden select-none">
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx?v=20261114-2"></script>
+    <div id="root">
+      <main id="startup-fallback" role="status">
+        <div>
+          <strong>Loading MeteoLab…</strong>
+          <p>If this message remains, the app script did not start. Reload the preview or check whether JavaScript is blocked.</p>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.tsx?v=20261114-3"></script>
   </body>
 </html>
