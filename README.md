@@ -2,11 +2,11 @@
 
 ## GitHub Pages
 
-GitHub Pages serves the static site from the `docs/` folder on `main`. Generate the single-file deployment with:
+GitHub Pages is configured to publish the repository root from `main`. Generate the deployable single-file `index.html` with:
 
 ```sh
 npm ci
 npm run build:pages
 ```
 
-Commit the updated `docs/index.html` after changing the app. The build targets the project-page path `/3dweathersandboxv2/` and bundles the app into one HTML file.
+Commit the updated root `index.html` after changing the app. The Vite source template is `app.html`; the build targets `/3dweathersandboxv2/` and bundles the app into one self-contained HTML file.
