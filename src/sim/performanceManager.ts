@@ -5,12 +5,26 @@ interface TierPreset {
   volumetricScale: number;
 }
 
+/**
+ * Tier presets.
+ *
+ * The volumetric scales here are meaningfully lower than they were before the ray-march gained
+ * true temporal reprojection. Reprojecting the previous frame's volume along the camera motion
+ * vector (instead of resampling it at the same UV) makes history safe to lean on much harder,
+ * and the rotating sub-pixel jitter means four consecutive low-res frames reconstruct detail
+ * that a single high-res frame would have to resolve outright. That trades one full-resolution
+ * ray-march for roughly a quarter of one at near-identical quality — the dominant lever on
+ * frame time, since the volume pass is the most expensive thing on the GPU.
+ */
 const TIER_PRESETS: Record<QualityTier, TierPreset> = {
-  ultra: { raymarchSteps: 84, volumetricScale: 0.8 },
-  high: { raymarchSteps: 62, volumetricScale: 0.68 },
-  medium: { raymarchSteps: 46, volumetricScale: 0.56 },
-  low: { raymarchSteps: 34, volumetricScale: 0.46 },
+  ultra: { raymarchSteps: 76, volumetricScale: 0.72 },
+  high: { raymarchSteps: 58, volumetricScale: 0.6 },
+  medium: { raymarchSteps: 44, volumetricScale: 0.5 },
+  low: { raymarchSteps: 32, volumetricScale: 0.42 },
 };
+
+/** Upper bound on the device pixel ratio, matching the engine's native cap. */
+export const MAX_DEVICE_PIXEL_RATIO = 1.75;
 
 const TIER_ORDER: QualityTier[] = ['low', 'medium', 'high', 'ultra'];
 
@@ -45,6 +59,13 @@ export class AdaptivePerformanceManager {
       exposure: 1.0,
       enableBloom: true,
       enableCameraShake: true,
+      pixelRatioScale: 1.0,
+      enableMotionBlur: true,
+      enableDayNightCycle: false,
+      dayNightCycleSec: 240,
+      // ~15.8 h reproduces the 34 deg solar elevation the manual lighting mode defaults to,
+      // so switching the cycle on does not jump the scene to a different time of day.
+      timeOfDayHours: 15.8,
     };
 
     this.metrics = {
@@ -57,7 +78,26 @@ export class AdaptivePerformanceManager {
       activeTier: defaultTier,
       raymarchStepsActive: preset.raymarchSteps,
       volumetricScaleActive: preset.volumetricScale,
+      pixelRatioActive: 1,
+      renderWidthPx: 0,
+      renderHeightPx: 0,
     };
+  }
+
+  /** Device pixel ratio this browser reports, clamped to the engine's native cap. */
+  public get basePixelRatio(): number {
+    const raw = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    return Math.min(raw, MAX_DEVICE_PIXEL_RATIO);
+  }
+
+  /** Effective pixel ratio after the user's render-scale slider. */
+  public get effectivePixelRatio(): number {
+    return this.basePixelRatio * this.clampedPixelRatioScale;
+  }
+
+  /** Render-scale slider value clamped to its supported 0.1x..1.0x range. */
+  public get clampedPixelRatioScale(): number {
+    return Math.min(1, Math.max(0.1, this.settings.pixelRatioScale));
   }
 
   public setGpuRendererInfo(rendererName: string): void {
@@ -139,6 +179,9 @@ export class AdaptivePerformanceManager {
       activeTier: this.settings.tier,
       raymarchStepsActive: this.settings.raymarchSteps,
       volumetricScaleActive: this.settings.volumetricScale,
+      pixelRatioActive: this.effectivePixelRatio,
+      renderWidthPx: this.metrics.renderWidthPx,
+      renderHeightPx: this.metrics.renderHeightPx,
     };
 
     return resolutionChanged;

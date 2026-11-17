@@ -20,6 +20,8 @@ const TERRAIN_FRAG = /* glsl */ `
 
   uniform sampler3D uVolTex;
   uniform vec3 uSunDir;
+  uniform vec3 uMoonDir;
+  uniform float uDaylight;
   uniform vec3 uCameraPos;
   uniform float uWetness;
   uniform float uRainHaze;
@@ -104,14 +106,28 @@ const TERRAIN_FRAG = /* glsl */ `
       N = normalize(mix(N, puddleN, puddleMask * 0.92));
     }
 
-    // Direct solar + sky hemisphere + real-time 3D cloud shadow
+    // Direct solar + sky hemisphere + real-time 3D cloud shadow, across the diurnal cycle
     float sunHeight = clamp(uSunDir.y, 0.02, 1.0);
+    float daylight = clamp(uDaylight, 0.0, 1.0);
     vec3 sunColor = mix(vec3(1.0, 0.62, 0.36), vec3(1.0, 0.96, 0.90), smoothstep(0.05, 0.45, sunHeight));
     float cloudShadow = sampleCloudShadow(vWorldPos);
     float ndotl = max(0.0, dot(N, uSunDir));
 
-    vec3 skyAmbient = mix(vec3(0.14, 0.18, 0.25), vec3(0.24, 0.33, 0.46), sunHeight) * (0.55 + 0.45 * cloudShadow);
-    vec3 directLight = sunColor * ndotl * cloudShadow * 1.45;
+    // Night floor: cool moonlight from the anti-solar direction over a deep blue hemisphere.
+    // Held low enough that lightning stays the dominant light source after dark, which is what
+    // makes a night storm legible from the ground instead of a black frame with sparks in it.
+    float moonElev = clamp(uMoonDir.y, 0.0, 1.0);
+    float ndotm = max(0.0, dot(N, uMoonDir));
+    vec3 nightAmbient =
+      mix(vec3(0.016, 0.023, 0.042), vec3(0.030, 0.042, 0.072), sunHeight) +
+      vec3(0.020, 0.028, 0.048) * moonElev;
+    nightAmbient *= 0.55 + 0.45 * cloudShadow;
+    vec3 moonLight = vec3(0.36, 0.48, 0.78) * ndotm * cloudShadow * 0.17 * moonElev;
+
+    vec3 dayAmbient =
+      mix(vec3(0.14, 0.18, 0.25), vec3(0.24, 0.33, 0.46), sunHeight) * (0.55 + 0.45 * cloudShadow);
+    vec3 skyAmbient = mix(nightAmbient, dayAmbient, daylight);
+    vec3 directLight = sunColor * ndotl * cloudShadow * 1.45 * daylight + moonLight;
 
     // Dynamic Lightning Ground Illumination & Puddle Specular Glint
     vec3 toBolt = uLightningPos - vWorldPos;
@@ -125,15 +141,22 @@ const TERRAIN_FRAG = /* glsl */ `
     // Wet surface & puddle Fresnel reflection of sky & lightning flash
     float fresnel = pow(1.0 - max(0.0, dot(N, V)), 4.0);
     float reflectivity = mix(0.02, 0.68, puddleMask) + uWetness * 0.16;
-    vec3 reflSky = mix(vec3(0.22, 0.28, 0.36), vec3(0.42, 0.56, 0.76), cloudShadow * sunHeight) +
+    vec3 dayRefl = mix(vec3(0.22, 0.28, 0.36), vec3(0.42, 0.56, 0.76), cloudShadow * sunHeight);
+    vec3 reflSky = mix(vec3(0.020, 0.028, 0.048), dayRefl, daylight) +
                    vec3(0.82, 0.88, 1.0) * boltAtten * 0.95;
     col = mix(col, reflSky, clamp(fresnel * reflectivity + puddleMask * 0.32, 0.0, 0.85));
 
     // Atmospheric Rayleigh/Mie distance haze + rain curtain visibility reduction
     float hazeDensity = 0.000052 + uRainHaze * 0.00022;
     float fogFactor = 1.0 - exp(-dist * hazeDensity);
+    vec3 dayHaze = mix(
+      vec3(0.62, 0.74, 0.88),
+      vec3(0.30, 0.35, 0.42),
+      clamp(uRainHaze * 1.1 + (1.0 - cloudShadow) * 0.5, 0.0, 1.0)
+    );
+    // A flash still lights the fog at night, so the bolt term stays outside the daylight mix.
     vec3 horizonHazeColor = mix(
-      mix(vec3(0.62, 0.74, 0.88), vec3(0.30, 0.35, 0.42), clamp(uRainHaze * 1.1 + (1.0 - cloudShadow) * 0.5, 0.0, 1.0)),
+      mix(vec3(0.028, 0.038, 0.062), dayHaze, daylight),
       vec3(0.75, 0.82, 0.98),
       clamp(boltAtten * 0.35, 0.0, 0.65)
     );
@@ -233,6 +256,8 @@ export class GroundEnvironmentRenderer {
       uniforms: {
         uVolTex: { value: volTexture },
         uSunDir: { value: new THREE.Vector3(0.4, 0.55, -0.72).normalize() },
+        uMoonDir: { value: new THREE.Vector3(-0.4, 0.55, 0.72).normalize() },
+        uDaylight: { value: 1.0 },
         uCameraPos: { value: new THREE.Vector3() },
         uWetness: { value: 0 },
         uRainHaze: { value: 0 },
@@ -311,6 +336,8 @@ export class GroundEnvironmentRenderer {
   public update(params: {
     timeSec: number;
     sunDir: THREE.Vector3;
+    moonDir: THREE.Vector3;
+    daylight: number;
     cameraPos: THREE.Vector3;
     isGroundMode: boolean;
     wetness: number;
@@ -325,6 +352,8 @@ export class GroundEnvironmentRenderer {
     const u = this.terrainMat.uniforms;
     u.uTime.value = params.timeSec;
     u.uSunDir.value.copy(params.sunDir);
+    u.uMoonDir.value.copy(params.moonDir);
+    u.uDaylight.value = params.daylight;
     u.uCameraPos.value.copy(params.cameraPos);
     u.uWetness.value = params.wetness;
     u.uRainHaze.value = params.rainHaze;
@@ -351,8 +380,13 @@ export class GroundEnvironmentRenderer {
         params.cameraPos.z
       );
       gu.uWetness.value = params.wetness;
+      // Grass catches the same day/night regime as the terrain: a moonlit floor is dim but
+      // not black, so blades still read as silhouette against lightning.
+      const dayAmbientDim = Math.max(0.28, params.sunDir.y * 1.35);
+      const nightAmbientDim = 0.075 + 0.05 * Math.max(0, params.moonDir.y);
       gu.uAmbientDim.value =
-        Math.max(0.28, params.sunDir.y * 1.35) * (1.0 - params.cloudCoverFrac * 0.45);
+        (params.daylight * dayAmbientDim + (1.0 - params.daylight) * nightAmbientDim) *
+        (1.0 - params.cloudCoverFrac * 0.45);
       gu.uLightningFlash.value = Math.min(1.2, params.lightningIntensity * 0.35);
     }
   }

@@ -19,6 +19,21 @@ import {
   SimulationTelemetrySnapshot,
 } from '../sim/types';
 
+/** Live solar state for the HUD clock, sampled from the render loop at UI refresh rate. */
+export interface SunReadout {
+  /** Local solar time as HH:MM. */
+  clock: string;
+  /** Local solar time in decimal hours, which is what the scrubber binds to. */
+  timeOfDayHours: number;
+  sunElevationDeg: number;
+  /** 0 at full night, 1 in full daylight. */
+  daylight: number;
+  /** 0..1 surface insolation actually reaching the convection scheme. */
+  insolation: number;
+  /** Whether the sun is below the horizon, for the day/night badge. */
+  isNight: boolean;
+}
+
 interface SettingsDrawerProps {
   config: AtmosphereConfig;
   onUpdateConfig: (patch: Partial<AtmosphereConfig>) => void;
@@ -28,6 +43,7 @@ interface SettingsDrawerProps {
   onSelectManualTier: (tier: QualityTier) => void;
   telemetry: SimulationTelemetrySnapshot;
   perf: PerformanceMetrics;
+  sun: SunReadout;
 }
 
 interface SliderRowProps {
@@ -95,6 +111,7 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
   onSelectManualTier,
   telemetry,
   perf,
+  sun,
 }) => {
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
     atmosphere: true,
@@ -552,13 +569,17 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
             <SliderRow
               label="Solar Elevation"
               value={config.sunElevationDeg}
-              min={4}
+              min={-12}
               max={75}
               step={1}
               decimals={0}
               unit="°"
               onChange={(v) => onUpdateConfig({ sunElevationDeg: v })}
             />
+            <div className="text-[8.5px] text-slate-500 -mt-1.5 leading-tight">
+              Manual sun altitude. Negative values give dusk and night without running the
+              cycle; overridden while Day / Night is on.
+            </div>
             <SliderRow
               label="Camera Exposure"
               value={quality.exposure}
@@ -568,6 +589,28 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
               decimals={2}
               onChange={(v) => onUpdateQuality({ exposure: v })}
             />
+
+            {/* Render scale: multiplies the device pixel ratio, so it drives the canvas backing
+                store and every render target at once. The single biggest frame-time lever. */}
+            <SliderRow
+              label="Pixel Ratio (Render Scale)"
+              value={quality.pixelRatioScale}
+              min={0.1}
+              max={1}
+              step={0.05}
+              decimals={2}
+              unit="x"
+              onChange={(v) => onUpdateQuality({ pixelRatioScale: v })}
+            />
+            <div className="flex items-center justify-between text-[9px] text-slate-400 -mt-1">
+              <span className="font-mono">
+                {perf.renderWidthPx} x {perf.renderHeightPx} px
+              </span>
+              <span className="font-mono">
+                DPR {perf.pixelRatioActive.toFixed(2)} · vol{' '}
+                {Math.round(perf.volumetricScaleActive * quality.pixelRatioScale * 100)}%
+              </span>
+            </div>
 
             <div className="flex items-center justify-between text-[10px] pt-0.5">
               <label className="flex items-center gap-1.5 cursor-pointer">
@@ -590,6 +633,86 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
                 />
                 <span>TAA</span>
               </label>
+            </div>
+
+            <label className="flex items-center justify-between text-[10px] cursor-pointer">
+              <span className="text-slate-300">
+                Motion Blur · depth-aware per-pixel camera smear
+              </span>
+              <input
+                type="checkbox"
+                checked={quality.enableMotionBlur}
+                onChange={(e) => onUpdateQuality({ enableMotionBlur: e.target.checked })}
+                className="accent-sky-400"
+              />
+            </label>
+
+            {/* Day / night cycle. Drives the solar geometry, the sky/terrain/volume lighting
+                rigs, and the surface insolation the convection scheme is fed. */}
+            <div className="border-t border-white/8 pt-1.5 space-y-1.5">
+              <label className="flex items-center justify-between text-[10px] cursor-pointer">
+                <span className="text-slate-300">Day / Night Cycle</span>
+                <input
+                  type="checkbox"
+                  checked={quality.enableDayNightCycle}
+                  onChange={(e) =>
+                    onUpdateQuality({ enableDayNightCycle: e.target.checked })
+                  }
+                  className="accent-amber-400"
+                />
+              </label>
+
+              <div className="flex items-center justify-between text-[9.5px]">
+                <span className="text-slate-400">Local solar time</span>
+                <span className="font-mono text-amber-200">
+                  {sun.clock} · {sun.sunElevationDeg.toFixed(0)}° ·{' '}
+                  {Math.round(sun.daylight * 100)}% lit
+                </span>
+              </div>
+
+              <div className="flex gap-1">
+                <span
+                  className={`flex-1 text-center py-0.5 rounded text-[9px] uppercase font-mono border ${
+                    sun.isNight
+                      ? 'bg-indigo-500/25 border-indigo-400/40 text-indigo-100'
+                      : sun.daylight < 0.98
+                        ? 'bg-orange-500/25 border-orange-400/40 text-orange-100'
+                        : 'bg-amber-400/20 border-amber-300/40 text-amber-100'
+                  }`}
+                >
+                  {sun.isNight ? 'Night' : sun.daylight < 0.98 ? 'Twilight' : 'Daylight'}
+                </span>
+                <span className="flex-1 text-center py-0.5 rounded text-[9px] font-mono border bg-slate-900 border-white/10 text-slate-400">
+                  insolation {Math.round(sun.insolation * 100)}%
+                </span>
+              </div>
+
+              <SliderRow
+                label="Time of Day"
+                value={
+                  quality.enableDayNightCycle ? sun.timeOfDayHours : quality.timeOfDayHours
+                }
+                min={0}
+                max={24}
+                step={0.1}
+                decimals={1}
+                unit="h"
+                onChange={(v) => onUpdateQuality({ timeOfDayHours: v })}
+              />
+              <SliderRow
+                label="Cycle Length"
+                value={quality.dayNightCycleSec}
+                min={30}
+                max={900}
+                step={10}
+                decimals={0}
+                unit="s"
+                onChange={(v) => onUpdateQuality({ dayNightCycleSec: v })}
+              />
+              <div className="text-[8.5px] text-slate-500 leading-tight">
+                Solar position solved for 13.5°N latitude; night also removes the insolation
+                that drives boundary-layer thermals, so convection decays after sunset.
+              </div>
             </div>
           </div>
         )}
@@ -619,6 +742,11 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
               <MetricCell
                 label="Ray-March Steps"
                 value={`${perf.raymarchStepsActive} @ ${Math.round(perf.volumetricScaleActive * 100)}%`}
+                tag="DIAG"
+              />
+              <MetricCell
+                label="Render Scale"
+                value={`${quality.pixelRatioScale.toFixed(2)}x · ${perf.renderWidthPx}x${perf.renderHeightPx}`}
                 tag="DIAG"
               />
               <MetricCell
