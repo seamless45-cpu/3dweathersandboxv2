@@ -60,6 +60,9 @@ export class AtmosphericSceneEngine {
   private realTimeElapsed = 0;
   private windOffset = new THREE.Vector3();
   private sunDir = new THREE.Vector3();
+  /** Reused camera-shake temporaries: the render hot path must not allocate per frame. */
+  private shakeAxis = new THREE.Vector3();
+  private shakeQuat = new THREE.Quaternion();
   private autoExposureCurrent = 1.0;
 
   constructor(
@@ -284,7 +287,7 @@ export class AtmosphericSceneEngine {
       const shake = this.cameraShake.update(realDtSec, coordinator.lightning.activeDischarges, cam.position);
       const shakeAngle = shake.length();
       if (shakeAngle > 0.000001) {
-        cam.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(shake.clone().normalize(), shakeAngle));
+        cam.quaternion.multiply(this.shakeQuat.setFromAxisAngle(this.shakeAxis.copy(shake).normalize(), shakeAngle));
       }
     } else {
       this.cameraShake.update(realDtSec, [], cam.position);
@@ -294,8 +297,13 @@ export class AtmosphericSceneEngine {
     // Keep sky dome centered on camera
     this.skyDomeMesh.position.copy(cam.position);
 
-    // Upload updated 3D atmospheric volume buffer to GPU
-    this.volTexture3D.needsUpdate = true;
+    // Upload updated 3D atmospheric volume buffer to GPU. The grid flags this only when a
+    // packed voxel actually changed (dynamics step or lightning glow), which keeps clear-sky
+    // frames from pushing ~250 KB to the GPU for nothing.
+    if (coordinator.grid.textureDirty) {
+      this.volTexture3D.needsUpdate = true;
+      coordinator.grid.textureDirty = false;
+    }
 
     // Solar direction from configured elevation angle
     const elevRad = (coordinator.config.sunElevationDeg * Math.PI) / 180.0;
@@ -309,9 +317,9 @@ export class AtmosphericSceneEngine {
       .normalize();
 
     // Advect sub-voxel procedural cloud turbulence smoothly with ambient mid-level wind
-    const midWind = coordinator.sounding.sampleAtAltitude(3500);
-    this.windOffset.x -= midWind.windU * realDtSec * 4.5;
-    this.windOffset.z -= midWind.windW * realDtSec * 4.5;
+    // (scalar accessors: no per-frame level-object allocation).
+    this.windOffset.x -= coordinator.sounding.windUAt(3500) * realDtSec * 4.5;
+    this.windOffset.z -= coordinator.sounding.windWAt(3500) * realDtSec * 4.5;
     this.windOffset.y -= 1.8 * realDtSec;
 
     // Update 3D Lightning & Upper-Atmospheric TLE meshes
@@ -357,6 +365,9 @@ export class AtmosphericSceneEngine {
       windU: coordinator.observerWindU,
       windW: coordinator.observerWindW,
       lightningFlash: flashIntensity,
+      fallSpeedMS: coordinator.observerPrecipFallSpeedMS,
+      frozenFraction: coordinator.observerFrozenFraction,
+      gustFactor: coordinator.observerGustFactor,
     });
 
     // PASS 1: Render 3D Scene (Sky + Terrain + Grass + Bolts + TLEs + Rain Streaks) into sceneRT + depthTexture

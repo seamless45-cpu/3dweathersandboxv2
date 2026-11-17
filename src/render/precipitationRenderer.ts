@@ -240,36 +240,55 @@ export class NearFieldPrecipitationRenderer {
     windU: number;
     windW: number;
     lightningFlash: number;
+    /** Mass-weighted terminal fall speed of what is actually reaching the observer (m/s). */
+    fallSpeedMS?: number;
+    /** 0..1 share of the surface flux that is frozen (snow, graupel or hail). */
+    frozenFraction?: number;
+    /** 0..1 gustiness from nearby downdrafts and gust fronts; slants the streaks further. */
+    gustFactor?: number;
   }): void {
-    const active = Math.min(1.0, params.rainRateMMHr / 48.0);
+    // Perceived density saturates well below a torrential core rate, so use a compressive
+    // curve: a 10 mm/h shower already fills the view, and 150 mm/h reads as a solid curtain.
+    const active = Math.min(1.0, Math.pow(params.rainRateMMHr / 95.0, 0.62));
     this.streakMesh.visible = active > 0.004;
 
     if (this.streakMesh.visible) {
       const u = this.streakMat.uniforms;
+      const frozen = clamp01(params.frozenFraction ?? frozenShareOfType(params.precipType));
+      // Fall speed comes from the microphysics (mass-weighted across rain/snow/graupel/hail)
+      // rather than a hard-coded per-type constant, so a shaft that has just melted out of
+      // hail accelerates visibly as it switches to rain.
+      const fall = clamp(params.fallSpeedMS ?? defaultFallSpeed(params.precipType), 0.6, 26.0);
+      const gust = clamp01(params.gustFactor ?? 0);
+
       u.uTime.value = params.realTimeSec;
       u.uCameraPos.value.copy(params.cameraPos);
-      u.uActiveFraction.value = Math.pow(active, 0.65);
+      u.uActiveFraction.value = Math.pow(active, 0.6);
       u.uLightningBoost.value = params.lightningFlash;
 
-      if (params.precipType === 'Snow / Ice Pellets') {
-        u.uFallVel.value.set(params.windU * 0.85, -2.2, params.windW * 0.85);
-        u.uStreakWidth.value = 0.032;
-        u.uStreakLength.value = 0.08;
-        u.uTint.value.setRGB(0.95, 0.97, 1.0);
-      } else if (
-        params.precipType === 'Hail & Heavy Rain' ||
-        params.precipType === 'Graupel Shower'
-      ) {
-        u.uFallVel.value.set(params.windU * 0.65, -15.5, params.windW * 0.65);
-        u.uStreakWidth.value = 0.022;
-        u.uStreakLength.value = 0.42;
-        u.uTint.value.setRGB(0.88, 0.93, 1.0);
-      } else {
-        u.uFallVel.value.set(params.windU * 0.75, -10.5, params.windW * 0.75);
-        u.uStreakWidth.value = 0.011;
-        u.uStreakLength.value = 0.68;
-        u.uTint.value.setRGB(0.68, 0.77, 0.88);
-      }
+      // Falling hydrometeors reach ~75-90 % of the horizontal wind (drag-limited), and snow
+      // couples more tightly than hail because it stays airborne far longer.
+      const windCoupling = 0.62 + 0.28 * frozen + 0.1 * gust;
+      u.uFallVel.value.set(
+        params.windU * windCoupling * (1.0 + gust * 0.55),
+        -fall,
+        params.windW * windCoupling * (1.0 + gust * 0.55)
+      );
+
+      // Streak length is a motion-blur exposure: length = fallSpeed * exposureTime. That makes
+      // hail (fast) streak long and snow (slow) read as short dabs, which is the opposite of
+      // the previous hard-coded mapping.
+      const exposureSec = 0.052;
+      u.uStreakLength.value = clamp(fall * exposureSec * (1.0 - 0.45 * frozen), 0.03, 1.15);
+      // Frozen particles are larger and scatter more, so they need a wider quad to be visible.
+      u.uStreakWidth.value = 0.011 + 0.026 * frozen + 0.004 * active;
+
+      // Liquid rain is a dim blue-grey; ice is bright and near-white.
+      u.uTint.value.setRGB(
+        0.68 + 0.29 * frozen,
+        0.77 + 0.2 * frozen,
+        0.88 + 0.12 * frozen
+      );
     }
 
     const groundY =
@@ -278,17 +297,18 @@ export class NearFieldPrecipitationRenderer {
         ? getTerrainHeight(params.cameraPos.x, params.cameraPos.z)
         : 0;
     const nearGround = params.cameraPos.y - groundY < 45.0;
+    // Splashes are a liquid-impact effect: scale them by the liquid share of the flux so a
+    // mixed-phase shaft still rings on wet ground, while pure snow stays silent.
+    const frozenShare = clamp01(params.frozenFraction ?? frozenShareOfType(params.precipType));
+    const liquidActive = active * (1.0 - frozenShare * 0.92);
     this.splashMesh.visible =
-      nearGround &&
-      active > 0.02 &&
-      params.precipType !== 'Snow / Ice Pellets' &&
-      params.precipType !== 'Virga';
+      nearGround && liquidActive > 0.02 && params.precipType !== 'Virga';
 
     if (this.splashMesh.visible) {
       const su = this.splashMat.uniforms;
       su.uTime.value = params.realTimeSec;
       su.uObserverGround.value.set(params.cameraPos.x, groundY, params.cameraPos.z);
-      su.uSplashActive.value = Math.min(1.0, active * 1.25);
+      su.uSplashActive.value = Math.min(1.0, liquidActive * 1.25);
       su.uLightningBoost.value = params.lightningFlash;
     }
   }
@@ -298,5 +318,51 @@ export class NearFieldPrecipitationRenderer {
     this.streakMat.dispose();
     this.splashMesh.geometry.dispose();
     this.splashMat.dispose();
+  }
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Fallback fall speed when the simulation has not supplied a mass-weighted value. */
+function defaultFallSpeed(type: PrecipitationType): number {
+  switch (type) {
+    case 'Snow / Ice Pellets':
+      return 1.2;
+    case 'Graupel Shower':
+      return 4.6;
+    case 'Hail & Heavy Rain':
+      return 11.5;
+    case 'Mixed-Phase Precipitation':
+      return 6.0;
+    case 'Drizzle':
+      return 2.1;
+    case 'Virga':
+      return 3.4;
+    case 'None':
+      return 6.4;
+    default:
+      return 6.4 + Math.min(3.0, 0.0);
+  }
+}
+
+/** Frozen share of the surface flux implied by the WMO precipitation type. */
+function frozenShareOfType(type: PrecipitationType): number {
+  switch (type) {
+    case 'Snow / Ice Pellets':
+      return 1.0;
+    case 'Graupel Shower':
+      return 0.85;
+    case 'Hail & Heavy Rain':
+      return 0.45;
+    case 'Mixed-Phase Precipitation':
+      return 0.5;
+    default:
+      return 0.0;
   }
 }

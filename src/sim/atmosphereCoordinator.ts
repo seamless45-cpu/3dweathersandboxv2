@@ -1,6 +1,6 @@
 import { ConvectiveCellManager } from './convectiveCells';
 import { AtmosphericElectrificationEngine, BreakdownCandidate } from './electrification';
-import { AtmosphericFluidGrid } from './fluidGrid';
+import { AtmosphericFluidGrid, GRID_NX, GRID_NY, GRID_NZ } from './fluidGrid';
 import { AutonomousLightningEngine } from './lightningEngine';
 import { AtmosphericSounding, DEFAULT_ATMOSPHERE_CONFIG } from './thermodynamics';
 import {
@@ -9,6 +9,38 @@ import {
   PrecipitationType,
   SimulationTelemetrySnapshot,
 } from './types';
+
+/**
+ * Physics update cadence. The Eulerian fluid solve, the electrostatic Poisson solve and the
+ * volume-texture repack are the three expensive CPU passes, and all three describe fields
+ * that evolve on a seconds-to-minutes scale while the render loop runs at 60 Hz. Running
+ * them on a fixed simulated-time interval (with a wall-clock floor so the simulation still
+ * looks alive at 1x speed) removes most of the per-frame physics cost without changing what
+ * the fluid equations integrate.
+ */
+export interface PhysicsCadence {
+  /** Minimum simulated seconds between fluid/field solves. */
+  simIntervalSec: number;
+  /** Maximum wall-clock seconds between fluid/field solves (keeps slow-motion responsive). */
+  realIntervalSec: number;
+}
+
+export const CADENCE_BY_TIER: Record<string, PhysicsCadence> = {
+  ultra: { simIntervalSec: 0.55, realIntervalSec: 0.045 },
+  high: { simIntervalSec: 0.85, realIntervalSec: 0.06 },
+  medium: { simIntervalSec: 1.25, realIntervalSec: 0.085 },
+  low: { simIntervalSec: 1.9, realIntervalSec: 0.12 },
+};
+
+/**
+ * The Eulerian solve is the one pass whose cost cannot be predicted from the tier alone: it
+ * scales with how much of the domain a storm system occupies. When a solve takes long enough
+ * to blow the frame budget, running it on a fixed interval turns into a visible periodic hitch
+ * instead of a smooth simulation. The coordinator therefore stretches the interval whenever the
+ * previous solve was expensive, trading a little temporal resolution for even frame times.
+ */
+const SOLVE_HITCH_MS = 7.0;
+const CADENCE_STRETCH_MAX = 3.0;
 
 export class AtmosphereSimulationCoordinator {
   public config: AtmosphereConfig;
@@ -24,17 +56,36 @@ export class AtmosphereSimulationCoordinator {
   public observerPrecipType: PrecipitationType = 'None';
   public observerWindU = 0;
   public observerWindW = 0;
+  /** Mass-weighted fall speed of the precipitation reaching the observer (m/s). */
+  public observerPrecipFallSpeedMS = 0;
+  /** 0..1 fraction of observer precipitation that is frozen (hail/graupel/snow). */
+  public observerFrozenFraction = 0;
+  /** 0..1 gustiness of the local wind, driven by nearby gust fronts and downdrafts. */
+  public observerGustFactor = 0;
+
+  public cadence: PhysicsCadence = { ...CADENCE_BY_TIER.high };
+
+  private fluidSimAccum = 0;
+  private fluidRealAccum = 0;
+  private fieldSimAccum = 0;
+  private fieldRealAccum = 0;
+  /** Adaptive stretch (1..3) applied to the fluid cadence when solves are expensive. */
+  private cadenceStretch = 1;
+  /** Milliseconds the last fluid solve and the last field solve each took. */
+  public lastFluidSolveMs = 0;
+  public lastFieldSolveMs = 0;
 
   private baselineWaterMassKg = 0;
-  private cumulativePrecipMassSinkKg = 0;
-  private cumulativeEvapFluxSourceKg = 0;
+  private cumulativeCondensedGKg = 0;
+  private cumulativeFalloutGKg = 0;
+  private cumulativeEvaporatedGKg = 0;
   private lastCandidates: BreakdownCandidate[] = [];
 
   constructor(initialConfig?: Partial<AtmosphereConfig>) {
     this.config = { ...DEFAULT_ATMOSPHERE_CONFIG, ...initialConfig };
     this.sounding = new AtmosphericSounding(this.config);
     this.cellManager = new ConvectiveCellManager();
-    this.grid = new AtmosphericFluidGrid(48, 28, 48);
+    this.grid = new AtmosphericFluidGrid(GRID_NX, GRID_NY, GRID_NZ);
     this.electrification = new AtmosphericElectrificationEngine();
     this.lightning = new AutonomousLightningEngine();
     this.computeBaselineVaporMass();
@@ -46,15 +97,36 @@ export class AtmosphereSimulationCoordinator {
       this.sounding.instability.precipitableWaterMM * DOMAIN_SIZE * DOMAIN_SIZE;
   }
 
+  public setCadence(cadence: PhysicsCadence): void {
+    this.cadence = { ...cadence };
+    this.cadenceStretch = 1;
+  }
+
+  /** Current adaptive multiplier (1..3) applied to the configured physics cadence. */
+  public get cadenceStretchFactor(): number {
+    return this.cadenceStretch;
+  }
+
   /** Resets the entire simulation to t = 0 completely clear sky */
   public resetToClearSky(): void {
     this.simTimeSec = 0;
     this.surfaceWetness = 0;
     this.observerRainMMHr = 0;
     this.observerPrecipType = 'None';
-    this.cumulativePrecipMassSinkKg = 0;
-    this.cumulativeEvapFluxSourceKg = 0;
+    this.observerPrecipFallSpeedMS = 0;
+    this.observerFrozenFraction = 0;
+    this.observerGustFactor = 0;
+    this.cumulativeCondensedGKg = 0;
+    this.cumulativeFalloutGKg = 0;
+    this.cumulativeEvaporatedGKg = 0;
     this.lastCandidates = [];
+    this.fluidSimAccum = 0;
+    this.fluidRealAccum = 0;
+    this.fieldSimAccum = 0;
+    this.fieldRealAccum = 0;
+    this.cadenceStretch = 1;
+    this.lastFluidSolveMs = 0;
+    this.lastFieldSolveMs = 0;
 
     this.sounding.recompute(this.config);
     this.cellManager.reset();
@@ -71,9 +143,9 @@ export class AtmosphereSimulationCoordinator {
   }
 
   /**
-   * Advances simulation with stable sub-stepping so numerical integration stays rock-solid
-   * even at 20x - 50x simulation acceleration, while keeping visual lightning flash duration
-   * anchored to real-world milliseconds (`realDtSec * 1000`).
+   * Advances the simulation. Lagrangian cell dynamics are sub-stepped for stability at any
+   * simulation speed, while the expensive Eulerian passes run on the physics cadence with
+   * the accumulated dt so they integrate the same total time.
    */
   public step(
     realDtSec: number,
@@ -82,13 +154,13 @@ export class AtmosphereSimulationCoordinator {
     observerX: number,
     observerZ: number
   ): void {
-    const clampedRealDt = Math.min(0.05, Math.max(0.001, realDtSec));
     if (paused) {
       return;
     }
-
+    const clampedRealDt = Math.min(0.05, Math.max(0.001, realDtSec));
     const totalSimDt = clampedRealDt * simSpeedMultiplier;
-    // Sub-step atmospheric dynamics with max dt <= 2.5s for strict numerical stability
+
+    // --- Lagrangian convective cells: sub-stepped for strict numerical stability ---
     const maxSubDt = 2.5;
     const subSteps = Math.max(1, Math.min(12, Math.ceil(totalSimDt / maxSubDt)));
     const subDt = totalSimDt / subSteps;
@@ -96,40 +168,66 @@ export class AtmosphereSimulationCoordinator {
     for (let s = 0; s < subSteps; s++) {
       this.simTimeSec += subDt;
       this.cellManager.step(subDt, this.simTimeSec, this.sounding, this.config);
-
-      // Accumulate surface water budget integrals
-      let domainRainAreaFluxKgPerS = 0;
-      for (const c of this.cellManager.cells) {
-        if (c.surfaceRainRateMMHr > 0.05) {
-          const coreArea = Math.PI * Math.pow(c.radiusM * 0.65, 2);
-          domainRainAreaFluxKgPerS += (c.surfaceRainRateMMHr / 3600.0) * coreArea;
-        }
-      }
-      this.cumulativePrecipMassSinkKg += domainRainAreaFluxKgPerS * subDt;
-      this.cumulativeEvapFluxSourceKg +=
-        domainRainAreaFluxKgPerS * subDt + this.grid.totalCondensateMassKg * 0.0005 * subDt;
     }
 
-    // Update 3D Eulerian fluid & volumetric condensate texture once per frame
-    this.grid.stepFluidAndCondensate(
-      totalSimDt,
-      this.simTimeSec,
-      this.sounding,
-      this.cellManager.cells,
-      this.cellManager.coldPools,
-      this.config
-    );
+    this.accumulateWaterBudget();
 
-    // Update 3D Cloud Electrification & Poisson Electric Field Solver
-    this.lastCandidates = this.electrification.step(
-      totalSimDt,
-      this.grid,
-      this.sounding,
-      this.cellManager.cells,
-      this.config
-    );
+    // --- Eulerian fluid solve on the physics cadence ---
+    this.fluidSimAccum += totalSimDt;
+    this.fluidRealAccum += clampedRealDt;
+    const stretch = this.cadenceStretch;
+    const runFluid =
+      this.fluidSimAccum >= this.cadence.simIntervalSec * stretch ||
+      this.fluidRealAccum >= this.cadence.realIntervalSec * stretch;
+    if (runFluid) {
+      const fluidDt = this.fluidSimAccum;
+      this.fluidSimAccum = 0;
+      this.fluidRealAccum = 0;
+      const t0 = nowMs();
+      this.grid.stepDynamics(
+        fluidDt,
+        this.simTimeSec,
+        this.sounding,
+        this.cellManager.cells,
+        this.cellManager.coldPools,
+        this.config
+      );
+      this.lastFluidSolveMs = nowMs() - t0;
+      // Relax the stretch back toward 1 whenever a solve was cheap, tighten it when expensive.
+      this.cadenceStretch =
+        this.lastFluidSolveMs > SOLVE_HITCH_MS
+          ? Math.min(CADENCE_STRETCH_MAX, this.cadenceStretch + 0.35)
+          : Math.max(1, this.cadenceStretch - 0.12);
+    }
+    // The texture must be repacked every frame: lightning glow inside clouds is a real-time
+    // visual effect even while the fluid itself advances more slowly.
+    this.grid.refreshVolumeTexture(clampedRealDt);
 
-    // Step Autonomous Dielectric Breakdown Lightning & TLE Engine
+    // --- 3D electrification & Poisson field solve (slower cadence: charge evolves slowly) ---
+    this.fieldSimAccum += totalSimDt;
+    this.fieldRealAccum += clampedRealDt;
+    const runField =
+      this.fieldSimAccum >= this.cadence.simIntervalSec * 1.6 * stretch ||
+      this.fieldRealAccum >= this.cadence.realIntervalSec * 2.0 * stretch;
+    if (runField) {
+      this.fieldSimAccum = 0;
+      this.fieldRealAccum = 0;
+      const t0 = nowMs();
+      this.lastCandidates = this.electrification.step(
+        Math.max(totalSimDt, this.cadence.simIntervalSec),
+        this.grid,
+        this.sounding,
+        this.cellManager.cells,
+        this.config,
+        true
+      );
+      this.lastFieldSolveMs = nowMs() - t0;
+    } else {
+      // Charge separation still relaxes every frame; only the field solve is deferred.
+      this.electrification.step(totalSimDt, this.grid, this.sounding, this.cellManager.cells, this.config, false);
+    }
+
+    // --- Autonomous dielectric breakdown lightning & TLEs (real-time millisecond phases) ---
     this.lightning.step(
       totalSimDt,
       clampedRealDt * 1000.0,
@@ -141,12 +239,47 @@ export class AtmosphereSimulationCoordinator {
       this.electrification
     );
 
-    // Sample local rainfall, wind & surface wetting at observer coordinates
-    this.updateObserverGroundEnvironment(totalSimDt, observerX, observerZ);
+    this.updateObserverGroundEnvironment(totalSimDt, clampedRealDt, observerX, observerZ);
+  }
+
+  /**
+   * Closes the column water budget in mixing-ratio space: everything condensed must still be
+   * either suspended, fallen out as precipitation, or evaporated back to vapor.
+   */
+  private accumulateWaterBudget(): void {
+    let condensed = 0;
+    let fallout = 0;
+    let evaporated = 0;
+    for (const c of this.cellManager.cells) {
+      condensed += c.cumCondensedGKg;
+      fallout += c.cumFalloutGKg;
+      evaporated += c.cumEvaporatedGKg;
+    }
+    // Water carried by cells that have already retired is tracked by the manager so the
+    // domain budget stays closed across the whole run.
+    this.cumulativeCondensedGKg = condensed + this.cellManager.retiredCondensedGKg;
+    this.cumulativeFalloutGKg = fallout + this.cellManager.retiredFalloutGKg;
+    this.cumulativeEvaporatedGKg = evaporated + this.cellManager.retiredEvaporatedGKg;
+  }
+
+  private waterInventoryGKg(): number {
+    let inventory = 0;
+    for (const c of this.cellManager.cells) {
+      inventory +=
+        c.cloudWaterGKg +
+        c.supercooledWaterGKg +
+        c.cloudIceGKg +
+        c.snowGKg +
+        c.graupelGKg +
+        c.hailGKg +
+        c.rainGKg;
+    }
+    return inventory;
   }
 
   private updateObserverGroundEnvironment(
     simDt: number,
+    realDt: number,
     obsX: number,
     obsZ: number
   ): void {
@@ -156,38 +289,77 @@ export class AtmosphereSimulationCoordinator {
     this.observerWindU = this.grid.u[id0];
     this.observerWindW = this.grid.w[id0];
 
+    // Precipitation at the observer: sum the shafts that actually cover this location,
+    // weighted by distance into the core, and keep the hydrometeor mix of the dominant
+    // contributor so the renderer knows whether it is raining, hailing or snowing.
     let localRain = 0;
     let dominantType: PrecipitationType = 'None';
+    let dominantFallSpeed = 0;
+    let frozenFraction = 0;
+    let gust = 0;
+
     for (const c of this.cellManager.cells) {
       const px = c.x + c.precipCoreOffsetX;
       const pz = c.z + c.precipCoreOffsetZ;
-      const d = Math.hypot(obsX - px, obsZ - pz);
-      const reach = Math.max(1800, c.radiusM * 1.35);
-      if (d < reach && c.surfaceRainRateMMHr > 0.08) {
-        const w = Math.pow(1.0 - d / reach, 1.3);
+      const dx = obsX - px;
+      const dz = obsZ - pz;
+      const reach = Math.max(1600, c.radiusM * 1.3);
+      const d2 = dx * dx + dz * dz;
+      if (d2 > reach * reach) continue;
+      const d = Math.sqrt(d2);
+      const w = Math.pow(1.0 - d / reach, 1.25);
+
+      if (c.surfaceRainRateMMHr > 0.05) {
         const contrib = c.surfaceRainRateMMHr * w;
         if (contrib > localRain) {
           localRain = contrib;
           dominantType = c.precipType;
+          frozenFraction = frozenShareOfType(c.precipType);
+          dominantFallSpeed = bulkFallSpeedOfCell(c);
+        }
+      }
+
+      // Downdraft outflow and gust front raise the local wind gustiness.
+      if (c.downdraftMaxMS > 1.0 && w > 0.15) {
+        gust = Math.max(gust, Math.min(1, (c.downdraftMaxMS / 16.0) * w));
+      }
+    }
+
+    for (const pool of this.cellManager.coldPools) {
+      const dx = obsX - pool.x;
+      const dz = obsZ - pool.z;
+      const dFront = Math.abs(Math.sqrt(dx * dx + dz * dz) - pool.radiusM);
+      if (dFront < 1600) {
+        gust = Math.max(gust, pool.strength * (1.0 - dFront / 1600));
+      }
+    }
+
+    // Grid-resolved rain fringe under a shaft whose core is offset from the observer.
+    const gridQr = this.grid.qr[id0];
+    if (gridQr > 0.03) {
+      const gridRain = gridQr * 9.5;
+      if (gridRain > localRain) {
+        localRain = gridRain;
+        if (dominantType === 'None') {
+          dominantType =
+            gridRain > 20 ? 'Heavy Rain' : gridRain > 5 ? 'Moderate Rain' : gridRain > 0.8 ? 'Light Rain' : 'Drizzle';
+          dominantFallSpeed = 5.5;
         }
       }
     }
 
-    // Also include gentle domain rain fringe if under rainy anvil/shaft
-    const gridQr = this.grid.qr[id0];
-    if (gridQr > 0.05 && localRain < gridQr * 14.0) {
-      localRain = gridQr * 14.0;
-      if (dominantType === 'None') {
-        dominantType = localRain > 15 ? 'Heavy Rain' : localRain > 4 ? 'Moderate Rain' : 'Light Rain';
-      }
-    }
+    // Smooth the observer values in real time so passing shaft edges ramp instead of popping.
+    const blend = 1.0 - Math.exp(-realDt * 6.5);
+    this.observerRainMMHr += (localRain - this.observerRainMMHr) * blend;
+    this.observerPrecipFallSpeedMS +=
+      (dominantFallSpeed - this.observerPrecipFallSpeedMS) * blend;
+    this.observerFrozenFraction += (frozenFraction - this.observerFrozenFraction) * blend;
+    this.observerGustFactor += (gust - this.observerGustFactor) * (1.0 - Math.exp(-realDt * 2.5));
+    this.observerPrecipType = this.observerRainMMHr > 0.08 ? dominantType : 'None';
 
-    this.observerRainMMHr = localRain;
-    this.observerPrecipType = localRain > 0.1 ? dominantType : 'None';
-
-    // Surface wetting, puddle accumulation & solar evaporation drying
-    if (localRain > 0.15) {
-      const wetRate = (0.004 + localRain * 0.00065) * simDt;
+    // Surface wetting, puddle accumulation & solar evaporation drying.
+    if (this.observerRainMMHr > 0.15) {
+      const wetRate = (0.004 + this.observerRainMMHr * 0.00065) * simDt;
       this.surfaceWetness = Math.min(1.0, this.surfaceWetness + wetRate);
     } else {
       const dryRate = 0.00045 * this.config.solarHeatingFactor * simDt;
@@ -218,22 +390,26 @@ export class AtmosphereSimulationCoordinator {
     }
 
     const denom = Math.max(1, cells.length);
-    const totalWaterNow =
-      this.baselineWaterMassKg +
-      this.grid.totalCondensateMassKg +
-      this.cumulativePrecipMassSinkKg -
-      this.cumulativeEvapFluxSourceKg;
+    const totalWaterNow = this.baselineWaterMassKg + this.grid.totalCondensateMassKg;
+
+    // Water conservation in mixing-ratio space: condensed == suspended + fallout + evaporated.
+    // Before any condensation has occurred there is no budget to check, so report 0 rather than
+    // dividing by a numerical floor (which read as a spurious 99.9 % "drift" on a clear sky).
+    const inventory = this.waterInventoryGKg();
+    const condensed = this.cumulativeCondensedGKg;
+    const accounted = inventory + this.cumulativeFalloutGKg + this.cumulativeEvaporatedGKg;
     const waterDriftPct =
-      (Math.abs(totalWaterNow - this.baselineWaterMassKg) /
-        Math.max(1.0, this.baselineWaterMassKg)) *
-      100.0;
+      condensed < 1e-3
+        ? 0
+        : Math.min(100, (Math.abs(condensed - accounted) / condensed) * 100.0);
 
     const inst = this.sounding.instability;
     const thermoOk =
       inst.lcl > 0 &&
       inst.el >= inst.lcl &&
       inst.cape >= 0 &&
-      !Number.isNaN(inst.cape);
+      !Number.isNaN(inst.cape) &&
+      maxRain < 2000;
 
     return {
       simTimeSec: this.simTimeSec,
@@ -264,12 +440,47 @@ export class AtmosphereSimulationCoordinator {
       validation: {
         massContinuityResidual: this.grid.maxDivergenceResidual,
         totalWaterMassKg: totalWaterNow,
-        waterConservationDriftPct: Math.min(2.5, waterDriftPct),
-        chargeBalanceResidualC:
-          Math.abs(this.electrification.netAtmosphereChargeC) * 0.002,
+        waterConservationDriftPct: Math.min(99.9, waterDriftPct),
+        chargeBalanceResidualC: Math.abs(this.electrification.netAtmosphereChargeC) * 0.002,
         maxCFL: this.grid.maxCFL,
         thermodynamicConsistent: thermoOk,
       },
     };
   }
+}
+
+function frozenShareOfType(type: PrecipitationType): number {
+  switch (type) {
+    case 'Snow / Ice Pellets':
+      return 1.0;
+    case 'Graupel Shower':
+      return 0.85;
+    case 'Hail & Heavy Rain':
+      return 0.45;
+    case 'Mixed-Phase Precipitation':
+      return 0.5;
+    default:
+      return 0.0;
+  }
+}
+
+function bulkFallSpeedOfCell(c: {
+  rainGKg: number;
+  snowGKg: number;
+  graupelGKg: number;
+  hailGKg: number;
+}): number {
+  const total = c.rainGKg + c.snowGKg + c.graupelGKg + c.hailGKg;
+  if (total <= 1e-4) return 6.0;
+  // Mass-weighted mean fall speed across the precipitating categories.
+  return (
+    (c.rainGKg * 6.4 + c.snowGKg * 1.1 + c.graupelGKg * 4.6 + c.hailGKg * 13.5) / total
+  );
+}
+
+/** Wall-clock milliseconds, without pulling in a DOM dependency for headless tooling. */
+function nowMs(): number {
+  return typeof performance !== 'undefined' && performance.now
+    ? performance.now()
+    : Date.now();
 }

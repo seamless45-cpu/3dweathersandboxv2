@@ -170,6 +170,12 @@ export interface ConvectiveCell {
   precipType: PrecipitationType;
   virgaFraction: number; // 0..1 fraction evaporating before reaching ground
 
+  // Integrated column water budget (g/kg of column air) — closes the conservation
+  // diagnostic: cumCondensed == inventory + cumFallout + cumEvaporated.
+  cumCondensedGKg: number;
+  cumFalloutGKg: number;
+  cumEvaporatedGKg: number;
+
   // Cell Electrical Charge Structure (tripole / anomalous multipole)
   upperPosChargeNCm3: number; // nC/m^3 at 8.5 - 13.5 km
   mainNegChargeNCm3: number; // nC/m^3 at 5.0 - 8.0 km (negative value)
