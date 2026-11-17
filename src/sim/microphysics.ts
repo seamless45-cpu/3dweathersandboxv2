@@ -1,4 +1,8 @@
-import { AtmosphericSounding, saturationMixingRatioIce, saturationMixingRatioLiquid } from './thermodynamics';
+import {
+  AtmosphericSounding,
+  saturationMixingRatioIce,
+  saturationMixingRatioLiquid,
+} from './thermodynamics';
 import { AtmosphereConfig, ConvectiveCell, PHYS, PrecipitationType } from './types';
 
 export interface CellMicrophysicsStepOutput {
@@ -6,12 +10,90 @@ export interface CellMicrophysicsStepOutput {
   subCloudCoolingKPerS: number;
   precipLoadingDragMS2: number;
   rimingRateGKgPerS: number; // feeds Takahashi non-inductive charging!
+  /** Net vapor -> condensate supply (g/kg of column air per s). Bounded by the sounding. */
+  condensateSupplyGKgPerS: number;
+  /** Condensate returned to vapor by entrainment mixing + sub-cloud evaporation. */
+  evaporatedGKgPerS: number;
+  /** Total hydrometeor mass leaving the column base (g/kg per s), before sub-cloud evaporation. */
+  precipFalloutGKgPerS: number;
+  /** Mass-weighted terminal fall speed of the precipitating categories (m/s). */
+  bulkFallSpeedMS: number;
+  /** Mass-weighted terminal fall speed of rain alone (m/s) — drives streak rendering. */
+  rainFallSpeedMS: number;
+  /** Fraction of falling rain that evaporates below cloud base (virga). */
+  subCloudEvapFraction: number;
+  totalSuspendedGKg: number;
+  totalPrecipGKg: number;
+  /** Mean droplet/ice effective radius (µm) implied by the condensate — used for optics. */
+  effectiveRadiusUm: number;
+  /** Liquid mass flux actually reaching the surface (kg m^-2 s^-1); 1 kg m^-2 h^-1 == 1 mm/h. */
+  surfaceLiquidFluxKgM2S: number;
+  /** Frozen mass flux reaching the surface (kg m^-2 s^-1). */
+  surfaceFrozenFluxKgM2S: number;
+  /** q_ceiling / q_adiabatic: how much of the adiabatic condensate survives entrainment. */
+  condensateEfficiency: number;
+}
+
+const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
+
+/**
+ * Bulk terminal fall speeds (mass-weighted, air-density corrected).
+ * Follows the standard Lin-et-al. style power laws V_t = a (rho q)^b with the
+ * (rho_0/rho)^0.5 expansion correction, clamped to observed hydrometeor ranges.
+ */
+export function terminalFallSpeedRainMS(qGKg: number, rho: number): number {
+  if (qGKg <= 1e-5) return 0;
+  const v = 14.34 * Math.pow(Math.max(1e-7, qGKg * 1e-3 * rho), 0.135);
+  return clamp(v, 0.8, 11.0);
+}
+
+export function terminalFallSpeedSnowMS(qGKg: number, rho: number): number {
+  if (qGKg <= 1e-5) return 0;
+  const v = 1.15 * Math.pow(Math.max(1e-7, qGKg * 1e-3 * rho), 0.09) * Math.sqrt(1.2 / rho);
+  return clamp(v, 0.3, 2.6);
+}
+
+export function terminalFallSpeedGraupelMS(qGKg: number, rho: number): number {
+  if (qGKg <= 1e-5) return 0;
+  const v = 6.0 * Math.pow(Math.max(1e-7, qGKg * 1e-3 * rho), 0.11) * Math.sqrt(1.2 / rho);
+  return clamp(v, 1.2, 9.0);
+}
+
+export function terminalFallSpeedHailMS(qGKg: number, rho: number): number {
+  if (qGKg <= 1e-5) return 0;
+  const v = 18.0 * Math.pow(Math.max(1e-7, qGKg * 1e-3 * rho), 0.12) * Math.sqrt(1.2 / rho);
+  return clamp(v, 4.0, 26.0);
 }
 
 /**
- * Steps the 8-compartment bulk cloud microphysics within a developing/mature/dissipating
- * convective cell column, coupling directly with updraft transport, sounding temperature,
- * CCN concentration, riming efficiency, and sub-cloud relative humidity.
+ * Melting fraction of an ice hydrometeor falling from `sourceHeightM` through the
+ * sub-freezing isotherm: first-order in the warm-layer temperature excess and the
+ * time the particle actually spends below 0 °C.
+ */
+function meltFraction(sourceHeightM: number, fallSpeedMS: number, freezeZ: number, warmDeltaK: number, kMelt: number): number {
+  if (freezeZ <= 60 || fallSpeedMS <= 0.05 || warmDeltaK <= 0.05) return 0;
+  const warmPathM = Math.min(sourceHeightM, freezeZ);
+  const timeInWarmLayer = warmPathM / fallSpeedMS;
+  return 1.0 - Math.exp(-kMelt * warmDeltaK * timeInWarmLayer);
+}
+
+/**
+ * Steps the 8-compartment bulk cloud microphysics of one convective column.
+ *
+ * Design notes (why this version cannot run away):
+ *  - The condensate reservoirs (cloud water, supercooled water, cloud ice) relax toward a
+ *    ceiling derived from the sounding itself: the adiabatic condensate a saturated parcel
+ *    would carry from cloud base to cloud top, multiplied by the entrainment dilution
+ *    factor exp(-eps * depth). That ceiling is a few g/kg for a deep convective column,
+ *    matching aircraft observations, instead of being an open-ended source term.
+ *  - Every precipitating category is fed only by first-order conversions out of those
+ *    reservoirs. For a reservoir relaxed with time constant tau and drained at rate k,
+ *    the steady-state throughput is ceiling / (tau + 1/k) <= ceiling / tau, i.e. no
+ *    downstream flux can ever exceed the vapor supply. Rain rates therefore stay in the
+ *    observed 0.1-150 mm/h range instead of diverging.
+ *  - Sedimentation is a mass flux q * V_t / H, and the surface rain rate is computed from
+ *    that same flux, so the reported rain rate is consistent with the mass actually
+ *    leaving the column (and with the cold-pool source term).
  */
 export function stepCellMicrophysics(
   cell: ConvectiveCell,
@@ -19,251 +101,386 @@ export function stepCellMicrophysics(
   sounding: AtmosphericSounding,
   cfg: AtmosphereConfig
 ): CellMicrophysicsStepOutput {
-  const lcl = sounding.instability.lcl;
-  const freezeZ = sounding.instability.freezingLevel;
-  const homoZ = sounding.instability.homogeneousFreezeLevel;
+  const inst = sounding.instability;
+  const freezeZ = inst.freezingLevel;
+  const homoZ = inst.homogeneousFreezeLevel;
+  const baseZ = cell.cloudBaseM;
+  const topZ = cell.cloudTopM;
+  const depth = Math.max(200, topZ - baseZ);
+  const stepDt = Math.max(1e-4, dt);
 
-  // If cell hasn't reached condensation level yet, evaporate any residual condensate
-  if (cell.cloudTopM <= cell.cloudBaseM + 60) {
-    const evap = Math.min(cell.cloudWaterGKg, dt * 0.05);
-    cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg - evap);
-    cell.rainGKg = Math.max(0, cell.rainGKg * (1 - 0.08 * dt));
+  // ---------------- 0. No condensed cloud yet: residual condensate evaporates ----------------
+  if (topZ <= baseZ + 60) {
+    const rhMid = clamp(sounding.relativeHumidityAt(Math.max(120, baseZ)), 0.05, 1.0);
+    const evapRate = 0.010 + 0.085 * (1.0 - rhMid); // 1/s
+    const evapFrac = 1.0 - Math.exp(-evapRate * stepDt);
+    const goneCloud = cell.cloudWaterGKg * evapFrac;
+    const goneSlw = cell.supercooledWaterGKg * evapFrac;
+    const goneIce = (cell.cloudIceGKg + cell.snowGKg) * evapFrac;
+    cell.cloudWaterGKg -= goneCloud;
+    cell.supercooledWaterGKg -= goneSlw;
+    cell.cloudIceGKg -= goneIce;
+    cell.snowGKg -= cell.snowGKg * evapFrac;
+
+    const rhoLow = Math.max(0.2, sounding.densityAt(Math.max(60, baseZ * 0.4)));
+    const vRain = terminalFallSpeedRainMS(cell.rainGKg, rhoLow);
+    const rainGone = cell.rainGKg * (1.0 - Math.exp(-(0.004 + vRain / Math.max(700, baseZ)) * stepDt));
+    cell.rainGKg = Math.max(0, cell.rainGKg - rainGone);
+
+    const evaporatedTotal = goneCloud + goneSlw + goneIce + rainGone;
+    cell.cumEvaporatedGKg += evaporatedTotal;
+    cell.vaporExcessGKg = Math.max(0, sounding.qSatGKgAt(baseZ) * (1.0 - rhMid));
     cell.surfaceRainRateMMHr = 0;
+    cell.virgaFraction = 0;
     cell.precipType = 'None';
+
+    const latentJPerKg = evaporatedTotal * 1e-3 * PHYS.L_V;
     return {
-      latentHeatingKPerS: -evap * 0.001 * (PHYS.L_V / PHYS.CP),
+      latentHeatingKPerS: -latentJPerKg / PHYS.CP / stepDt,
       subCloudCoolingKPerS: 0,
-      precipLoadingDragMS2: 0,
+      precipLoadingDragMS2: PHYS.G * (cell.rainGKg + cell.graupelGKg + cell.hailGKg) * 1e-3,
       rimingRateGKgPerS: 0,
+      condensateSupplyGKgPerS: 0,
+      evaporatedGKgPerS: evaporatedTotal / stepDt,
+      precipFalloutGKgPerS: 0,
+      bulkFallSpeedMS: vRain,
+      rainFallSpeedMS: vRain,
+      subCloudEvapFraction: 0,
+      totalSuspendedGKg: cell.cloudWaterGKg + cell.supercooledWaterGKg + cell.cloudIceGKg,
+      totalPrecipGKg: cell.rainGKg + cell.snowGKg + cell.graupelGKg + cell.hailGKg,
+      effectiveRadiusUm: 8,
+      surfaceLiquidFluxKgM2S: 0,
+      surfaceFrozenFluxKgM2S: 0,
+      condensateEfficiency: 0,
     };
   }
 
-  const midCloudZ = 0.45 * cell.cloudBaseM + 0.55 * cell.cloudTopM;
-  const upperCloudZ = 0.22 * cell.cloudBaseM + 0.78 * cell.cloudTopM;
-  const midLvl = sounding.sampleAtAltitude(midCloudZ);
-  const upperLvl = sounding.sampleAtAltitude(upperCloudZ);
-  const baseLvl = sounding.sampleAtAltitude(Math.max(200, cell.cloudBaseM * 0.5));
+  const w = Math.max(0, cell.updraftMaxMS);
 
-  // 1. Condensation driven by adiabatic ascent above LCL (w * dq_vs/dz) minus lateral entrainment drying
-  const qvsBase = saturationMixingRatioLiquid(
-    sounding.sampleAtAltitude(cell.cloudBaseM).tempK,
-    sounding.sampleAtAltitude(cell.cloudBaseM).p
-  );
-  const qvsMid = saturationMixingRatioLiquid(midLvl.tempK, midLvl.p);
-  const availableCondensatePotentialGKg = Math.max(0, (qvsBase - qvsMid) * 1000.0);
+  // ---------------- 1. Entrainment, dilution ceiling and column residence time ----------------
+  // Observed lateral entrainment: ~1-3 km^-1 for shallow cumulus, 0.1-0.5 km^-1 for the
+  // cores of deep convective towers. eps ~ 0.1 + 0.62/R captures that radius dependence.
+  const radiusKm = Math.max(0.22, cell.radiusM * 1e-3);
+  const epsKmInv = clamp(0.075 + 0.34 / radiusKm, 0.09, 1.6);
+  cell.entrainmentRate = epsKmInv;
 
-  const updraftSupply = Math.max(0, cell.updraftMaxMS);
-  const depthFactor = Math.min(1.5, (cell.cloudTopM - lcl) / 3500.0);
-  const condensationRate =
-    updraftSupply *
-    0.0055 *
-    Math.max(0.25, depthFactor) *
-    (1.0 + 0.12 * ( availableCondensatePotentialGKg - (cell.cloudWaterGKg + cell.supercooledWaterGKg) ));
+  const tauResidence = clamp(depth / Math.max(1.2, w), 90, 2400); // s, base -> top transit
+  const relax = 1.0 - Math.exp(-stepDt / tauResidence);
 
-  const entrainmentEvap =
-    cell.entrainmentRate *
-    (1.15 - sounding.levels[0].qvEnv * 40.0) *
-    0.045 *
-    (cell.cloudWaterGKg + cell.supercooledWaterGKg);
+  // Strict physical ceiling: the adiabatic condensate a saturated parcel produces over the
+  // cloud depth. Entrainment dilutes a *parcel* along the path it actually travels, and the
+  // condensate that reaches a given level was produced over the layer below it — not over the
+  // whole tower. Applying exp(-eps * full depth) to the column integral instead suppressed
+  // deep clouds almost completely (0.02 at 13 km), which is why tall towers stopped raining.
+  //
+  // The physically consistent form weights each layer's production by the dilution it has
+  // suffered on the way up:
+  //     q_eff = INT_base^top  (dq_c/dz) * exp(-eps * (z - base)) dz
+  const qCeilingGKg = dilutedAdiabaticCondensate(sounding, baseZ, topZ, epsKmInv);
+  // Undiluted column condensate, kept for diagnostics (condensation efficiency).
+  const qAdiabaticGKg = sounding.adiabaticCondensateGKg(baseZ, topZ);
+  const condensateEfficiency = qAdiabaticGKg > 1e-6 ? clamp(qCeilingGKg / qAdiabaticGKg, 0.02, 1.0) : 1.0;
 
-  // Partition newly condensed water into warm cloud droplets (z < freezeZ) vs supercooled water (freezeZ < z < homoZ)
-  const warmDepthFrac =
-    cell.cloudTopM <= freezeZ
-      ? 1.0
-      : Math.max(0.08, Math.min(1.0, (freezeZ - cell.cloudBaseM) / Math.max(200, cell.cloudTopM - cell.cloudBaseM)));
-  const mixedDepthFrac =
-    cell.cloudTopM <= freezeZ
-      ? 0.0
-      : Math.max(
-          0.0,
-          Math.min(
-            1.0,
-            (Math.min(cell.cloudTopM, homoZ) - Math.max(cell.cloudBaseM, freezeZ)) /
-              Math.max(300, cell.cloudTopM - cell.cloudBaseM)
-          )
-        );
-  const glaciatedDepthFrac = Math.max(0, 1.0 - warmDepthFrac - mixedDepthFrac);
-
-  const netCond = Math.max(-0.08, condensationRate - entrainmentEvap);
-  const dWarmCond = netCond * warmDepthFrac * dt;
-  const dSlwCond = netCond * mixedDepthFrac * dt;
-  const dVaporDepDirect = Math.max(0, netCond) * glaciatedDepthFrac * dt;
-
-  cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg + dWarmCond);
-  cell.supercooledWaterGKg = Math.max(0, cell.supercooledWaterGKg + dSlwCond);
-  cell.cloudIceGKg = Math.max(0, cell.cloudIceGKg + dVaporDepDirect);
-
-  // Upward transport of warm droplets across freezing level into supercooled liquid water
-  if (cell.cloudTopM > freezeZ && cell.updraftMaxMS > 1.5) {
-    const loftToSupercooled = Math.min(
-      cell.cloudWaterGKg * 0.4,
-      cell.cloudWaterGKg * (cell.updraftMaxMS / 2800.0) * dt
-    );
-    cell.cloudWaterGKg -= loftToSupercooled;
-    cell.supercooledWaterGKg += loftToSupercooled;
+  // ---------------- 2. Phase partition, weighted by where condensate is actually produced ----
+  const SAMPLES = 6;
+  let weightSum = 0;
+  let warmWeight = 0;
+  let mixedWeight = 0;
+  let glaciatedWeight = 0;
+  let iceWeightInMixed = 0;
+  for (let k = 0; k < SAMPLES; k++) {
+    const z = baseZ + (depth * (k + 0.5)) / SAMPLES;
+    const production = sounding.condGKgPerKmAt(z);
+    if (production <= 1e-9) continue;
+    const tempC = sounding.tempCAt(z);
+    weightSum += production;
+    if (tempC >= 0) {
+      warmWeight += production;
+    } else if (tempC > -38) {
+      mixedWeight += production;
+      // INP activation is strongly nonlinear in temperature (Fletcher-like).
+      iceWeightInMixed += production * Math.pow(Math.min(1, -tempC / 38.0), 1.6);
+    } else {
+      glaciatedWeight += production;
+    }
   }
+  if (weightSum <= 1e-9) {
+    warmWeight = 1;
+    weightSum = 1;
+  }
+  const fracWarm = warmWeight / weightSum;
+  const fracMixed = mixedWeight / weightSum;
+  const fracGlaciated = glaciatedWeight / weightSum;
+  const fracIceOfMixed = fracMixed > 1e-6 ? iceWeightInMixed / mixedWeight : 0;
 
-  // 2. Heterogeneous & Homogeneous Freezing + Bergeron-Findeisen Deposition
-  let latentFreezeJPerKg = 0;
-  if (cell.cloudTopM > freezeZ + 300) {
-    const iceSupersat =
-      saturationMixingRatioLiquid(upperLvl.tempK, upperLvl.p) /
-        Math.max(1e-6, saturationMixingRatioIce(upperLvl.tempK, upperLvl.p)) -
-      1.0;
-    const bergeronRate =
-      Math.max(0, iceSupersat) *
-      0.032 *
-      Math.sqrt(Math.max(0.02, cell.cloudIceGKg + 0.05)) *
-      Math.min(1.0, cell.supercooledWaterGKg * 0.8);
-    const dBergeron = Math.min(cell.supercooledWaterGKg * 0.35, bergeronRate * dt);
+  const eqCloudGKg = qCeilingGKg * fracWarm;
+  const eqSlwGKg = qCeilingGKg * fracMixed * (1.0 - fracIceOfMixed);
+  const eqIceGKg = qCeilingGKg * (fracGlaciated + fracMixed * fracIceOfMixed);
+
+  // ---------------- 3. Condensation / dilution-evaporation of the suspended reservoirs -------
+  const dCloud = (eqCloudGKg - cell.cloudWaterGKg) * relax;
+  const dSlw = (eqSlwGKg - cell.supercooledWaterGKg) * relax;
+  const dIce = (eqIceGKg - cell.cloudIceGKg) * relax;
+
+  const grossCondGKg = Math.max(0, dCloud) + Math.max(0, dSlw) + Math.max(0, dIce);
+  const grossDilutionEvapGKg = Math.max(0, -dCloud) + Math.max(0, -dSlw) + Math.max(0, -dIce);
+
+  cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg + dCloud);
+  cell.supercooledWaterGKg = Math.max(0, cell.supercooledWaterGKg + dSlw);
+  cell.cloudIceGKg = Math.max(0, cell.cloudIceGKg + dIce);
+
+  // Latent heat: vapor->liquid releases L_v, vapor->ice releases L_s, freezing releases L_f.
+  let latentJPerKg =
+    (Math.max(0, dCloud) + Math.max(0, dSlw)) * 1e-3 * PHYS.L_V +
+    Math.max(0, dIce) * 1e-3 * PHYS.L_S -
+    (Math.max(0, -dCloud) + Math.max(0, -dSlw)) * 1e-3 * PHYS.L_V -
+    Math.max(0, -dIce) * 1e-3 * PHYS.L_S;
+
+  // ---------------- 4. Bergeron-Findeisen + homogeneous freezing ----------------
+  const mixedLevelZ = clamp(0.5 * (freezeZ + Math.min(topZ, freezeZ + 3200)), baseZ, topZ);
+  const mixedTempK = sounding.tempKAt(mixedLevelZ);
+  const mixedPressPa = sounding.pressurePaAt(mixedLevelZ);
+  let freezingJPerKg = 0;
+
+  if (cell.supercooledWaterGKg > 1e-4 && cell.cloudTopM > freezeZ + 250) {
+    const qsl = saturationMixingRatioLiquid(mixedTempK, mixedPressPa);
+    const qsi = Math.max(1e-9, saturationMixingRatioIce(mixedTempK, mixedPressPa));
+    const iceSupersaturation = clamp(qsl / qsi - 1.0, 0, 0.35);
+    // Dendritic growth window near -15 °C is where ice grows fastest at SLW expense.
+    const dendriticBoost = 0.55 + 1.25 * Math.exp(-Math.pow((mixedTempK - 258.15) / 7.5, 2));
+    const kBergeron =
+      9.0e-4 *
+      (0.4 + iceSupersaturation * 9.0) *
+      dendriticBoost *
+      (cell.cloudIceGKg / (cell.cloudIceGKg + 0.06));
+    const dBergeron = Math.min(
+      cell.supercooledWaterGKg * 0.5,
+      cell.supercooledWaterGKg * (1.0 - Math.exp(-kBergeron * stepDt))
+    );
     cell.supercooledWaterGKg -= dBergeron;
     cell.cloudIceGKg += dBergeron;
-    latentFreezeJPerKg += dBergeron * 0.001 * PHYS.L_F;
+    freezingJPerKg += dBergeron * 1e-3 * PHYS.L_F;
 
-    // Homogeneous freezing above -38C isotherm
+    // Homogeneous freezing of the remainder above the -38 °C isotherm.
     if (cell.cloudTopM > homoZ) {
-      const homoFrac = Math.min(1.0, (cell.cloudTopM - homoZ) / 1800.0);
-      const dHomo = Math.min(
-        cell.supercooledWaterGKg * 0.65,
-        cell.supercooledWaterGKg * homoFrac * 0.18 * dt
-      );
+      const overShoot = clamp((cell.cloudTopM - homoZ) / 1600.0, 0, 1.6);
+      const kHomo = 0.012 + 0.09 * overShoot; // 1/s
+      const dHomo = cell.supercooledWaterGKg * (1.0 - Math.exp(-kHomo * stepDt));
       cell.supercooledWaterGKg -= dHomo;
       cell.cloudIceGKg += dHomo;
-      latentFreezeJPerKg += dHomo * 0.001 * PHYS.L_F;
+      freezingJPerKg += dHomo * 1e-3 * PHYS.L_F;
     }
   }
 
-  // 3. Ice Crystal Aggregation -> Snow Aggregates
-  const aggThreshold = 0.22;
-  if (cell.cloudIceGKg > aggThreshold) {
+  // ---------------- 5. Ice -> snow aggregation ----------------
+  if (cell.cloudIceGKg > 0.03) {
+    const aggTempFactor =
+      0.45 + 1.35 * Math.exp(-Math.pow((mixedTempK - 258.15) / 9.0, 2));
+    const kAgg = 1.35e-3 * aggTempFactor * clamp(cell.cloudIceGKg / 0.18, 0.25, 1.6);
     const dAgg = Math.min(
-      (cell.cloudIceGKg - aggThreshold) * 0.5,
-      0.028 * (cell.cloudIceGKg - aggThreshold) * dt
+      cell.cloudIceGKg * 0.55,
+      cell.cloudIceGKg * (1.0 - Math.exp(-kAgg * stepDt))
     );
     cell.cloudIceGKg -= dAgg;
     cell.snowGKg += dAgg;
   }
 
-  // 4. Riming (Supercooled water colliding with Ice/Snow -> Graupel) & Wet Growth -> Hailstones
+  // ---------------- 6. Riming (SLW + ice/snow -> graupel) and wet hail growth ----------------
   let rimingRateGKgPerS = 0;
-  if (cell.supercooledWaterGKg > 0.08 && (cell.snowGKg + cell.cloudIceGKg + cell.graupelGKg) > 0.06) {
-    const collectorMass = cell.snowGKg * 0.9 + cell.cloudIceGKg * 0.35 + cell.graupelGKg * 1.15;
-    rimingRateGKgPerS =
-      0.038 *
+  const collectors = cell.snowGKg + cell.graupelGKg * 1.15 + cell.cloudIceGKg * 0.28;
+  if (cell.supercooledWaterGKg > 0.03 && collectors > 0.02) {
+    // Collision kernel ~ liquid water content x collector surface area, temperature limited.
+    const tempWindow = clamp(0.35 + 1.25 * Math.exp(-Math.pow((mixedTempK - 261.15) / 9.0, 2)), 0.2, 1.7);
+    const kRime =
+      3.4e-3 *
       cfg.rimingEfficiency *
-      cell.supercooledWaterGKg *
-      Math.min(3.5, collectorMass) *
-      Math.min(1.8, 0.35 + cell.updraftMaxMS / 14.0);
-
-    const dRime = Math.min(cell.supercooledWaterGKg * 0.55, rimingRateGKgPerS * dt);
+      tempWindow *
+      clamp(collectors / 0.5, 0.15, 2.4) *
+      clamp(0.4 + w / 16.0, 0.3, 2.0);
+    rimingRateGKgPerS = Math.min(cell.supercooledWaterGKg, kRime * cell.supercooledWaterGKg * stepDt) / stepDt;
+    const dRime = rimingRateGKgPerS * stepDt;
     cell.supercooledWaterGKg -= dRime;
-    // Also convert a portion of snow embryo into graupel
-    const snowConvert = Math.min(cell.snowGKg * 0.35, dRime * 0.45);
-    cell.snowGKg -= snowConvert;
-    cell.graupelGKg += dRime + snowConvert;
-    latentFreezeJPerKg += dRime * 0.001 * PHYS.L_F;
+    // Rimed collectors become graupel; some snow embryos are converted along with the rime.
+    const snowConverted = Math.min(cell.snowGKg * 0.4, dRime * 0.55);
+    cell.snowGKg -= snowConverted;
+    cell.graupelGKg += dRime + snowConverted;
+    freezingJPerKg += (dRime + snowConverted) * 1e-3 * PHYS.L_F;
 
-    // Hailstone growth in strong convective cores (updraft > 16 m/s & abundant supercooled water + graupel embryos)
-    if (cell.updraftMaxMS > 15.5 && cell.graupelGKg > 0.45 && cell.supercooledWaterGKg > 0.35) {
-      const hailFactor = (cell.updraftMaxMS - 15.5) / 18.0;
+    // Wet growth into hail needs a strong updraft able to suspend growing stones plus
+    // abundant supercooled water (the classic 1 g/kg + 15 m/s hail criterion).
+    if (w > 12.0 && cell.graupelGKg > 0.22 && cell.supercooledWaterGKg > 0.18) {
+      const hailVigor = clamp((w - 12.0) / 20.0, 0, 1.4) * clamp(cell.supercooledWaterGKg / 0.6, 0.15, 1.6);
+      const kHail = 2.6e-3 * hailVigor;
       const dHail = Math.min(
-        cell.graupelGKg * 0.3,
-        0.042 * hailFactor * cell.graupelGKg * cell.supercooledWaterGKg * dt
+        cell.graupelGKg * 0.45,
+        cell.graupelGKg * (1.0 - Math.exp(-kHail * stepDt))
       );
-      const slwAccrete = Math.min(cell.supercooledWaterGKg * 0.25, dHail * 0.5);
+      const slwAccreted = Math.min(cell.supercooledWaterGKg * 0.35, dHail * 0.55);
       cell.graupelGKg -= dHail;
-      cell.supercooledWaterGKg -= slwAccrete;
-      cell.hailGKg += dHail + slwAccrete;
-      latentFreezeJPerKg += slwAccrete * 0.001 * PHYS.L_F;
+      cell.supercooledWaterGKg -= slwAccreted;
+      cell.hailGKg += dHail + slwAccreted;
+      freezingJPerKg += (dHail + slwAccreted) * 1e-3 * PHYS.L_F;
     }
   }
 
-  // 5. Kessler Warm-Rain Autoconversion & Collision-Coalescence Accretion
-  // Higher CCN suppresses autoconversion threshold slightly, delaying warm rain until deeper cloud water builds
-  const autoThresholdGKg = 0.55 * Math.pow(cfg.ccnConcentration, 0.45);
+  // ---------------- 7. Warm rain: Kessler autoconversion + collision-coalescence accretion ----
+  // Clean-cloud autoconversion threshold rises with CCN (more, smaller droplets).
+  const autoThresholdGKg = 0.52 * Math.pow(clamp(cfg.ccnConcentration, 0.3, 3.0), 0.45);
   let dAuto = 0;
   if (cell.cloudWaterGKg > autoThresholdGKg) {
     dAuto = Math.min(
       cell.cloudWaterGKg - autoThresholdGKg,
-      0.022 * (cell.cloudWaterGKg - autoThresholdGKg) * dt
+      1.5e-3 * (cell.cloudWaterGKg - autoThresholdGKg) * stepDt
     );
   }
-  const dAccrete = Math.min(
-    cell.cloudWaterGKg - dAuto,
-    0.048 * cell.cloudWaterGKg * Math.pow(Math.max(0, cell.rainGKg), 0.875) * dt
-  );
+  // Kessler accretion in g/kg units: 2.2 (Qr Qc)^(7/8) with Q in kg/kg == 0.0124 (qr qc)^0.875,
+  // with a modest convective-collection enhancement.
+  const dAccrete =
+    cell.rainGKg > 1e-4 && cell.cloudWaterGKg > 1e-4
+      ? Math.min(
+          cell.cloudWaterGKg - dAuto,
+          0.021 * Math.pow(cell.rainGKg * cell.cloudWaterGKg, 0.875) * stepDt
+        )
+      : 0;
   cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg - dAuto - dAccrete);
   cell.rainGKg += dAuto + dAccrete;
 
-  // 6. Sedimentation & Melting of Snow / Graupel / Hail falling below Freezing Level
-  const densityFactor = Math.sqrt(1.225 / Math.max(0.25, midLvl.rho));
-  const vtRain = 6.8 * Math.pow(Math.max(0.05, cell.rainGKg), 0.18) * densityFactor; // 4 - 10 m/s
-  const vtSnow = 1.35 * densityFactor;
-  const vtGraupel = 4.9 * Math.pow(Math.max(0.05, cell.graupelGKg), 0.2) * densityFactor;
-  const vtHail = 15.5 * Math.pow(Math.max(0.05, cell.hailGKg), 0.25) * densityFactor; // 12 - 26 m/s
-
-  // Warm sub-freezing-level depth determines melting fraction of descending ice hydrometeors
-  let latentMeltJPerKg = 0;
-  if (freezeZ > 450) {
-    const warmLayerFactor = Math.min(1.4, freezeZ / 3400.0);
-    const snowMelt = Math.min(cell.snowGKg * 0.5, cell.snowGKg * 0.024 * warmLayerFactor * dt);
-    const graupelMelt = Math.min(cell.graupelGKg * 0.45, cell.graupelGKg * 0.032 * warmLayerFactor * dt);
-    // Large hail survives partial melting if freezeZ isn't excessively high!
-    const hailMelt = Math.min(cell.hailGKg * 0.25, cell.hailGKg * 0.012 * warmLayerFactor * dt);
-
-    cell.snowGKg -= snowMelt;
-    cell.graupelGKg -= graupelMelt;
-    cell.hailGKg -= hailMelt;
-    cell.rainGKg += snowMelt + graupelMelt + hailMelt * 0.7;
-
-    latentMeltJPerKg = (snowMelt + graupelMelt + hailMelt) * 0.001 * PHYS.L_F;
+  // Ice crystal sublimation in dry entrained air (anvil edges, dissipating towers).
+  const rhIceMid = clamp(sounding.relativeHumidityAt(mixedLevelZ), 0.05, 1.0);
+  if (rhIceMid < 0.93 && topZ > freezeZ) {
+    const kSub = 2.4e-4 * (1.0 - rhIceMid) * 6.0;
+    const dSub = Math.min(cell.cloudIceGKg * 0.4, cell.cloudIceGKg * (1.0 - Math.exp(-kSub * stepDt)));
+    cell.cloudIceGKg -= dSub;
+    latentJPerKg -= dSub * 1e-3 * PHYS.L_S;
+    cell.cumEvaporatedGKg += dSub;
   }
 
-  // 7. Sub-Cloud Rain Evaporation, Virga & Cold-Pool Evaporative Cooling
-  const subCloudQvs = saturationMixingRatioLiquid(baseLvl.tempK, baseLvl.p);
-  const subCloudDeficit = Math.max(0, 1.0 - baseLvl.qvEnv / Math.max(1e-5, subCloudQvs));
-  const subCloudDepthKm = Math.max(0.3, cell.cloudBaseM / 1000.0);
+  // ---------------- 8. Sedimentation, melting and sub-cloud evaporation ----------------
+  const rhoMid = Math.max(0.18, sounding.densityAt(0.5 * (baseZ + Math.min(topZ, freezeZ + 2000))));
+  const rhoSurface = Math.max(0.3, sounding.densityAt(Math.max(30, baseZ * 0.25)));
 
-  // Fraction of falling rain that evaporates before hitting ground (Virga when sub-cloud layer is dry & high-based!)
-  const virgaEvapPotential = Math.min(
-    0.96,
-    subCloudDeficit * subCloudDepthKm * (0.48 / Math.max(0.35, Math.sqrt(cell.rainGKg + 0.1)))
+  const vRain = terminalFallSpeedRainMS(cell.rainGKg, rhoMid);
+  const vSnow = terminalFallSpeedSnowMS(cell.snowGKg, rhoMid);
+  const vGraupel = terminalFallSpeedGraupelMS(cell.graupelGKg, rhoMid);
+  const vHail = terminalFallSpeedHailMS(cell.hailGKg, rhoMid);
+
+  // Mean height each category starts its descent from (sets both the fallout time scale and
+  // how much of the fall path lies below the 0 °C isotherm).
+  const hRain = Math.max(800, baseZ + depth * 0.42);
+  const hSnow = Math.max(800, 0.5 * (Math.max(baseZ, freezeZ) + Math.min(topZ, Math.max(baseZ, freezeZ) + 3200)));
+  const hGraupel = Math.max(1000, Math.min(topZ - 300, freezeZ + 900));
+  const hHail = Math.max(1200, Math.min(topZ - 300, freezeZ + 1400));
+
+  const fallRain = cell.rainGKg * (1.0 - Math.exp(-(vRain / hRain) * stepDt));
+  const fallSnow = cell.snowGKg * (1.0 - Math.exp(-(vSnow / hSnow) * stepDt));
+  const fallGraupel = cell.graupelGKg * (1.0 - Math.exp(-(vGraupel / hGraupel) * stepDt));
+  const fallHail = cell.hailGKg * (1.0 - Math.exp(-(vHail / hHail) * stepDt));
+
+  // Warm-layer temperature excess for melting (mean temperature between ground and 0 °C level).
+  const warmDeltaK = Math.max(0, sounding.tempKAt(Math.max(60, freezeZ * 0.45)) - PHYS.T_FREEZE);
+  const meltSnow = meltFraction(hSnow, vSnow, freezeZ, warmDeltaK, 7.0e-4);
+  const meltGraupel = meltFraction(hGraupel, vGraupel, freezeZ, warmDeltaK, 3.0e-4);
+  const meltHail = meltFraction(hHail, vHail, freezeZ, warmDeltaK, 1.2e-4);
+
+  // ---- Convert the reservoir drain into a true column mass flux -------------------------
+  // Each category is treated as a well-mixed layer of depth h falling at its own terminal
+  // speed, so draining dq (g/kg) out of that layer in stepDt removes
+  //     dM = rho * dq/1000 * h      [kg m^-2]
+  // of water from the column. Dividing by stepDt gives the mass flux, and since
+  // 1 kg m^-2 h^-1 == 1 mm/h, the surface rate is flux * 3600. Getting the h factor right is
+  // what makes 6 g/kg of suspended rain read as a torrential shaft instead of a drizzle.
+  const invDt = 1.0 / stepDt;
+  const columnMassFlux = (dqGKg: number, hM: number, rho: number) =>
+    rho * (dqGKg * 1e-3) * hM * invDt; // kg m^-2 s^-1
+
+  const fluxRain = columnMassFlux(fallRain, hRain, rhoSurface);
+  const fluxSnow = columnMassFlux(fallSnow, hSnow, rhoSurface);
+  const fluxGraupel = columnMassFlux(fallGraupel, hGraupel, rhoSurface);
+  const fluxHail = columnMassFlux(fallHail, hHail, rhoSurface);
+
+  // Ice that melts en route joins the rain shaft; the remainder reaches the ground frozen.
+  const meltedFlux = fluxSnow * meltSnow + fluxGraupel * meltGraupel + fluxHail * meltHail;
+  const frozenSurfaceFlux =
+    fluxSnow * (1.0 - meltSnow) + fluxGraupel * (1.0 - meltGraupel) + fluxHail * (1.0 - meltHail);
+
+  cell.rainGKg = Math.max(0, cell.rainGKg - fallRain);
+  cell.snowGKg = Math.max(0, cell.snowGKg - fallSnow);
+  cell.graupelGKg = Math.max(0, cell.graupelGKg - fallGraupel);
+  cell.hailGKg = Math.max(0, cell.hailGKg - fallHail);
+
+  // Sub-cloud evaporation of the rain shaft: bulk ventilation parameterisation
+  //   dqr/dt = -k (1 - RH) qr^0.65, k scaled by vapor diffusivity ~ T^1.8 / p.
+  const subCloudZ = Math.max(80, baseZ * 0.5);
+  const rhSub = clamp(sounding.relativeHumidityAt(subCloudZ), 0.03, 1.0);
+  const tSubK = Math.max(200, sounding.tempKAt(subCloudZ));
+  const pSubPa = Math.max(20000, sounding.pressurePaAt(subCloudZ));
+  const kEvap =
+    1.6e-3 *
+    (1.0 - rhSub) *
+    Math.pow(tSubK / 293.0, 1.8) *
+    (101325.0 / pSubPa) *
+    Math.sqrt(1.2 / rhoSurface);
+  const subCloudFallTime = baseZ / Math.max(0.7, vRain);
+  // Thicker shafts saturate the sub-cloud layer, so the evaporated *fraction* falls as the
+  // rain rate rises — that is the difference between virga and a downpour.
+  const shaftLoading = clamp((cell.rainGKg + fallRain) / 1.4, 0.05, 1.0);
+  const evapFraction = clamp(
+    (1.0 - Math.exp(-kEvap * Math.pow(shaftLoading, -0.55) * subCloudFallTime)) *
+      (1.15 - 0.45 * shaftLoading),
+    0,
+    0.985
   );
-  cell.virgaFraction = cell.rainGKg > 0.04 ? virgaEvapPotential : 0;
+  const hasRainShaft = cell.rainGKg > 0.008 || fallRain > 1e-4 || meltedFlux > 1e-7;
+  cell.virgaFraction = hasRainShaft ? evapFraction : 0;
 
-  const fallOutColumnH = Math.max(1800, cell.cloudTopM - cell.cloudBaseM * 0.35);
-  const rainFallout = cell.rainGKg * (vtRain / fallOutColumnH) * dt;
-  const hailFallout = cell.hailGKg * (vtHail / fallOutColumnH) * dt;
-  const graupelFallout = cell.graupelGKg * (vtGraupel / (fallOutColumnH * 1.4)) * dt;
-  const snowFallout = freezeZ < 600 ? cell.snowGKg * (vtSnow / fallOutColumnH) * dt : 0;
+  // ---------------- 9. Surface precipitation rates (mm/h liquid equivalent) ----------------
+  // Only the liquid flux that survives sub-cloud evaporation reaches the ground as rain; the
+  // rest returns to vapour and is accounted for as evaporated, never as fallout. Counting it
+  // in both terms was what broke the column water budget.
+  const evaporatedFlux = (fluxRain + meltedFlux) * evapFraction;
+  const reachingLiquidFlux = fluxRain + meltedFlux - evaporatedFlux;
+  const reachingTotalFlux = reachingLiquidFlux + frozenSurfaceFlux;
 
-  const rainEvaporatedSubCloud = rainFallout * virgaEvapPotential;
-  cell.rainGKg = Math.max(0, cell.rainGKg - rainFallout);
-  cell.hailGKg = Math.max(0, cell.hailGKg - hailFallout);
-  cell.graupelGKg = Math.max(0, cell.graupelGKg - graupelFallout * (freezeZ < 1500 ? 1.0 : 0.25));
-  cell.snowGKg = Math.max(0, cell.snowGKg - snowFallout);
+  cell.surfaceRainRateMMHr = Math.max(0, reachingTotalFlux * 3600.0);
+  const frozenSurfaceRateMMHr = frozenSurfaceFlux * 3600.0;
 
-  // Dissipative anvil sublimation when updraft weakens
-  if (cell.stage === 'dissipating' || cell.updraftMaxMS < 2.0) {
-    cell.cloudIceGKg = Math.max(0, cell.cloudIceGKg * (1.0 - 0.008 * dt));
-    cell.snowGKg = Math.max(0, cell.snowGKg * (1.0 - 0.011 * dt));
-    cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg * (1.0 - 0.022 * dt));
-    cell.supercooledWaterGKg = Math.max(0, cell.supercooledWaterGKg * (1.0 - 0.025 * dt));
-  }
+  // ---- Cumulative water budget, all in g/kg of column air -------------------------------
+  // The reservoirs were drained by (fallRain + fallSnow + fallGraupel + fallHail) g/kg this
+  // step. That mass either reaches the surface or evaporates below cloud base; splitting it
+  // by the evaporated *fraction of the liquid flux* keeps the two terms exactly complementary
+  // so cumCondensed == inventory + cumFallout + cumEvaporated to round-off.
+  const drainedGKg = fallRain + fallSnow + fallGraupel + fallHail;
+  const liquidDrainedGKg = fallRain + fallSnow * meltSnow + fallGraupel * meltGraupel + fallHail * meltHail;
+  const evaporatedGKg = drainedGKg > 1e-12 ? liquidDrainedGKg * evapFraction : 0;
+  cell.cumFalloutGKg += drainedGKg - evaporatedGKg;
+  cell.cumEvaporatedGKg += evaporatedGKg + grossDilutionEvapGKg;
 
-  // Surface rainfall flux: rho_air * q_precip (kg/kg) * v_t (m/s) * 3600 -> kg/(m^2*hr) == mm/hr
-  const reachingRainFlux =
-    baseLvl.rho * (cell.rainGKg * 0.001) * vtRain * (1.0 - virgaEvapPotential) * 3600.0;
-  const reachingHailFlux =
-    freezeZ < 4800 ? baseLvl.rho * (cell.hailGKg * 0.001) * vtHail * 0.65 * 3600.0 : 0;
-  const reachingGraupelSnowFlux =
-    freezeZ < 1400
-      ? baseLvl.rho * ((cell.graupelGKg * vtGraupel + cell.snowGKg * vtSnow) * 0.001) * 3600.0
+  // Evaporation and melting cool the sub-cloud layer of depth ~baseZ, not the whole column.
+  const meltJPerKg = meltedFlux * stepDt * PHYS.L_F;
+  const evapJPerKg = evaporatedFlux * stepDt * PHYS.L_V;
+  const subCloudMassKgM2 = Math.max(60, rhoSurface * Math.max(300, baseZ));
+  const subCloudCoolingKPerS = (evapJPerKg + meltJPerKg * 0.85) / (PHYS.CP * subCloudMassKgM2);
+  cell.cumCondensedGKg += grossCondGKg;
+  cell.vaporExcessGKg = Math.max(0, sounding.qSatGKgAt(baseZ) * (1.0 - rhSub));
+
+  // ---------------- 10. Diagnostics consumed by dynamics, electrification and rendering ------
+  const suspendedGKg = cell.cloudWaterGKg + cell.supercooledWaterGKg + cell.cloudIceGKg;
+  const precipGKg = cell.rainGKg + cell.snowGKg + cell.graupelGKg + cell.hailGKg;
+
+  // Condensate weighting for effective radius: e-re grows with LWC but saturates (autoconversion).
+  const effectiveRadiusUm = clamp(6.5 + 9.0 * Math.pow(clamp(suspendedGKg, 0, 4.0), 0.42), 5, 26);
+
+  // Gravitational loading: precipitating mass loads fully, suspended condensate partially
+  // (small droplets are carried by the updraft but still add inertia).
+  const precipLoadingDragMS2 =
+    PHYS.G * (precipGKg + 0.35 * suspendedGKg + 0.5 * (cell.snowGKg + cell.graupelGKg)) * 1e-3;
+
+  const bulkFallSpeedMS =
+    precipGKg > 1e-4
+      ? (cell.rainGKg * vRain + cell.snowGKg * vSnow + cell.graupelGKg * vGraupel + cell.hailGKg * vHail) /
+        precipGKg
       : 0;
 
-  cell.surfaceRainRateMMHr = Math.max(0, reachingRainFlux + reachingHailFlux + reachingGraupelSnowFlux);
-
-  // Classify precipitation regime physically
   cell.precipType = classifyCellPrecipitation(
     cell.rainGKg,
     cell.hailGKg,
@@ -271,36 +488,27 @@ export function stepCellMicrophysics(
     cell.snowGKg,
     cell.surfaceRainRateMMHr,
     cell.virgaFraction,
-    freezeZ
+    freezeZ,
+    frozenSurfaceRateMMHr
   );
 
-  // Total condensate mass ratio for gravitational precipitation loading drag (-g * q_total)
-  const totalHydrometeorKgKg =
-    (cell.cloudWaterGKg +
-      cell.supercooledWaterGKg +
-      cell.cloudIceGKg +
-      cell.snowGKg +
-      cell.graupelGKg +
-      cell.hailGKg +
-      cell.rainGKg) *
-    0.001;
-
-  const precipLoadingDragMS2 = PHYS.G * totalHydrometeorKgKg;
-
-  const latentCondJPerKg = (dWarmCond + dSlwCond + dVaporDepDirect) * 0.001 * PHYS.L_V;
-  const netLatentHeatingKPerS =
-    (latentCondJPerKg + latentFreezeJPerKg - latentMeltJPerKg) / (PHYS.CP * Math.max(1e-3, dt));
-
-  const subCloudCoolingKPerS =
-    ((rainEvaporatedSubCloud * 0.001 * PHYS.L_V + latentMeltJPerKg * 0.55) /
-      (PHYS.CP * Math.max(1e-3, dt))) *
-    1.8;
-
   return {
-    latentHeatingKPerS: netLatentHeatingKPerS,
+    latentHeatingKPerS: (latentJPerKg + freezingJPerKg) / PHYS.CP / stepDt,
     subCloudCoolingKPerS: Math.max(0, subCloudCoolingKPerS),
-    precipLoadingDragMS2,
+    precipLoadingDragMS2: Math.max(0, precipLoadingDragMS2),
     rimingRateGKgPerS,
+    condensateSupplyGKgPerS: grossCondGKg / stepDt,
+    evaporatedGKgPerS: (grossDilutionEvapGKg + evaporatedGKg) / stepDt,
+    precipFalloutGKgPerS: (drainedGKg - evaporatedGKg) / stepDt,
+    surfaceLiquidFluxKgM2S: reachingLiquidFlux,
+    surfaceFrozenFluxKgM2S: frozenSurfaceFlux,
+    bulkFallSpeedMS,
+    rainFallSpeedMS: vRain,
+    subCloudEvapFraction: evapFraction,
+    totalSuspendedGKg: suspendedGKg,
+    totalPrecipGKg: precipGKg,
+    effectiveRadiusUm,
+    condensateEfficiency,
   };
 }
 
@@ -311,37 +519,66 @@ export function classifyCellPrecipitation(
   snowGKg: number,
   surfaceMMHr: number,
   virgaFrac: number,
-  freezeZ: number
+  freezeZ: number,
+  frozenMMHr = 0
 ): PrecipitationType {
-  if (rainGKg > 0.18 && virgaFrac > 0.82 && surfaceMMHr < 0.35) {
+  if (surfaceMMHr < 0.08) {
+    return rainGKg > 0.06 && virgaFrac > 0.55 ? 'Virga' : 'None';
+  }
+  if (surfaceMMHr < 0.35 && virgaFrac > 0.8) {
     return 'Virga';
   }
-  if (surfaceMMHr < 0.12) {
-    return 'None';
+
+  const frozenShare = frozenMMHr / Math.max(0.01, surfaceMMHr);
+
+  if (frozenShare > 0.62) {
+    if (hailGKg > 0.12 && frozenShare > 0.72) return 'Hail & Heavy Rain';
+    if (graupelGKg > 0.2) return 'Graupel Shower';
+    return rainGKg > 0.12 && frozenShare < 0.88 ? 'Mixed-Phase Precipitation' : 'Snow / Ice Pellets';
   }
-  if (freezeZ < 650 && snowGKg > 0.25) {
-    return rainGKg > 0.2 ? 'Mixed-Phase Precipitation' : 'Snow / Ice Pellets';
+
+  if (hailGKg > 0.25 && surfaceMMHr > 12.0) return 'Hail & Heavy Rain';
+  if (graupelGKg > 0.3 && freezeZ < 2600 && surfaceMMHr > 2.5) return 'Graupel Shower';
+  if (hailGKg > 0.1 && graupelGKg > 0.22 && surfaceMMHr > 6.0) return 'Mixed-Phase Precipitation';
+  if (freezeZ < 650 && snowGKg > 0.12 && surfaceMMHr < 8) {
+    return rainGKg > 0.15 ? 'Mixed-Phase Precipitation' : 'Snow / Ice Pellets';
   }
-  if (hailGKg > 0.42 && surfaceMMHr > 15.0) {
-    return 'Hail & Heavy Rain';
-  }
-  if (graupelGKg > 0.65 && freezeZ < 2400 && surfaceMMHr > 2.0) {
-    return 'Graupel Shower';
-  }
-  if (hailGKg > 0.18 && graupelGKg > 0.4 && surfaceMMHr > 8.0) {
-    return 'Mixed-Phase Precipitation';
-  }
-  if (surfaceMMHr >= 65.0) {
-    return 'Torrential Convective Rain';
-  }
-  if (surfaceMMHr >= 22.0) {
-    return 'Heavy Rain';
-  }
-  if (surfaceMMHr >= 5.5) {
-    return 'Moderate Rain';
-  }
-  if (surfaceMMHr >= 1.0) {
-    return 'Light Rain';
-  }
+
+  // WMO-style intensity bands for liquid precipitation.
+  if (surfaceMMHr >= 45.0) return 'Torrential Convective Rain';
+  if (surfaceMMHr >= 16.0) return 'Heavy Rain';
+  if (surfaceMMHr >= 4.0) return 'Moderate Rain';
+  if (surfaceMMHr >= 0.8) return 'Light Rain';
   return 'Drizzle';
+}
+
+/**
+ * Adiabatic condensate of a saturated parcel weighted by the lateral entrainment dilution it
+ * accumulates on the way up:
+ *
+ *     q_eff = ∫_base^top (dq_c/dz) · exp(-ε (z - base)) dz
+ *
+ * Each layer keeps the condensate it produced, discounted only by the mixing it has suffered
+ * since. Evaluating the production rate at 8 Gauss-ish midpoints keeps this within a fraction
+ * of a percent of the analytic result while costing eight table lookups.
+ */
+function dilutedAdiabaticCondensate(
+  sounding: AtmosphericSounding,
+  baseZ: number,
+  topZ: number,
+  epsKmInv: number
+): number {
+  if (topZ <= baseZ) return 0;
+  const depthKm = (topZ - baseZ) / 1000.0;
+  const eps = Math.max(0, epsKmInv);
+  const SAMPLES = 8;
+  let total = 0;
+  for (let k = 0; k < SAMPLES; k++) {
+    const fMid = (k + 0.5) / SAMPLES;
+    const z = baseZ + (topZ - baseZ) * fMid;
+    const production = sounding.condGKgPerKmAt(z); // g/kg per km
+    if (production <= 1e-9) continue;
+    total += production * Math.exp(-eps * depthKm * fMid);
+  }
+  return Math.max(0, (total * depthKm) / SAMPLES);
 }

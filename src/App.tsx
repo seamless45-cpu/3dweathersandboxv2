@@ -3,7 +3,11 @@ import { Eye } from 'lucide-react';
 import { StormAudio } from './audio/stormAudio';
 import { CameraMode } from './render/cameraController';
 import { AtmosphericSceneEngine } from './render/sceneEngine';
-import { AtmosphereSimulationCoordinator } from './sim/atmosphereCoordinator';
+import {
+  AtmosphereSimulationCoordinator,
+  CADENCE_BY_TIER,
+  PhysicsCadence,
+} from './sim/atmosphereCoordinator';
 import { AdaptivePerformanceManager } from './sim/performanceManager';
 import {
   AtmosphereConfig,
@@ -129,6 +133,7 @@ export function App() {
     let rafId = 0;
     let prevTime = performance.now();
     let uiSyncAccum = 0;
+    let lastCadence: PhysicsCadence | null = null;
 
     const animate = (now: number) => {
       rafId = requestAnimationFrame(animate);
@@ -161,6 +166,14 @@ export function App() {
       );
       if (scaleChanged) {
         engine.allocateRenderTargets(perfMgr.settings.volumetricScale);
+      }
+      // The expensive Eulerian passes (fluid solve, Poisson field, texture repack) run on the
+      // physics cadence for the active quality tier; Lagrangian cell dynamics still step every
+      // frame, so storms stay smooth even when the grid updates a few times a second.
+      const cadence = CADENCE_BY_TIER[perfMgr.settings.tier];
+      if (cadence && cadence !== lastCadence) {
+        lastCadence = cadence;
+        coordinator.setCadence(cadence);
       }
 
       // Throttle React HUD state updates to ~6 Hz so UI causes near-zero CPU overhead!

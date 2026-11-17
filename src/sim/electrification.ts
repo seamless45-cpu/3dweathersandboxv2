@@ -19,6 +19,14 @@ export interface BreakdownCandidate {
   nearestCell: ConvectiveCell | null;
 }
 
+/** Shared empty result: avoids allocating a fresh array on every skipped solve. */
+const NO_CANDIDATES: BreakdownCandidate[] = [];
+
+/** Saturating normalisation used by the non-inductive charging kernel. */
+function clamp01_2(v: number): number {
+  return v <= 0 ? 0 : v >= 2.2 ? 2.2 : v;
+}
+
 export function breakdownThresholdKVm(rhoKgM3: number): number {
   // Empirical cloud-air runaway/breakdown threshold scaled to local air density.
   return 206.0 * (rhoKgM3 / 1.225);
@@ -43,8 +51,16 @@ export class AtmosphericElectrificationEngine {
 
   private eThreshByY = new Float32Array(64);
   private hadPotentialLastStep = false;
+  /** Reused per-level charge-layer profiles (avoids 4 exp() calls per grid point). */
+  private profMain: Float32Array = new Float32Array(64);
+  private profLpcc: Float32Array = new Float32Array(64);
+  private profUpper: Float32Array = new Float32Array(64);
+  private profScreen: Float32Array = new Float32Array(64);
+  /** Candidates from the most recent field solve (empty when the solve was skipped). */
+  public lastCandidates: BreakdownCandidate[] = [];
 
   public reset(): void {
+    this.lastCandidates = [];
     this.maxElectricFieldKVm = 0;
     this.maxBreakdownRatio = 0;
     this.maxPosChargeNCm3 = 0;
@@ -54,12 +70,18 @@ export class AtmosphericElectrificationEngine {
     this.hadPotentialLastStep = false;
   }
 
+  /**
+   * @param solveFieldWhen false, the (slow) Poisson field solve and breakdown scan are
+   * skipped and the previous candidates are returned. Charge evolves on a minutes-scale,
+   * so re-solving it every rendered frame is wasted work; the coordinator drives cadence.
+   */
   public step(
     dt: number,
     grid: AtmosphericFluidGrid,
     sounding: AtmosphericSounding,
     cells: ConvectiveCell[],
-    cfg: AtmosphereConfig
+    cfg: AtmosphereConfig,
+    solveField = true
   ): BreakdownCandidate[] {
     const inst = sounding.instability;
     const mixedPhaseTemperatureK = sounding.sampleAtAltitude(
@@ -76,12 +98,15 @@ export class AtmosphericElectrificationEngine {
         cell.cloudIceGKg > 0.04;
 
       if (hasMixedPhase && cell.updraftMaxMS > 2.2) {
+        // Non-inductive (Takahashi-style) charging: the graupel/ice collision rate is
+        // normalised by the hydrometeor contents typical of the -15 degreesC charging zone,
+        // so the kernel is O(1) for a realistic mixed-phase core instead of O(1000).
         const temperatureWindow = Math.exp(-Math.pow((mixedPhaseTemperatureK - 258.15) / 17.0, 2));
         const collisionKernel =
-          cell.graupelGKg *
-          cell.cloudIceGKg *
-          Math.min(2.4, 0.28 + cell.supercooledWaterGKg * 1.55) *
-          Math.min(2.8, cell.updraftMaxMS / 10.0) *
+          clamp01_2(cell.graupelGKg / 0.8) *
+          clamp01_2(cell.cloudIceGKg / 0.3) *
+          clamp01_2(0.25 + cell.supercooledWaterGKg * 1.35) *
+          clamp01_2(cell.updraftMaxMS / 14.0) *
           temperatureWindow *
           cfg.chargeSeparationGain;
 
@@ -93,7 +118,7 @@ export class AtmosphericElectrificationEngine {
         const upperShare = 1.0 - 0.36 * Math.min(0.9, reversalFraction);
         const lowerShare = 0.14 + 0.36 * Math.min(0.9, reversalFraction);
         const totalPositiveShare = upperShare + lowerShare;
-        const dqTotal = 0.115 * collisionKernel * dt;
+        const dqTotal = 0.011 * collisionKernel * dt;
         const upperDelta = -mainLayerSign * dqTotal * (upperShare / totalPositiveShare);
         const lowerDelta = -mainLayerSign * dqTotal * (lowerShare / totalPositiveShare);
         const mainDelta = mainLayerSign * dqTotal;
@@ -150,16 +175,29 @@ export class AtmosphericElectrificationEngine {
       this.maxPosChargeNCm3 = 0;
       this.maxNegChargeNCm3 = 0;
       this.netAtmosphereChargeC = 0;
-      return [];
+      this.lastCandidates = NO_CANDIDATES;
+      return NO_CANDIDATES;
     }
 
     this.hadPotentialLastStep = true;
+    if (!solveField) {
+      // Breakdown may only initiate on a freshly solved field, otherwise one supercritical
+      // voxel could fire repeatedly between solves.
+      return NO_CANDIDATES;
+    }
     grid.rhoQ.fill(0);
 
     const nx = grid.nx;
     const ny = grid.ny;
     const nz = grid.nz;
     const slice = grid.sliceStride;
+
+    if (this.profMain.length < ny) {
+      this.profMain = new Float32Array(ny);
+      this.profLpcc = new Float32Array(ny);
+      this.profUpper = new Float32Array(ny);
+      this.profScreen = new Float32Array(ny);
+    }
 
     let actMinIx = nx - 2;
     let actMaxIx = 1;
@@ -175,77 +213,116 @@ export class AtmosphericElectrificationEngine {
         continue;
       }
 
-      const maxR = Math.max(cell.radiusM * 1.6, cell.anvilRadiusM * 1.05) + 900;
-      const minIx = Math.max(1, grid.worldToGridX(cell.x - maxR));
-      const maxIx = Math.min(nx - 2, grid.worldToGridX(cell.x + maxR));
-      const minIz = Math.max(1, grid.worldToGridZ(cell.z - maxR));
-      const maxIz = Math.min(nz - 2, grid.worldToGridZ(cell.z + maxR));
-      const maxIy = Math.min(ny - 2, Math.ceil((cell.cloudTopM + 900) / grid.dy));
-
-      if (minIx < actMinIx) actMinIx = minIx;
-      if (maxIx > actMaxIx) actMaxIx = maxIx;
-      if (maxIy > actMaxIy) actMaxIy = maxIy;
-      if (minIz < actMinIz) actMinIz = minIz;
-      if (maxIz > actMaxIz) actMaxIz = maxIz;
-
       const zLPCC = Math.max(cell.cloudBaseM + 400, inst.freezingLevel - 500);
       const zMainNeg = inst.freezingLevel + 2100;
       const zUpperPos = Math.min(cell.cloudTopM - 600, inst.freezingLevel + 5200);
       const zScreen = cell.cloudTopM;
 
-      const coreDenom = Math.max(500 * 500, cell.radiusM * cell.radiusM * 1.15);
-      const lpccDenom = Math.max(450 * 450, cell.radiusM * cell.radiusM * 0.65);
-      const anvilShiftX = cell.x + cell.anvilAxisX * cell.anvilRadiusM * 0.42;
-      const anvilShiftZ = cell.z + cell.anvilAxisZ * cell.anvilRadiusM * 0.42;
-      const anvilDenom = Math.pow(Math.max(500, cell.anvilRadiusM * 0.85), 2);
+      // Vertical Gaussian layer profiles are functions of iy only: hoisting them out of the
+      // horizontal loops removes four exp() evaluations per grid point per cell.
+      const maxIy = Math.min(ny - 2, Math.ceil((cell.cloudTopM + 900) / grid.dy));
+      let anyLayer = false;
+      for (let iy = 1; iy <= maxIy; iy++) {
+        const wy = grid.gridToWorldY(iy);
+        const pMain = Math.exp(-Math.pow((wy - zMainNeg) / 1150.0, 2));
+        const pLpcc = Math.exp(-Math.pow((wy - zLPCC) / 850.0, 2));
+        const pUpper = Math.exp(-Math.pow((wy - zUpperPos) / 1450.0, 2));
+        const pScreen = wy > zScreen - 1700 ? Math.exp(-Math.pow((wy - zScreen) / 550.0, 2)) : 0;
+        this.profMain[iy] = cell.mainNegChargeNCm3 * pMain;
+        this.profLpcc[iy] = cell.lowerPosChargeNCm3 * pLpcc;
+        this.profUpper[iy] = cell.upperPosChargeNCm3 * pUpper;
+        this.profScreen[iy] = cell.anvilScreenChargeNCm3 * pScreen;
+        if (pMain > 0.02 || pLpcc > 0.02 || pUpper > 0.02 || pScreen > 0.02) anyLayer = true;
+      }
+      if (!anyLayer) continue;
+      for (let iy = maxIy + 1; iy < ny; iy++) {
+        this.profMain[iy] = 0;
+        this.profLpcc[iy] = 0;
+        this.profUpper[iy] = 0;
+        this.profScreen[iy] = 0;
+      }
+
+      // Core region (main negative + LPCC + upper positive over the tower).
+      const coreReach = cell.radiusM * 1.75 + 700;
+      const coreMinIx = Math.max(1, grid.worldToGridX(cell.x - coreReach));
+      const coreMaxIx = Math.min(nx - 2, grid.worldToGridX(cell.x + coreReach));
+      const coreMinIz = Math.max(1, grid.worldToGridZ(cell.z - coreReach));
+      const coreMaxIz = Math.min(nz - 2, grid.worldToGridZ(cell.z + coreReach));
+      const coreDenom = 1.0 / Math.max(500 * 500, cell.radiusM * cell.radiusM * 1.15);
+      const lpccDenom = 1.0 / Math.max(450 * 450, cell.radiusM * cell.radiusM * 0.65);
       const precipX = cell.x + cell.precipCoreOffsetX * 0.5;
       const precipZ = cell.z + cell.precipCoreOffsetZ * 0.5;
 
-      for (let iz = minIz; iz <= maxIz; iz++) {
+      if (coreMinIx < actMinIx) actMinIx = coreMinIx;
+      if (coreMaxIx > actMaxIx) actMaxIx = coreMaxIx;
+      if (maxIy > actMaxIy) actMaxIy = maxIy;
+      if (coreMinIz < actMinIz) actMinIz = coreMinIz;
+      if (coreMaxIz > actMaxIz) actMaxIz = coreMaxIz;
+
+      for (let iz = coreMinIz; iz <= coreMaxIz; iz++) {
         const wz = grid.gridToWorldZ(iz);
         const zOff = slice * iz;
-        for (let ix = minIx; ix <= maxIx; ix++) {
+        const dzCore = wz - cell.z;
+        const dzLpcc = wz - precipZ;
+        for (let ix = coreMinIx; ix <= coreMaxIx; ix++) {
           const wx = grid.gridToWorldX(ix);
-
           const dxCore = wx - cell.x;
-          const dzCore = wz - cell.z;
-          const rCoreSq = (dxCore * dxCore + dzCore * dzCore) / coreDenom;
-
-          const rAnvilSq =
-            cell.anvilRadiusM > 1200
-              ? (Math.pow(wx - anvilShiftX, 2) + Math.pow(wz - anvilShiftZ, 2)) / anvilDenom
-              : 99.0;
-
-          if (rCoreSq > 2.6 && rAnvilSq > 1.8) continue;
-
+          const dxLpcc = wx - precipX;
+          const rCoreSq = (dxCore * dxCore + dzCore * dzCore) * coreDenom;
+          if (rCoreSq > 3.2) continue;
           const coreHoriz = Math.exp(-rCoreSq);
-          const anvilHoriz = rAnvilSq < 1.8 ? Math.exp(-rAnvilSq * 1.2) : 0;
-          const lpccHoriz = Math.exp(
-            -(Math.pow(wx - precipX, 2) + Math.pow(wz - precipZ, 2)) / lpccDenom
-          );
-          const upperHoriz = Math.max(coreHoriz, anvilHoriz * 0.68);
-
+          const lpccHoriz = Math.exp(-(dxLpcc * dxLpcc + dzLpcc * dzLpcc) * lpccDenom);
+          const rowBase = zOff + ix;
           for (let iy = 1; iy <= maxIy; iy++) {
-            const wy = grid.gridToWorldY(iy);
-            let q =
-              cell.mainNegChargeNCm3 *
-                coreHoriz *
-                Math.exp(-Math.pow((wy - zMainNeg) / 1150.0, 2)) +
-              cell.lowerPosChargeNCm3 *
-                lpccHoriz *
-                Math.exp(-Math.pow((wy - zLPCC) / 850.0, 2)) +
-              cell.upperPosChargeNCm3 *
-                upperHoriz *
-                Math.exp(-Math.pow((wy - zUpperPos) / 1450.0, 2));
+            const q =
+              this.profMain[iy] * coreHoriz +
+              this.profLpcc[iy] * lpccHoriz +
+              this.profUpper[iy] * coreHoriz;
+            if (q !== 0) grid.rhoQ[rowBase + nx * iy] += q;
+          }
+        }
+      }
 
-            if (anvilHoriz > 0.05) {
-              q +=
-                cell.anvilScreenChargeNCm3 *
-                anvilHoriz *
-                Math.exp(-Math.pow((wy - zScreen) / 550.0, 2));
+      // Anvil region: upper positive charge and the negative screening layer spread over
+      // the glaciated outflow. Vertically thin, so only a few levels are touched.
+      if (
+        cell.anvilRadiusM > 1200 &&
+        (Math.abs(cell.upperPosChargeNCm3) > 0.02 || Math.abs(cell.anvilScreenChargeNCm3) > 0.02)
+      ) {
+        const anvilShiftX = cell.x + cell.anvilAxisX * cell.anvilRadiusM * 0.42;
+        const anvilShiftZ = cell.z + cell.anvilAxisZ * cell.anvilRadiusM * 0.42;
+        const anvilDenom = 1.0 / Math.pow(Math.max(500, cell.anvilRadiusM * 0.85), 2);
+        const reach = cell.anvilRadiusM * 1.05 + 600;
+        const aMinIx = Math.max(1, grid.worldToGridX(anvilShiftX - reach));
+        const aMaxIx = Math.min(nx - 2, grid.worldToGridX(anvilShiftX + reach));
+        const aMinIz = Math.max(1, grid.worldToGridZ(anvilShiftZ - reach));
+        const aMaxIz = Math.min(nz - 2, grid.worldToGridZ(anvilShiftZ + reach));
+        const aMinIy = Math.max(1, Math.floor((zScreen - 2200) / grid.dy));
+        if (aMinIx < actMinIx) actMinIx = aMinIx;
+        if (aMaxIx > actMaxIx) actMaxIx = aMaxIx;
+        if (aMinIz < actMinIz) actMinIz = aMinIz;
+        if (aMaxIz > actMaxIz) actMaxIz = aMaxIz;
+
+        for (let iy = aMinIy; iy <= maxIy; iy++) {
+          const wy = grid.gridToWorldY(iy);
+          const upperShape = Math.exp(-Math.pow((wy - zUpperPos) / 1450.0, 2));
+          const screenShape = Math.exp(-Math.pow((wy - zScreen) / 550.0, 2));
+          const upperQ = cell.upperPosChargeNCm3 * 0.68 * upperShape;
+          const screenQ = cell.anvilScreenChargeNCm3 * screenShape;
+          if (Math.abs(upperQ) < 1e-4 && Math.abs(screenQ) < 1e-4) continue;
+          const rowOff = nx * iy;
+          for (let iz = aMinIz; iz <= aMaxIz; iz++) {
+            const wz = grid.gridToWorldZ(iz);
+            const dAz = wz - anvilShiftZ;
+            const base = slice * iz + rowOff;
+            for (let ix = aMinIx; ix <= aMaxIx; ix++) {
+              const wx = grid.gridToWorldX(ix);
+              const dAx = wx - anvilShiftX;
+              const rAnvilSq = (dAx * dAx + dAz * dAz) * anvilDenom;
+              if (rAnvilSq > 2.4) continue;
+              const anvilHoriz = Math.exp(-rAnvilSq * 1.2);
+              grid.rhoQ[base + ix] += (upperQ + screenQ) * anvilHoriz;
             }
-
-            grid.rhoQ[zOff + nx * iy + ix] += q;
           }
         }
       }
@@ -258,9 +335,14 @@ export class AtmosphericElectrificationEngine {
     const bMinIz = Math.max(1, actMinIz - 6);
     const bMaxIz = Math.min(nz - 2, actMaxIz + 6);
 
-    this.solvePoisson3DBounded(grid, 10, bMinIx, bMaxIx, bMaxIy, bMinIz, bMaxIz);
+    // Warm-started red-black SOR: the potential from the previous solve is an excellent
+    // initial guess because charge evolves on a minutes scale, so 8 sweeps converge as well
+    // as a cold-started 20 and run at the physics cadence rather than every frame.
+    this.solvePoisson3DBounded(grid, 8, bMinIx, bMaxIx, bMaxIy, bMinIz, bMaxIz);
 
     const candidates: BreakdownCandidate[] = [];
+    const MAX_CANDIDATES = 96;
+    let bestCandidate: BreakdownCandidate | null = null;
     let maxE = 0;
     let maxRatio = 0;
     let maxPosQ = 0;
@@ -269,8 +351,23 @@ export class AtmosphericElectrificationEngine {
     const voxelVol = grid.dx * grid.dy * grid.dz;
 
     for (let iy = 0; iy < ny; iy++) {
-      const lvl = sounding.sampleAtAltitude(grid.gridToWorldY(iy));
-      this.eThreshByY[iy] = breakdownThresholdKVm(lvl.rho);
+      this.eThreshByY[iy] = breakdownThresholdKVm(sounding.densityAt(grid.gridToWorldY(iy)));
+    }
+
+    // Grid-index bounding boxes per cell make the "which cell owns this voxel" lookup a
+    // handful of integer compares instead of a distance scan over every cell.
+    const cellBoxMinIx: number[] = [];
+    const cellBoxMaxIx: number[] = [];
+    const cellBoxMinIz: number[] = [];
+    const cellBoxMaxIz: number[] = [];
+    const cellReach: number[] = [];
+    for (const c of cells) {
+      const reach = Math.max(c.radiusM * 2.0, c.anvilRadiusM * 1.1);
+      cellBoxMinIx.push(grid.worldToGridX(c.x - reach));
+      cellBoxMaxIx.push(grid.worldToGridX(c.x + reach));
+      cellBoxMinIz.push(grid.worldToGridZ(c.z - reach));
+      cellBoxMaxIz.push(grid.worldToGridZ(c.z + reach));
+      cellReach.push(reach * reach);
     }
 
     const inv2Dx = 1000.0 / (2.0 * grid.dx);
@@ -299,7 +396,7 @@ export class AtmosphericElectrificationEngine {
           grid.ey[id] = ey;
           grid.ez[id] = ez;
 
-          const eMag = Math.hypot(ex, ey, ez);
+          const eMag = Math.sqrt(ex * ex + ey * ey + ez * ez);
           const ratio = eMag / eThresh;
 
           if (eMag > maxE) maxE = eMag;
@@ -308,21 +405,26 @@ export class AtmosphericElectrificationEngine {
           if (eMag > 18.0) {
             const wx = grid.gridToWorldX(ix);
             let bestCell: ConvectiveCell | null = null;
-            let bestDist = 18000;
-            for (const c of cells) {
-              const d = Math.hypot(wx - c.x, wz - c.z);
-              if (d < bestDist) {
-                bestDist = d;
+            let bestDist2 = Infinity;
+            for (let ci = 0; ci < cells.length; ci++) {
+              if (ix < cellBoxMinIx[ci] || ix > cellBoxMaxIx[ci]) continue;
+              if (iz < cellBoxMinIz[ci] || iz > cellBoxMaxIz[ci]) continue;
+              const c = cells[ci];
+              const ddx = wx - c.x;
+              const ddz = wz - c.z;
+              const d2 = ddx * ddx + ddz * ddz;
+              if (d2 < bestDist2 && d2 < cellReach[ci]) {
+                bestDist2 = d2;
                 bestCell = c;
               }
             }
-            if (bestCell && bestDist < Math.max(bestCell.radiusM * 2.0, bestCell.anvilRadiusM * 1.1)) {
+            if (bestCell) {
               if (eMag > bestCell.peakElectricFieldKVm) bestCell.peakElectricFieldKVm = eMag;
               if (ratio > bestCell.breakdownRatio) bestCell.breakdownRatio = ratio;
             }
 
             if (ratio >= 1.0) {
-              candidates.push({
+              const candidate: BreakdownCandidate = {
                 ix,
                 iy,
                 iz,
@@ -337,7 +439,9 @@ export class AtmosphericElectrificationEngine {
                 ez,
                 localRhoQ: q,
                 nearestCell: bestCell,
-              });
+              };
+              if (!bestCandidate || ratio > bestCandidate.ratio) bestCandidate = candidate;
+              if (candidates.length < MAX_CANDIDATES) candidates.push(candidate);
             }
           }
         }
@@ -353,6 +457,12 @@ export class AtmosphericElectrificationEngine {
     if (candidates.length > 1) {
       candidates.sort((a, b) => b.ratio - a.ratio);
     }
+    // Guarantee the strongest breakdown point survives the collection cap.
+    if (bestCandidate && (candidates.length === 0 || candidates[0] !== bestCandidate)) {
+      if (candidates.length >= MAX_CANDIDATES) candidates.pop();
+      candidates.unshift(bestCandidate);
+    }
+    this.lastCandidates = candidates;
     return candidates;
   }
 

@@ -160,6 +160,45 @@ export function moistAdiabaticLapseRateKPerM(tempK: number, pressurePa: number):
 export class AtmosphericSounding {
   public levels: SoundingProfileLevel[] = [];
   public dz = 200; // meters per sounding level (91 levels from 0 to 18,000m)
+
+  // Flat structure-of-arrays mirror of `levels`. The per-frame hot loops (fluid grid,
+  // microphysics, electrification) read these directly: scalar accessors interpolate
+  // without allocating the 11-field SoundingProfileLevel object thousands of times per
+  // frame, which was the main source of minor-GC stutter.
+  public numLevels = 0;
+  public zArr!: Float32Array;
+  public pArr!: Float32Array;
+  public tArr!: Float32Array;
+  public tdArr!: Float32Array;
+  public qvArr!: Float32Array;
+  public rhoArr!: Float32Array;
+  public thetaArr!: Float32Array;
+  public uArr!: Float32Array;
+  public wArr!: Float32Array;
+
+  /**
+   * Saturation mixing ratio q_vs(z) in g/kg along the environmental profile, and the
+   * condensate a *saturated parcel* would produce per km of moist-adiabatic ascent
+   * (g/kg/km), with its vertical integral. These are the physical ceilings the bulk
+   * microphysics relaxes toward, so condensate can never exceed the vapor actually
+   * available in the sounding.
+   */
+  public qSatGKg!: Float32Array;
+  public adiabaticCondGKgPerKm!: Float32Array;
+  public adiabaticCondIntegralGKg!: Float32Array;
+  public tempCAtLevel!: Float32Array;
+  /**
+   * Parcel buoyancy B(z) in m/s^2 for the mixed-layer + solar-perturbation parcel that CAPE
+   * and CIN are integrated from: negative inside the capped layer, positive between LFC and
+   * EL, negative again in the stable layer aloft. Cells integrate this directly instead of
+   * inferring buoyancy from regime-specific constants.
+   */
+  public parcelBuoyArr!: Float32Array;
+  /** Condensate (g/kg) the CAPE parcel carries at each level. */
+  public parcelCondArr!: Float32Array;
+  /** Running integral of parcelBuoyArr (J/kg), so layer-mean buoyancy is a two-lookup difference. */
+  public parcelBuoyIntegralArr!: Float32Array;
+
   public instability: InstabilityTelemetry = {
     cape: 0,
     cin: 0,
@@ -184,7 +223,24 @@ export class AtmosphericSounding {
     const numLevels = Math.floor(DOMAIN_MAX_ALT / this.dz) + 1;
     if (this.levels.length !== numLevels) {
       this.levels = new Array(numLevels);
+      this.zArr = new Float32Array(numLevels);
+      this.pArr = new Float32Array(numLevels);
+      this.tArr = new Float32Array(numLevels);
+      this.tdArr = new Float32Array(numLevels);
+      this.qvArr = new Float32Array(numLevels);
+      this.rhoArr = new Float32Array(numLevels);
+      this.thetaArr = new Float32Array(numLevels);
+      this.parcelBuoyArr = new Float32Array(numLevels);
+      this.parcelCondArr = new Float32Array(numLevels);
+      this.parcelBuoyIntegralArr = new Float32Array(numLevels);
+      this.uArr = new Float32Array(numLevels);
+      this.wArr = new Float32Array(numLevels);
+      this.qSatGKg = new Float32Array(numLevels);
+      this.adiabaticCondGKgPerKm = new Float32Array(numLevels);
+      this.adiabaticCondIntegralGKg = new Float32Array(numLevels);
+      this.tempCAtLevel = new Float32Array(numLevels);
     }
+    this.numLevels = numLevels;
 
     const t0 = cfg.surfaceTempC + 273.15;
     const p0 = cfg.surfacePressureHPa * 100.0;
@@ -298,6 +354,40 @@ export class AtmosphericSounding {
         windU,
         windW,
       };
+
+      this.zArr[i] = z;
+      this.pArr[i] = currentP;
+      this.tArr[i] = tempK;
+      this.tdArr[i] = dewpointK;
+      this.qvArr[i] = qvEnv;
+      this.rhoArr[i] = rho;
+      this.thetaArr[i] = thetaEnv;
+      this.uArr[i] = windU;
+      this.wArr[i] = windW;
+      this.tempCAtLevel[i] = tempK - PHYS.T_FREEZE;
+      this.qSatGKg[i] = saturationMixingRatioLiquid(tempK, currentP) * 1000.0;
+    }
+
+    // Condensate a saturated parcel yields per km of moist-adiabatic ascent:
+    //   dq_c/dz = -d q_vs/dz |_sat  (total water of the parcel is conserved)
+    // Evaluated with a 200 m finite difference along the moist adiabat, so the latent
+    // heating and every downstream hydrometeor budget is bounded by real vapor supply.
+    const probeDz = this.dz;
+    let condIntegral = 0;
+    for (let i = 0; i < numLevels; i++) {
+      const t1 = this.tArr[i];
+      const p1 = this.pArr[i];
+      const gammaM = moistAdiabaticLapseRateKPerM(t1, p1);
+      const t2 = t1 - gammaM * probeDz;
+      const p2 = p1 * Math.exp((-PHYS.G * probeDz) / (PHYS.R_D * t1));
+      const q1 = saturationMixingRatioLiquid(t1, p1);
+      const q2 = saturationMixingRatioLiquid(t2, p2);
+      const perKm = Math.max(0, (q1 - q2) * 1000.0 * (1000.0 / probeDz));
+      this.adiabaticCondGKgPerKm[i] = perKm;
+      if (i > 0) {
+        condIntegral += 0.5 * (this.adiabaticCondGKgPerKm[i - 1] + perKm) * (probeDz / 1000.0);
+      }
+      this.adiabaticCondIntegralGKg[i] = condIntegral;
     }
 
     // Compute Parcel Ascent (Mixed-layer + solar surface warm perturbation parcel)
@@ -341,6 +431,13 @@ export class AtmosphericSounding {
       const tvParcel = tp * (1.0 + 0.608 * qvCurrent);
       const tvEnv = lvl.tempK * (1.0 + 0.608 * lvl.qvEnv);
       const buoy = PHYS.G * ((tvParcel - tvEnv) / tvEnv);
+
+      this.parcelBuoyArr[i] = buoy;
+      // Trapezoidal running integral of B(z) in J/kg.
+      this.parcelBuoyIntegralArr[i] =
+        this.parcelBuoyIntegralArr[i - 1] + 0.5 * (buoy + this.parcelBuoyArr[i - 1]) * this.dz;
+      // Condensate the parcel has produced so far (0 while it is still sub-saturated).
+      this.parcelCondArr[i] = foundLCL ? Math.max(0, (parcelQv - qvCurrent) * 1000.0) : 0;
 
       if (buoy > 0 && lvl.z >= lcl) {
         if (!foundLFC) {
@@ -441,5 +538,119 @@ export class AtmosphericSounding {
       windU: a.windU + (b.windU - a.windU) * f,
       windW: a.windW + (b.windW - a.windW) * f,
     };
+  }
+
+  /** Allocation-free variant of sampleAtAltitude for hot loops: writes into `out`. */
+  public sampleInto(out: SoundingProfileLevel, zMeters: number): SoundingProfileLevel {
+    const clampedZ = zMeters < 0 ? 0 : zMeters > DOMAIN_MAX_ALT ? DOMAIN_MAX_ALT : zMeters;
+    const exactIdx = clampedZ / this.dz;
+    const last = this.numLevels - 1;
+    let i0 = exactIdx | 0;
+    if (i0 > last) i0 = last;
+    if (i0 < 0) i0 = 0;
+    const i1 = i0 < last ? i0 + 1 : i0;
+    const f = exactIdx - i0;
+    out.z = clampedZ;
+    out.p = this.pArr[i0] + (this.pArr[i1] - this.pArr[i0]) * f;
+    out.tempK = this.tArr[i0] + (this.tArr[i1] - this.tArr[i0]) * f;
+    out.dewpointK = this.tdArr[i0] + (this.tdArr[i1] - this.tdArr[i0]) * f;
+    out.qvEnv = this.qvArr[i0] + (this.qvArr[i1] - this.qvArr[i0]) * f;
+    out.rho = this.rhoArr[i0] + (this.rhoArr[i1] - this.rhoArr[i0]) * f;
+    out.thetaEnv = this.thetaArr[i0] + (this.thetaArr[i1] - this.thetaArr[i0]) * f;
+    out.windU = this.uArr[i0] + (this.uArr[i1] - this.uArr[i0]) * f;
+    out.windW = this.wArr[i0] + (this.wArr[i1] - this.wArr[i0]) * f;
+    return out;
+  }
+
+  public tempKAt(z: number): number {
+    return this.interp(this.tArr, z);
+  }
+  public tempCAt(z: number): number {
+    return this.interp(this.tArr, z) - PHYS.T_FREEZE;
+  }
+  public pressurePaAt(z: number): number {
+    return this.interp(this.pArr, z);
+  }
+  public densityAt(z: number): number {
+    return this.interp(this.rhoArr, z);
+  }
+  public qvEnvAt(z: number): number {
+    return this.interp(this.qvArr, z);
+  }
+  /** Environmental saturation mixing ratio (g/kg) — the vapor actually available to a cloud. */
+  public qSatGKgAt(z: number): number {
+    return this.interp(this.qSatGKg, z);
+  }
+  public windUAt(z: number): number {
+    return this.interp(this.uArr, z);
+  }
+  public windWAt(z: number): number {
+    return this.interp(this.wArr, z);
+  }
+  /** Relative humidity (0..1) of the environment at altitude z. */
+  public relativeHumidityAt(z: number): number {
+    const qs = this.qSatGKgAt(z);
+    return qs > 1e-6 ? Math.min(1.0, this.qvEnvAt(z) / qs) : 1.0;
+  }
+
+  private interp(arr: Float32Array, z: number): number {
+    const clampedZ = z < 0 ? 0 : z > DOMAIN_MAX_ALT ? DOMAIN_MAX_ALT : z;
+    const exactIdx = clampedZ / this.dz;
+    const last = this.numLevels - 1;
+    let i0 = exactIdx | 0;
+    if (i0 > last) i0 = last;
+    if (i0 < 0) i0 = 0;
+    const i1 = i0 < last ? i0 + 1 : i0;
+    const f = exactIdx - i0;
+    return arr[i0] + (arr[i1] - arr[i0]) * f;
+  }
+
+  /**
+   * Parcel buoyancy B(z) in m/s^2 at an arbitrary altitude, linearly interpolated from the
+   * stored ascent profile. This is the acceleration a convective updraft actually feels at
+   * that level: negative under the cap, strongly positive in the free-convection layer, and
+   * negative again above the equilibrium level.
+   */
+  public parcelBuoyancyAt(zMeters: number): number {
+    return this.interp(this.parcelBuoyArr, zMeters);
+  }
+
+  /** Condensate (g/kg) carried by the CAPE parcel at altitude z. */
+  public parcelCondensateAt(zMeters: number): number {
+    return this.interp(this.parcelCondArr, zMeters);
+  }
+
+  /**
+   * Condensate (g/kg) a saturated parcel would carry after moist-adiabatic ascent from
+   * baseZ to topZ — the strict adiabatic ceiling for a cloud column of that depth.
+   */
+  public adiabaticCondensateGKg(baseZ: number, topZ: number): number {
+    if (topZ <= baseZ) return 0;
+    const a = this.interp(this.adiabaticCondIntegralGKg, baseZ);
+    const b = this.interp(this.adiabaticCondIntegralGKg, topZ);
+    return Math.max(0, b - a);
+  }
+
+  /**
+   * Integral of parcel buoyancy between two altitudes (J/kg == m^2/s^2). Dividing by the
+   * layer depth gives the depth-mean acceleration a plume actually experiences while it
+   * traverses that layer — the quantity that sets its equilibrium updraft speed. Using the
+   * midpoint value instead badly underestimates growth for shallow clouds, because B(z) rises
+   * steeply just above the LFC.
+   */
+  public parcelBuoyancyIntegral(fromZ: number, toZ: number): number {
+    if (toZ <= fromZ) return 0;
+    return this.interp(this.parcelBuoyIntegralArr, toZ) - this.interp(this.parcelBuoyIntegralArr, fromZ);
+  }
+
+  /** Instantaneous saturated-ascent condensation rate (g/kg per s) for updraft w (m/s) at z. */
+  public adiabaticCondensationRateGKgPerS(z: number, wMS: number): number {
+    if (wMS <= 0) return 0;
+    return this.interp(this.adiabaticCondGKgPerKm, z) * wMS * 0.001;
+  }
+
+  /** Condensate a saturated parcel produces per km of ascent at altitude z (g/kg/km). */
+  public condGKgPerKmAt(z: number): number {
+    return this.interp(this.adiabaticCondGKgPerKm, z);
   }
 }

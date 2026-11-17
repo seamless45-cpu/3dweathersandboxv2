@@ -11,6 +11,8 @@ import {
   StormOrganizationMode,
 } from './types';
 
+const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
+
 export class ConvectiveCellManager {
   public cells: ConvectiveCell[] = [];
   public coldPools: ColdPool[] = [];
@@ -18,7 +20,18 @@ export class ConvectiveCellManager {
 
   private nextCellNum = 1;
   private nextPoolNum = 1;
-  private boundaryLayerThermalEnergy = 0; // Builds naturally from 0 at t=0 via solar heating
+  private boundaryLayerThermalEnergy = 0;
+  /** Fraction (0..0.86) of the initial CIN mixed away by surface heating and gust fronts. */
+  private capErosionFrac = 0;
+  /** Transient mixing from active cold-pool fronts, fed by stepColdPools. */
+  private gustFrontMixing = 0;
+  /**
+   * Cumulative water budgets of cells that have already retired. Kept separately so the
+   * domain water balance stays closed even after the cell objects are gone.
+   */
+  public retiredCondensedGKg = 0;
+  public retiredFalloutGKg = 0;
+  public retiredEvaporatedGKg = 0; // Builds naturally from 0 at t=0 via solar heating
   private nucleationCheckTimer = 0;
   private rngState = 13374209;
 
@@ -39,6 +52,11 @@ export class ConvectiveCellManager {
     this.nextCellNum = 1;
     this.nextPoolNum = 1;
     this.boundaryLayerThermalEnergy = 0;
+    this.capErosionFrac = 0;
+    this.gustFrontMixing = 0;
+    this.retiredCondensedGKg = 0;
+    this.retiredFalloutGKg = 0;
+    this.retiredEvaporatedGKg = 0;
     this.nucleationCheckTimer = 0;
     this.rngState = 13374209;
   }
@@ -61,6 +79,17 @@ export class ConvectiveCellManager {
     // 2. Step Cold Pools (evaporatively cooled density currents expanding along surface)
     this.stepColdPools(dt, sounding);
 
+    // 2b. Cap erosion. Insolation and boundary-layer mixing warm/moisten the layer below the
+    // inversion, so the effective CIN decays through the run instead of staying pinned at its
+    // t=0 value. Without this a modest cap suppresses convection forever, which is why cells
+    // never left the nucleating stage.
+    const erosionRate =
+      (0.028 + 0.052 * cfg.solarHeatingFactor) *
+      (0.35 + Math.min(1.4, this.boundaryLayerThermalEnergy)) +
+      this.gustFrontMixing * 0.9;
+    this.capErosionFrac = Math.min(0.93, this.capErosionFrac + erosionRate * dt * 0.016);
+    this.gustFrontMixing = Math.max(0, this.gustFrontMixing - dt * 0.006);
+
     // 3. Evaluate natural convective parcel nucleation (solar thermals + gust front convergence)
     this.nucleationCheckTimer += dt;
     if (this.nucleationCheckTimer >= 3.5) {
@@ -68,8 +97,10 @@ export class ConvectiveCellManager {
       this.nucleationCheckTimer = 0;
     }
 
-    // 4. Step each individual Convective Cell's dynamics, vertical growth, shear, microphysics & electrification inputs
+    // 4. Step each individual Convective Cell's dynamics, vertical growth, shear, microphysics
     const newSplitCells: ConvectiveCell[] = [];
+    // Fraction of the capping inversion mixed away so far (0 = pristine cap, 1 = fully eroded).
+    const capErosionProgress = this.capErosionFrac;
 
     for (let i = this.cells.length - 1; i >= 0; i--) {
       const cell = this.cells[i];
@@ -77,13 +108,17 @@ export class ConvectiveCellManager {
 
       // Sample steering flow across cloud depth + Bunkers propagation if rotating/mature
       const steerZ = Math.min(6500, 0.55 * cell.cloudBaseM + 0.45 * Math.max(cell.cloudBaseM + 500, cell.cloudTopM));
-      const steerWind = sounding.sampleAtAltitude(steerZ);
-      const upperWind = sounding.sampleAtAltitude(Math.min(12500, Math.max(8500, inst.el * 0.9)));
-      const lowWind = sounding.sampleAtAltitude(500);
+      const upperZ = Math.min(12500, Math.max(8500, inst.el * 0.9));
+      const steerU = sounding.windUAt(steerZ);
+      const steerW = sounding.windWAt(steerZ);
+      const upperU = sounding.windUAt(upperZ);
+      const upperW = sounding.windWAt(upperZ);
+      const lowU = sounding.windUAt(500);
+      const lowW = sounding.windWAt(500);
 
       // Upper-level storm-relative anvil shear vector
-      const dAnvX = upperWind.windU - steerWind.windU;
-      const dAnvZ = upperWind.windW - steerWind.windW;
+      const dAnvX = upperU - steerU;
+      const dAnvZ = upperW - steerW;
       const dAnvMag = Math.hypot(dAnvX, dAnvZ);
       if (dAnvMag > 0.5) {
         cell.anvilAxisX = dAnvX / dAnvMag;
@@ -92,63 +127,114 @@ export class ConvectiveCellManager {
 
       // Compute gust-front convergence support vs cold-pool undercutting
       let gustFrontLiftBoost = 0;
-      let coldPoolUndercutPenalty = 0;
+      let coldPoolBuoyancyPenalty = 0;
+      const shearProtection = Math.min(0.88, inst.bulkShear06km / 24.0);
       for (const pool of this.coldPools) {
         const d = Math.hypot(cell.x - pool.x, cell.z - pool.z);
         const distFromFront = Math.abs(d - pool.radiusM);
         if (distFromFront < 1400 && pool.sourceCellId !== cell.id) {
-          gustFrontLiftBoost += pool.strength * 2.2 * (1.0 - distFromFront / 1400);
-        } else if (d < pool.radiusM * 0.65 && pool.tempDeficitK > 2.2) {
-          // Deep cold air beneath updraft stabilizes inflow unless strong wind shear keeps inflow ahead of front
-          const shearProtection = Math.min(0.88, inst.bulkShear06km / 24.0);
-          coldPoolUndercutPenalty +=
-            (pool.tempDeficitK * 0.35) * (1.0 - shearProtection);
+          const frontWeight = pool.strength * (1.0 - distFromFront / 1400);
+          gustFrontLiftBoost += frontWeight * 2.2;
+          this.gustFrontMixing = Math.min(0.9, this.gustFrontMixing + frontWeight * dt * 0.05);
+        } else if (d < pool.radiusM * 0.65 && pool.tempDeficitK > 1.6) {
+          // Cold, dense air beneath the updraft chokes the low-level inflow unless vertical
+          // shear keeps the inflow ahead of the gust front.
+          const envTempK = Math.max(240, sounding.tempKAt(Math.max(60, pool.depthM * 0.5)));
+          coldPoolBuoyancyPenalty +=
+            ((PHYS.G * pool.tempDeficitK * 0.55) / envTempK) * (1.0 - shearProtection);
         }
       }
+      coldPoolBuoyancyPenalty = Math.min(coldPoolBuoyancyPenalty, 0.22);
 
-      // Microphysics update (condensation, ice, riming, hail, rain, latent heating, drag)
+      // Microphysics update (condensation ceiling, ice, riming, hail, rain, latent heat, drag).
+      // Also sets cell.entrainmentRate (km^-1) from the updraft radius.
       const mpOut = stepCellMicrophysics(cell, dt, sounding, cfg);
 
-      // Parcel Buoyancy & Vertical Momentum Integration
-      // Entrainment scales inversely with updraft radius: narrow thermals dilute fast in dry mid-levels!
-      cell.entrainmentRate = 0.24 / Math.max(0.55, cell.radiusM / 1000.0);
+      const cloudDepth = Math.max(300, cell.cloudTopM - cell.cloudBaseM);
+      const dilutionFactor = Math.exp(-cell.entrainmentRate * (cloudDepth / 1000.0));
+      const updraftRadiusEff = Math.min(4200, Math.max(320, cell.radiusM));
 
-      // Effective parcel buoyancy from CAPE, latent heating, CIN below LFC, entrainment dilution, and precip drag
-      const aboveLFC = cell.cloudTopM > inst.lfc;
-      const capeScale = Math.sqrt(Math.max(0, inst.cape)) / 42.0; // ~0 to 1.4
-      let thermalBuoyancy = 0;
+      // ---- Vertical momentum balance -------------------------------------------------
+      // The parcel buoyancy profile B(z) comes straight from the sounding ascent that CAPE
+      // and CIN are integrated from, so the updraft feels the real vertical structure:
+      // negative under the cap, strongly positive between LFC and EL, negative aloft. That
+      // replaces four hand-tuned regime constants with one measured profile.
+      //
+      //     dw/dt = B(z) * eta_ent * f_shape  -  loading  -  w|w| / R_eff
+      //
+      // whose steady state for B > 0 is the classical plume result w = sqrt(B * R).
+      const zEval = Math.max(60, 0.5 * (cell.cloudBaseM + cell.cloudTopM));
 
-      if (cell.cloudTopM < inst.lcl) {
-        // Dry boundary-layer thermal rising toward LCL
-        thermalBuoyancy =
-          0.052 * cfg.solarHeatingFactor * Math.min(1.3, this.boundaryLayerThermalEnergy) -
-          0.00022 * inst.cin +
-          0.03 * gustFrontLiftBoost;
-      } else if (!aboveLFC) {
-        // Between LCL and LFC: fighting capping inversion (CIN)!
-        const capResistance = 0.00042 * inst.cin + 0.0095 * cfg.cappingInversionStrengthK;
-        thermalBuoyancy =
-          0.046 * (cfg.solarHeatingFactor * Math.min(1.25, this.boundaryLayerThermalEnergy) + gustFrontLiftBoost) +
-          mpOut.latentHeatingKPerS * 1.15 -
-          capResistance -
-          cell.entrainmentRate * 0.032;
-      } else if (cell.cloudTopM <= inst.el && inst.cape > 120) {
-        // Free convection zone (LFC -> EL): full CAPE release!
-        const zNorm =
-          (cell.cloudTopM - inst.lfc) / Math.max(1000, inst.el - inst.lfc);
-        const verticalShape = Math.sin(Math.min(1.0, Math.max(0.08, zNorm)) * Math.PI * 0.88);
-        thermalBuoyancy =
-          0.165 * capeScale * (0.48 + 0.85 * verticalShape) +
-          mpOut.latentHeatingKPerS * 0.9 -
-          cell.entrainmentRate * 0.042;
-      } else {
-        // Above Equilibrium Level (EL): strong stratospheric negative buoyancy decelerates overshoot!
-        const overshootDepth = cell.cloudTopM - inst.el;
-        thermalBuoyancy = -0.00045 * overshootDepth;
+      // Depth-mean parcel buoyancy over the layer the plume is *currently* working through.
+      // The integral window trails the cloud top by one convective depth: an updraft's speed
+      // reflects the buoyancy it has accumulated over roughly the layer it occupies, not the
+      // whole column from the ground (which would permanently charge an established storm for
+      // the sub-cloud CIN it already paid to escape) and not the single midpoint level either
+      // (which badly underestimates growth just above the LFC, where B(z) rises steeply).
+      const windowDepth = Math.max(900, Math.min(cloudDepth, 6500));
+      const integBase = Math.max(60, cell.cloudTopM - windowDepth);
+      const envB =
+        sounding.parcelBuoyancyIntegral(integBase, cell.cloudTopM) / (cell.cloudTopM - integBase);
+
+      // A shallow cloud still inside the capped layer pays for the negative area above it:
+      // integrate from the LCL when the top has not yet reached the LFC.
+      const cappedEnvB =
+        cell.cloudTopM < inst.lfc
+          ? sounding.parcelBuoyancyIntegral(Math.min(cell.cloudBaseM, inst.lcl), inst.lfc) /
+            Math.max(300, inst.lfc - Math.min(cell.cloudBaseM, inst.lcl))
+          : envB;
+
+      // Entrainment dilution: a plume mixes environmental air in proportion to the depth it
+      // has travelled, scaled by how narrow it is (eta -> 1 for a wide, undiluted core).
+      const entrainmentEfficiency = clamp(Math.pow(dilutionFactor, 0.45), 0.14, 1.0);
+
+      // Perturbation-pressure drag. Narrow thermals lose most of their buoyancy to the
+      // dynamic pressure gradient; a deep, wide tower keeps nearly all of it.
+      const depthFrac = clamp(cloudDepth / Math.max(2000, inst.el - inst.lcl), 0.05, 1.0);
+      const shapeFactor = clamp(0.40 + 0.62 * depthFrac, 0.34, 1.0);
+
+      // A thermal warmer than the CAPE parcel (solar heating, gust-front forcing) starts with
+      // extra buoyancy in the sub-cloud and capped layers, which is what lets convection
+      // initiate at all when the mixed-layer parcel is still slightly stable.
+      // A thermal warmer than the CAPE parcel (solar heating, gust-front convergence) carries
+      // extra buoyancy of its own. This is the perturbation that lets convection initiate when
+      // the mixed-layer parcel profile is still marginally stable.
+      const thermalExcessK =
+        (0.85 + 1.15 * cfg.solarHeatingFactor * Math.min(1.35, this.boundaryLayerThermalEnergy)) *
+        (1.0 + 0.5 * gustFrontLiftBoost);
+      const excessBuoyancy =
+        (PHYS.G * thermalExcessK) / Math.max(240, sounding.tempKAt(zEval));
+
+      // Cap erosion: surface heating and gust-front mixing gradually remove the inversion, so
+      // the negative buoyancy between LCL and LFC weakens through the run. Applied only to the
+      // negative part of B(z) — CAPE above the LFC is untouched.
+      // Surface heating and gust-front mixing erode the inversion, so only the *negative*
+      // part of the profile weakens with time; CAPE above the LFC is untouched.
+      const cappedB = cappedEnvB < 0 ? cappedEnvB * (1.0 - capErosionProgress) : cappedEnvB;
+
+      const shearSeparation = Math.min(1.0, inst.bulkShear06km / 18.0);
+      const loadingDrag =
+        mpOut.precipLoadingDragMS2 * (1.0 - 0.72 * shearSeparation);
+
+      // The thermal excess is a near-surface perturbation: it decays with height as the plume
+      // entrains, so it matters below the LFC and fades through the deep convective layer.
+      const excessDecay = clamp(1.0 - cloudDepth / Math.max(1200, inst.el - inst.lcl), 0.0, 1.0);
+
+      let buoyancyMS2 =
+        cappedB * entrainmentEfficiency * shapeFactor +
+        excessBuoyancy * shapeFactor * excessDecay * excessDecay -
+        loadingDrag -
+        coldPoolBuoyancyPenalty;
+
+      // Above the equilibrium level the profile already turns negative, but an overshooting
+      // dome also feels the extra static stability of the lower stratosphere.
+      if (cell.cloudTopM > inst.el) {
+        buoyancyMS2 -= 0.00035 * (cell.cloudTopM - inst.el);
       }
 
-      // Mesocyclone rotational dynamics when vertical shear & SRH tilt horizontal vorticity into updraft
-      if (cell.cloudTopM > inst.lfc + 1200 && cell.updraftMaxMS > 8.0 && inst.bulkShear06km > 13.0) {
+      // Mesocyclone rotational dynamics when vertical shear & SRH tilt horizontal vorticity
+      // into the updraft.
+      if (cell.cloudTopM > inst.lfc + 1200 && cell.updraftMaxMS > 6.0 && inst.bulkShear06km > 12.0) {
         const tiltingSource =
           (inst.bulkShear06km / 6000.0) *
           (cell.updraftMaxMS / Math.max(1200, cell.radiusM)) *
@@ -158,102 +244,126 @@ export class ConvectiveCellManager {
       } else {
         cell.mesocycloneVorticity *= Math.max(0, 1.0 - 0.03 * dt);
       }
-
       cell.rotationPhase += cell.mesocycloneVorticity * dt * 8.0;
 
-      // Dynamic non-hydrostatic vertical pressure gradient boost in rotating mesocyclones
+      // Non-hydrostatic perturbation pressure deficit in a rotating updraft adds buoyancy.
       const dynamicPressureBoost =
-        Math.abs(cell.mesocycloneVorticity) > 0.008
-          ? Math.min(0.11, Math.abs(cell.mesocycloneVorticity) * 4.2)
+        Math.abs(cell.mesocycloneVorticity) > 0.006
+          ? Math.min(0.085, Math.abs(cell.mesocycloneVorticity) * 3.4)
           : 0;
 
-      // Weak-shear pulse storm self-choking: if shear is low, precip drag acts directly on updraft!
-      const shearSeparationFactor = Math.min(1.0, inst.bulkShear06km / 18.0);
-      const effectivePrecipDragOnUpdraft =
-        mpOut.precipLoadingDragMS2 * (1.0 - 0.72 * shearSeparationFactor);
-
-      // Mature storm lifecycle aging & cold pool undercutting
+      // Mature-storm ageing: non-rotating cells are eventually choked by their own cold pool.
       const lifecycleExhaustion =
-        cell.ageSec > 1500 && Math.abs(cell.mesocycloneVorticity) < 0.012
-          ? 0.00008 * (cell.ageSec - 1500)
+        cell.ageSec > 1500 && Math.abs(cell.mesocycloneVorticity) < 0.01
+          ? 0.000075 * (cell.ageSec - 1500)
           : 0;
 
       cell.buoyancyAccel =
-        thermalBuoyancy +
-        dynamicPressureBoost -
-        effectivePrecipDragOnUpdraft -
-        0.025 * coldPoolUndercutPenalty -
-        lifecycleExhaustion;
+        buoyancyMS2 + dynamicPressureBoost - lifecycleExhaustion;
 
-      // Update peak updraft velocity w_max
-      const aerodynamicDrag = 0.00018 * cell.updraftMaxMS * Math.abs(cell.updraftMaxMS);
-      cell.updraftMaxMS += (cell.buoyancyAccel - aerodynamicDrag) * dt;
-      cell.updraftMaxMS = Math.max(-2.5, Math.min(58.0, cell.updraftMaxMS));
+      // Integrate rather than relax to the equilibrium speed: a thermal that arrives at the
+      // capping inversion with kinetic energy keeps rising while it decelerates, which is how
+      // real convection punches through a modest cap.
+      const w = cell.updraftMaxMS;
+      const dragMS2 = (w * Math.abs(w)) / updraftRadiusEff;
+      let dw = (cell.buoyancyAccel - dragMS2) * dt;
+      // The explicit drag term must never reverse the velocity inside one step.
+      if (dragMS2 > 0 && dw < -0.6 * w) dw = -0.6 * w;
+      cell.updraftMaxMS = clamp(w + dw, -3.0, 58.0);
 
-      // Downdraft driven by precipitation loading + sub-cloud evaporative & melting cooling
-      const downdraftForcing =
-        mpOut.precipLoadingDragMS2 * 1.45 + mpOut.subCloudCoolingKPerS * 14.0;
-      const targetDowndraft = Math.min(
-        28.0,
-        Math.sqrt(Math.max(0, downdraftForcing * 950.0))
+      // ---- Downdraft: sub-cloud evaporative/melt cooling plus precipitation loading ----
+      const subCloudDepth = Math.max(350, cell.cloudBaseM);
+      const subCloudTempK = Math.max(240, sounding.tempKAt(subCloudDepth * 0.5));
+      const fallResidenceTime = subCloudDepth / Math.max(1.2, mpOut.bulkFallSpeedMS);
+      // Only part of the sub-cloud cooling ends up in the downdraft air (mixing, spreading).
+      const downdraftTempDeficitK = mpOut.subCloudCoolingKPerS * fallResidenceTime * 0.62;
+      const downdraftBuoyancy =
+        (PHYS.G * Math.min(11, downdraftTempDeficitK)) / subCloudTempK +
+        mpOut.precipLoadingDragMS2 * 0.85;
+      const targetDowndraft = clamp(
+        0.62 * Math.sqrt(2.0 * Math.max(0, downdraftBuoyancy) * subCloudDepth),
+        0,
+        24
       );
-      cell.downdraftMaxMS += (targetDowndraft - cell.downdraftMaxMS) * Math.min(1.0, 0.04 * dt);
+      cell.downdraftMaxMS +=
+        (targetDowndraft - cell.downdraftMaxMS) * (1.0 - Math.exp(-dt / 150.0));
+      cell.downdraftMaxMS = clamp(cell.downdraftMaxMS, 0, 24);
 
-      // Update Cloud Base, Cloud Top, Tower Radius, Overshooting Top & Anvil Spread
-      cell.cloudBaseM += (inst.lcl - cell.cloudBaseM) * Math.min(1.0, 0.05 * dt);
+      // ---- Cloud geometry: base, top, radius, overshoot, anvil ----
+      // The visible cloud base sits at the LCL once the tower is established; a shallow
+      // thermal still has its condensate deck forming, so the base relaxes in only after the
+      // top has cleared the LCL. This keeps the sub-LCL dry-thermal branch meaningful.
+      const targetBaseM = cell.cloudTopM > inst.lcl + 250 ? inst.lcl : Math.min(inst.lcl, cell.cloudTopM);
+      cell.cloudBaseM += (targetBaseM - cell.cloudBaseM) * (1.0 - Math.exp(-dt / 70.0));
+      if (cell.cloudTopM < cell.cloudBaseM) cell.cloudBaseM = cell.cloudTopM;
 
-      if (cell.updraftMaxMS > 0.3) {
-        // Cloud top rises at ~0.48 * peak updraft speed (plume cap ascent velocity)
-        const capRise = cell.updraftMaxMS * 0.48;
+      if (cell.updraftMaxMS > 0.25) {
+        // The cloud top rises at the updraft speed *at the top of the cloud*, not at w_max.
+        // In a shallow cumulus the peak updraft sits right below the cap, so the top climbs at
+        // ~0.88 w; in a deep mature tower w_max is mid-cloud and the top spreads into an anvil,
+        // so it climbs at ~0.44 w. Blending on depth reproduces both growth regimes.
+        const capRiseFactor = clamp(0.88 - 0.44 * (cloudDepth / 9000.0), 0.4, 0.88);
+        const capRise = cell.updraftMaxMS * capRiseFactor;
         const maxPhysicalTop =
           inst.cape > 80
-            ? inst.el + Math.min(2600, cell.updraftMaxMS * 48.0)
-            : inst.lcl + 1600;
+            ? inst.el + Math.min(2400, cell.updraftMaxMS * 42.0)
+            : inst.lcl + 900 + cell.updraftMaxMS * 180.0;
         if (cell.cloudTopM < maxPhysicalTop) {
           cell.cloudTopM += capRise * dt;
         } else {
-          cell.cloudTopM += (maxPhysicalTop - cell.cloudTopM) * Math.min(1.0, 0.04 * dt);
+          cell.cloudTopM += (maxPhysicalTop - cell.cloudTopM) * (1.0 - Math.exp(-dt / 26.0));
         }
       } else {
         // Subsidence & cloud top collapse during dissipation
         cell.cloudTopM = Math.max(
           cell.cloudBaseM,
-          cell.cloudTopM - (1.8 + Math.max(0, -cell.updraftMaxMS) * 0.8) * dt
+          cell.cloudTopM - (1.6 + Math.max(0, -cell.updraftMaxMS) * 0.9) * dt
         );
       }
 
-      // Overshooting dome height above Equilibrium Level
       cell.overshootingTopM =
         inst.cape > 400 && cell.cloudTopM > inst.el
           ? Math.max(0, cell.cloudTopM - inst.el)
           : 0;
 
-      // Convective tower horizontal radius grows with cloud depth and mass continuity
+      // Convective tower radius. Observed updraft cores scale with cloud depth, not with the
+      // product of speed and depth: a 2 km shallow cumulus core is ~0.5 km across while a
+      // 12 km tower is 3-5 km across. Getting this right matters twice over, because the
+      // radius also sets the lateral entrainment rate (eps ~ 0.2/R) that dilutes condensate
+      // and the aerodynamic drag that limits the updraft.
+      const continuityRadius =
+        340 + Math.sqrt(Math.max(0, cell.updraftMaxMS) * Math.max(300, cloudDepth)) * 15.0;
+      const depthRadius = cloudDepth * (0.19 + 0.011 * Math.sqrt(Math.max(0, cell.updraftMaxMS)));
       const targetRadius =
         cell.stage === 'dissipating'
-          ? cell.radiusM * (1.0 - 0.002 * dt)
-          : Math.min(
-              4800,
-              650 + Math.max(0, cell.cloudTopM - cell.cloudBaseM) * 0.26 * (1.0 + Math.abs(cell.mesocycloneVorticity) * 14.0)
+          ? cell.radiusM * (1.0 - 0.0016 * dt)
+          : clamp(
+              Math.max(continuityRadius, depthRadius) *
+                (1.0 + Math.min(0.35, Math.abs(cell.mesocycloneVorticity) * 9.0)),
+              480,
+              4600
             );
-      cell.radiusM += (targetRadius - cell.radiusM) * Math.min(1.0, 0.035 * dt);
+      cell.radiusM += (targetRadius - cell.radiusM) * (1.0 - Math.exp(-dt / 240.0));
 
-      // Upper tropospheric anvil divergence near Equilibrium Level (Cb capillatus!)
-      if (cell.cloudTopM > inst.el * 0.84 && (cell.cloudIceGKg + cell.snowGKg) > 0.25) {
-        const anvilOutflowSpeed = Math.max(4.0, cell.updraftMaxMS * 0.55 + dAnvMag * 0.45);
+      // Upper tropospheric anvil divergence near the Equilibrium Level (Cb capillatus).
+      if (cell.cloudTopM > inst.el * 0.82 && (cell.cloudIceGKg + cell.snowGKg) > 0.1) {
+        const anvilOutflowSpeed = Math.max(3.5, cell.updraftMaxMS * 0.5 + dAnvMag * 0.45);
         cell.anvilRadiusM = Math.min(13500, cell.anvilRadiusM + anvilOutflowSpeed * dt);
       } else if (cell.stage === 'dissipating') {
-        cell.anvilRadiusM = Math.max(0, cell.anvilRadiusM - 1.2 * dt);
+        cell.anvilRadiusM = Math.max(0, cell.anvilRadiusM - 1.4 * dt);
+      } else {
+        cell.anvilRadiusM = Math.max(0, cell.anvilRadiusM - 0.15 * dt);
       }
 
-      // Precipitation Core & Rear-Flank Downdraft (RFD) spatial offsets from updraft center
-      const ffdShiftX = (steerWind.windU - lowWind.windU) * 75.0;
-      const ffdShiftZ = (steerWind.windW - lowWind.windW) * 75.0;
-      cell.precipCoreOffsetX += (ffdShiftX - cell.precipCoreOffsetX) * Math.min(1.0, 0.04 * dt);
-      cell.precipCoreOffsetZ += (ffdShiftZ - cell.precipCoreOffsetZ) * Math.min(1.0, 0.04 * dt);
+      // Precipitation core & rear-flank downdraft offsets from the updraft center.
+      // Falling hydrometeors drift downshear with the low-level flow while they fall.
+      const ffdShiftX = (steerU - lowU) * 78.0;
+      const ffdShiftZ = (steerW - lowW) * 78.0;
+      cell.precipCoreOffsetX += (ffdShiftX - cell.precipCoreOffsetX) * (1.0 - Math.exp(-dt / 45.0));
+      cell.precipCoreOffsetZ += (ffdShiftZ - cell.precipCoreOffsetZ) * (1.0 - Math.exp(-dt / 45.0));
 
-      if (Math.abs(cell.mesocycloneVorticity) > 0.009) {
-        // Hook-echo / RFD wraps cyclonically around southwest/rear flank of mesocyclone
+      if (Math.abs(cell.mesocycloneVorticity) > 0.008) {
+        // Hook-echo / RFD wraps cyclonically around the rear flank of the mesocyclone.
         const wrapAngle = Math.atan2(ffdShiftZ, ffdShiftX) + 2.35;
         cell.rfdOffsetX = Math.cos(wrapAngle) * cell.radiusM * 0.72;
         cell.rfdOffsetZ = Math.sin(wrapAngle) * cell.radiusM * 0.72;
@@ -262,46 +372,48 @@ export class ConvectiveCellManager {
         cell.rfdOffsetZ = -cell.precipCoreOffsetZ * 0.25;
       }
 
-      // Storm Cell Translation: Steering Wind + Bunkers Deviation for Supercells + Gust Front Propagation
+      // Storm translation: steering flow + Bunkers deviation for rotating cells.
       const supercellFrac = Math.min(1.0, Math.abs(cell.mesocycloneVorticity) / 0.014);
       const targetVx =
         cell.rightMoverBias >= 0
-          ? steerWind.windU * (1.0 - supercellFrac) + inst.bunkersStormU * supercellFrac
-          : steerWind.windU * 1.05 - (inst.bunkersStormU - steerWind.windU) * 0.85;
+          ? steerU * (1.0 - supercellFrac) + inst.bunkersStormU * supercellFrac
+          : steerU * 1.05 - (inst.bunkersStormU - steerU) * 0.85;
       const targetVz =
         cell.rightMoverBias >= 0
-          ? steerWind.windW * (1.0 - supercellFrac) + inst.bunkersStormW * supercellFrac
-          : steerWind.windW * 1.05 - (inst.bunkersStormW - steerWind.windW) * 0.85;
+          ? steerW * (1.0 - supercellFrac) + inst.bunkersStormW * supercellFrac
+          : steerW * 1.05 - (inst.bunkersStormW - steerW) * 0.85;
 
-      cell.vx += (targetVx - cell.vx) * Math.min(1.0, 0.08 * dt);
-      cell.vz += (targetVz - cell.vz) * Math.min(1.0, 0.08 * dt);
+      const steerTau = 1.0 - Math.exp(-dt / 55.0);
+      cell.vx += (targetVx - cell.vx) * steerTau;
+      cell.vz += (targetVz - cell.vz) * steerTau;
       cell.x += cell.vx * dt;
       cell.z += cell.vz * dt;
 
-      // Spawn or reinforce surface Cold Pool when evaporative downdraft & rain reach surface
-      if (cell.downdraftMaxMS > 5.5 && (cell.surfaceRainRateMMHr > 3.5 || cell.virgaFraction > 0.45)) {
-        this.feedOrCreateColdPool(cell, mpOut.subCloudCoolingKPerS, dt);
+      // Spawn or reinforce the surface cold pool when the evaporative downdraft reaches ground.
+      if (
+        cell.downdraftMaxMS > 2.6 &&
+        (cell.surfaceRainRateMMHr > 1.2 || cell.virgaFraction > 0.55)
+      ) {
+        this.feedOrCreateColdPool(cell, downdraftTempDeficitK, dt);
       }
 
-      // Supercell Splitting when strong unidirectional/curved shear stretches vigorous updraft
+      // Supercell splitting when strong curved shear stretches a vigorous updraft.
       if (
         !cell.splitCandidateDone &&
         inst.bulkShear06km > 21.0 &&
         inst.cape > 1400 &&
-        cell.updraftMaxMS > 22.0 &&
+        cell.updraftMaxMS > 20.0 &&
         cell.ageSec > 260 &&
         this.cells.length < 14
       ) {
         cell.splitCandidateDone = true;
         cell.rightMoverBias = 1;
-        const leftMover = this.createSplitLeftMover(cell);
-        newSplitCells.push(leftMover);
+        newSplitCells.push(this.createSplitLeftMover(cell));
       }
 
-      // Classify individual cell stage physically
       cell.stage = this.classifyCellStage(cell, inst.lcl, inst.freezingLevel, inst.el);
 
-      // Remove completely dissipated cells or cells advected far outside domain
+      // Remove completely dissipated cells or cells advected far outside the domain.
       const totalHydrometeors =
         cell.cloudWaterGKg +
         cell.supercooledWaterGKg +
@@ -318,10 +430,18 @@ export class ConvectiveCellManager {
       if (
         outOfBounds ||
         (cell.ageSec > 90 &&
-          cell.updraftMaxMS < 0.2 &&
-          totalHydrometeors < 0.03 &&
+          cell.updraftMaxMS < 0.25 &&
+          totalHydrometeors < 0.035 &&
           cell.anvilRadiusM < 400)
       ) {
+        // A retiring cell must not simply delete its water: whatever condensate is still
+        // suspended either falls out or evaporates back to vapour, and its cumulative budget
+        // history has to survive so the domain water balance stays closed across the whole
+        // run. Without this the drift grew every time a cell dissipated.
+        this.retiredCondensedGKg += cell.cumCondensedGKg;
+        this.retiredFalloutGKg += cell.cumFalloutGKg + totalHydrometeors * (outOfBounds ? 0.5 : 0.0);
+        this.retiredEvaporatedGKg +=
+          cell.cumEvaporatedGKg + totalHydrometeors * (outOfBounds ? 0.5 : 1.0);
         this.cells.splice(i, 1);
       }
     }
@@ -353,14 +473,16 @@ export class ConvectiveCellManager {
       return;
     }
 
-    // Candidate 1: Gust Front & Cold Pool Collision Triggering (Multicell / Squall regeneration!)
+    // Candidate 1: Gust front & cold pool collision triggering (multicell / squall regeneration).
     for (let i = 0; i < this.coldPools.length; i++) {
       const p1 = this.coldPools[i];
       if (p1.strength < 0.22 || p1.radiusM < 1200) continue;
 
-      // Sample downshear edge of cold pool where warm low-level inflow converges head-on with gust front
-      const lowWind = sounding.sampleAtAltitude(400);
-      const inflowAngle = Math.atan2(-lowWind.windW, -lowWind.windU) + (this.rand() - 0.5) * 0.9;
+      // Sample the downshear edge of the cold pool where warm low-level inflow converges
+      // head-on with the gust front.
+      const inflowU = -sounding.windUAt(400);
+      const inflowW = -sounding.windWAt(400);
+      const inflowAngle = Math.atan2(inflowW, inflowU) + (this.rand() - 0.5) * 0.9;
       const candX = p1.x + Math.cos(inflowAngle) * p1.radiusM;
       const candZ = p1.z + Math.sin(inflowAngle) * p1.radiusM;
 
@@ -368,7 +490,7 @@ export class ConvectiveCellManager {
         continue;
       }
 
-      // Check collision with another cold pool for enhanced lifting!
+      // Collision with a second gust front greatly enhances the forced lift.
       let collisionBoost = 0;
       for (let j = 0; j < this.coldPools.length; j++) {
         if (i === j) continue;
@@ -379,7 +501,7 @@ export class ConvectiveCellManager {
         }
       }
 
-      // Mechanical gust-front lifting w_gust ~ 0.6 * c_gust overcomes much stronger CIN than solar thermals alone
+      // Mechanical gust-front lifting w ~ 0.6 c overcomes far more CIN than solar thermals alone.
       const gustKineticEnergy = 0.5 * Math.pow(p1.expansionSpeedMS * (1.0 + collisionBoost * 0.5), 2);
       if (
         gustKineticEnergy + 28.0 * cfg.solarHeatingFactor > inst.cin * 0.75 &&
@@ -388,21 +510,26 @@ export class ConvectiveCellManager {
       ) {
         const triggerProb = Math.min(0.65, (0.08 + 0.16 * collisionBoost) * checkDt);
         if (this.rand() < triggerProb) {
-          this.spawnNucleatingThermal(candX, candZ, sounding, 950 + collisionBoost * 350, 2.8 + p1.expansionSpeedMS * 0.35);
+          this.spawnNucleatingThermal(
+            candX,
+            candZ,
+            sounding,
+            950 + collisionBoost * 350,
+            2.6 + p1.expansionSpeedMS * 0.3
+          );
           if (this.cells.length >= 14) return;
         }
       }
     }
 
-    // Candidate 2: Solar Boundary-Layer Thermal Plumes over sunlit terrain hotspots
+    // Candidate 2: Solar boundary-layer thermal plumes over sunlit terrain hotspots.
     if (rh0 < 29 || inst.lcl > 4100 || cfg.solarHeatingFactor < 0.15) {
       // Too dry or no surface heating -> clear sky persists naturally!
       return;
     }
 
-    // Thermal kinetic energy vs CIN barrier
     const thermalEnergyJPerKg =
-      (38.0 * cfg.solarHeatingFactor * this.boundaryLayerThermalEnergy) +
+      38.0 * cfg.solarHeatingFactor * this.boundaryLayerThermalEnergy +
       Math.max(0, (rh0 - 50) * 0.9);
     if (thermalEnergyJPerKg < inst.cin * 0.55) {
       return;
@@ -410,7 +537,7 @@ export class ConvectiveCellManager {
 
     const attempts = 5;
     for (let a = 0; a < attempts; a++) {
-      // Favor field of view in front of observer (-11km..+11km X, -11km..+3.5km Z) while covering whole domain
+      // Favor the field of view in front of the observer while still covering the domain.
       const candX = (this.rand() * 2.0 - 1.0) * (DOMAIN_HALF_SIZE - 3000);
       const candZ = (this.rand() * 1.7 - 1.05) * (DOMAIN_HALF_SIZE * 0.72);
 
@@ -444,27 +571,28 @@ export class ConvectiveCellManager {
   ): void {
     const num = this.nextCellNum++;
     const id = `CELL-${String(num).padStart(2, '0')}`;
-    const lowWind = sounding.sampleAtAltitude(700);
-    const upperWind = sounding.sampleAtAltitude(9500);
-    const dx = upperWind.windU - lowWind.windU;
-    const dz = upperWind.windW - lowWind.windW;
+    const lowU = sounding.windUAt(700);
+    const lowW = sounding.windWAt(700);
+    const dx = sounding.windUAt(9500) - lowU;
+    const dz = sounding.windWAt(9500) - lowW;
     const dMag = Math.max(0.1, Math.hypot(dx, dz));
 
     const lcl = sounding.instability.lcl;
-    // Start parcel slightly below LCL so condensation grows visibly from thin wisps at LCL!
-    const startTop = Math.max(350, lcl - 120);
+    // Start the parcel as a shallow surface thermal: it must climb to the LCL under its own
+    // buoyancy, so the dry-adiabatic stage is simulated rather than skipped.
+    const startTop = Math.max(280, Math.min(lcl * 0.55, 620));
 
     this.cells.push({
       id,
       numericId: num,
       x,
       z,
-      vx: lowWind.windU,
-      vz: lowWind.windW,
+      vx: lowU,
+      vz: lowW,
       ageSec: 0,
       stage: 'nucleating',
       radiusM,
-      cloudBaseM: lcl,
+      cloudBaseM: startTop * 0.42,
       cloudTopM: startTop,
       anvilRadiusM: 0,
       anvilAxisX: dx / dMag,
@@ -473,7 +601,7 @@ export class ConvectiveCellManager {
       updraftMaxMS: initUpdraftMS,
       downdraftMaxMS: 0,
       buoyancyAccel: 0.02,
-      entrainmentRate: 0.25,
+      entrainmentRate: 0.6,
       mesocycloneVorticity: 0,
       rotationPhase: this.rand() * Math.PI * 2,
       splitCandidateDone: false,
@@ -493,6 +621,9 @@ export class ConvectiveCellManager {
       surfaceRainRateMMHr: 0,
       precipType: 'None',
       virgaFraction: 0,
+      cumCondensedGKg: 0,
+      cumFalloutGKg: 0,
+      cumEvaporatedGKg: 0,
       upperPosChargeNCm3: 0,
       mainNegChargeNCm3: 0,
       lowerPosChargeNCm3: 0,
@@ -506,7 +637,7 @@ export class ConvectiveCellManager {
   private createSplitLeftMover(parent: ConvectiveCell): ConvectiveCell {
     const num = this.nextCellNum++;
     const id = `CELL-${String(num).padStart(2, '0')}`;
-    // Conserve water & charge by partitioning 62% to right-mover and 38% to left-mover
+    // Conserve water & charge by partitioning 62% to the right-mover and 38% to the left-mover.
     const frac = 0.38;
     const keep = 0.62;
 
@@ -532,6 +663,9 @@ export class ConvectiveCellManager {
       graupelGKg: parent.graupelGKg * frac,
       hailGKg: parent.hailGKg * frac,
       rainGKg: parent.rainGKg * frac,
+      cumCondensedGKg: parent.cumCondensedGKg * frac,
+      cumFalloutGKg: parent.cumFalloutGKg * frac,
+      cumEvaporatedGKg: parent.cumEvaporatedGKg * frac,
       upperPosChargeNCm3: parent.upperPosChargeNCm3 * frac,
       mainNegChargeNCm3: parent.mainNegChargeNCm3 * frac,
       lowerPosChargeNCm3: parent.lowerPosChargeNCm3 * frac,
@@ -546,6 +680,9 @@ export class ConvectiveCellManager {
     parent.graupelGKg *= keep;
     parent.hailGKg *= keep;
     parent.rainGKg *= keep;
+    parent.cumCondensedGKg *= keep;
+    parent.cumFalloutGKg *= keep;
+    parent.cumEvaporatedGKg *= keep;
     parent.upperPosChargeNCm3 *= keep;
     parent.mainNegChargeNCm3 *= keep;
     parent.lowerPosChargeNCm3 *= keep;
@@ -559,19 +696,46 @@ export class ConvectiveCellManager {
       for (let j = i + 1; j < this.cells.length; j++) {
         const a = this.cells[i];
         const b = this.cells[j];
-        // Don't immediately re-merge freshly split opposite-vorticity pair
+        // Don't immediately re-merge a freshly split opposite-vorticity pair.
         if (a.rightMoverBias * b.rightMoverBias < 0 && Math.abs(a.ageSec - b.ageSec) < 120) {
           continue;
         }
         const dist = Math.hypot(a.x - b.x, a.z - b.z);
         const mergeDist = 0.62 * (a.radiusM + b.radiusM);
         if (dist < mergeDist && a.cloudTopM > a.cloudBaseM + 600 && b.cloudTopM > b.cloudBaseM + 600) {
-          // Merge smaller cell into stronger cell conserving mass & charge weighted by volume
-          const volA = a.radiusM * a.radiusM * Math.max(200, a.cloudTopM - a.cloudBaseM);
-          const volB = b.radiusM * b.radiusM * Math.max(200, b.cloudTopM - b.cloudBaseM);
+          // Merge the smaller cell into the stronger one. Mixing ratios are *intensive*, so a
+          // plain volume-weighted average silently destroys water whenever the two cells
+          // differ in size. Conserve mass by construction instead: total mass in, divided by
+          // the volume the merged cell actually occupies.
+          const depthA = Math.max(200, a.cloudTopM - a.cloudBaseM);
+          const depthB = Math.max(200, b.cloudTopM - b.cloudBaseM);
+          const volA = a.radiusM * a.radiusM * depthA;
+          const volB = b.radiusM * b.radiusM * depthB;
           const totVol = volA + volB;
           const wA = volA / totVol;
           const wB = volB / totVol;
+
+          // Per-cell inventory *before* anything is overwritten. The budget identity
+          // C = I + F + E holds per cell, so the merged cell must satisfy it against the SUM
+          // of the two inventories, not against their volume-weighted mean.
+          const invA =
+            a.cloudWaterGKg + a.supercooledWaterGKg + a.cloudIceGKg + a.snowGKg +
+            a.graupelGKg + a.hailGKg + a.rainGKg;
+          const invB =
+            b.cloudWaterGKg + b.supercooledWaterGKg + b.cloudIceGKg + b.snowGKg +
+            b.graupelGKg + b.hailGKg + b.rainGKg;
+
+          const mass = (k: (c: ConvectiveCell) => number) => k(a) * volA + k(b) * volB;
+          const mCloudWater = mass((c) => c.cloudWaterGKg);
+          const mSlw = mass((c) => c.supercooledWaterGKg);
+          const mIce = mass((c) => c.cloudIceGKg);
+          const mSnow = mass((c) => c.snowGKg);
+          const mGraupel = mass((c) => c.graupelGKg);
+          const mHail = mass((c) => c.hailGKg);
+          const mRain = mass((c) => c.rainGKg);
+          const chargeUpper = mass((c) => c.upperPosChargeNCm3);
+          const chargeMain = mass((c) => c.mainNegChargeNCm3);
+          const chargeLower = mass((c) => c.lowerPosChargeNCm3);
 
           a.x = a.x * wA + b.x * wB;
           a.z = a.z * wA + b.z * wB;
@@ -582,17 +746,29 @@ export class ConvectiveCellManager {
           a.anvilRadiusM = Math.max(a.anvilRadiusM, b.anvilRadiusM);
           a.updraftMaxMS = Math.min(56, Math.max(a.updraftMaxMS, b.updraftMaxMS) * 1.06);
 
-          a.cloudWaterGKg = a.cloudWaterGKg * wA + b.cloudWaterGKg * wB * 1.15;
-          a.supercooledWaterGKg = a.supercooledWaterGKg * wA + b.supercooledWaterGKg * wB * 1.15;
-          a.cloudIceGKg = a.cloudIceGKg * wA + b.cloudIceGKg * wB * 1.15;
-          a.snowGKg = a.snowGKg * wA + b.snowGKg * wB * 1.15;
-          a.graupelGKg = a.graupelGKg * wA + b.graupelGKg * wB * 1.15;
-          a.hailGKg = a.hailGKg * wA + b.hailGKg * wB * 1.15;
-          a.rainGKg = a.rainGKg * wA + b.rainGKg * wB * 1.15;
+          // Volume the merged cell now represents; all concentrations are divided by it so the
+          // total water and charge inventories are unchanged by the merge.
+          const volMerged = Math.max(1, a.radiusM * a.radiusM * Math.max(200, a.cloudTopM - a.cloudBaseM));
+          a.cloudWaterGKg = mCloudWater / volMerged;
+          a.supercooledWaterGKg = mSlw / volMerged;
+          a.cloudIceGKg = mIce / volMerged;
+          a.snowGKg = mSnow / volMerged;
+          a.graupelGKg = mGraupel / volMerged;
+          a.hailGKg = mHail / volMerged;
+          a.rainGKg = mRain / volMerged;
+          // Integrated budgets are extensive: they simply add. Any mass the geometry change
+          // leaves unaccounted for is returned to vapour so the column balance closes exactly.
+          const inventoryAfter =
+            a.cloudWaterGKg + a.supercooledWaterGKg + a.cloudIceGKg + a.snowGKg +
+            a.graupelGKg + a.hailGKg + a.rainGKg;
+          const mergeMassDeltaGKg = Math.max(0, invA + invB - inventoryAfter);
+          a.cumCondensedGKg += b.cumCondensedGKg;
+          a.cumFalloutGKg += b.cumFalloutGKg;
+          a.cumEvaporatedGKg += b.cumEvaporatedGKg + mergeMassDeltaGKg;
 
-          a.upperPosChargeNCm3 = a.upperPosChargeNCm3 * wA + b.upperPosChargeNCm3 * wB;
-          a.mainNegChargeNCm3 = a.mainNegChargeNCm3 * wA + b.mainNegChargeNCm3 * wB;
-          a.lowerPosChargeNCm3 = a.lowerPosChargeNCm3 * wA + b.lowerPosChargeNCm3 * wB;
+          a.upperPosChargeNCm3 = chargeUpper / volMerged;
+          a.mainNegChargeNCm3 = chargeMain / volMerged;
+          a.lowerPosChargeNCm3 = chargeLower / volMerged;
 
           this.cells.splice(j, 1);
           j--;
@@ -603,11 +779,15 @@ export class ConvectiveCellManager {
 
   private feedOrCreateColdPool(
     cell: ConvectiveCell,
-    coolingRateKPerS: number,
+    downdraftTempDeficitK: number,
     dt: number
   ): void {
     const poolCenterX = cell.x + cell.precipCoreOffsetX;
     const poolCenterZ = cell.z + cell.precipCoreOffsetZ;
+
+    // Cold pool temperature deficit tracks the evaporative deficit of the downdraft air,
+    // strengthened a little by heavy rain loading and limited by surface heating.
+    const targetDeficitK = clamp(downdraftTempDeficitK * 1.35 + cell.surfaceRainRateMMHr * 0.012, 0.6, 12.0);
 
     let existing = this.coldPools.find((p) => p.sourceCellId === cell.id);
     if (!existing) {
@@ -624,38 +804,41 @@ export class ConvectiveCellManager {
         radiusM: Math.max(900, cell.radiusM * 0.65),
         expansionSpeedMS: 4.5,
         depthM: 550,
-        tempDeficitK: 2.2,
+        tempDeficitK: targetDeficitK * 0.55,
         ageSec: 0,
         strength: 0.5,
       };
       this.coldPools.push(existing);
     } else {
-      existing.tempDeficitK = Math.min(
-        9.5,
-        existing.tempDeficitK + (coolingRateKPerS * 12.0 + cell.surfaceRainRateMMHr * 0.0012) * dt
+      existing.x += (poolCenterX - existing.x) * Math.min(1.0, 0.02 * dt);
+      existing.z += (poolCenterZ - existing.z) * Math.min(1.0, 0.02 * dt);
+      existing.tempDeficitK +=
+        (targetDeficitK - existing.tempDeficitK) * Math.min(1.0, 0.012 * dt);
+      existing.depthM = Math.min(
+        1450,
+        existing.depthM + (Math.max(0, 260 + cell.downdraftMaxMS * 62.0) - existing.depthM) * Math.min(1, 0.01 * dt)
       );
-      existing.depthM = Math.min(1450, existing.depthM + cell.downdraftMaxMS * 0.25 * dt);
     }
   }
 
   private stepColdPools(dt: number, sounding: AtmosphericSounding): void {
-    const t0 = sounding.levels[0].tempK;
+    const t0 = sounding.tArr[0];
     for (let i = this.coldPools.length - 1; i >= 0; i--) {
       const p = this.coldPools[i];
       p.ageSec += dt;
-      // Benjamin (1968) gravity current propagation speed: c = Froude * sqrt(g * H * dT / T0)
+      // Benjamin (1968) gravity-current speed: c = F * sqrt(g H |dT| / T0)
       p.expansionSpeedMS =
         0.78 * Math.sqrt((PHYS.G * p.depthM * Math.max(0.2, p.tempDeficitK)) / t0);
       p.radiusM += p.expansionSpeedMS * dt;
       p.x += p.vx * dt;
       p.z += p.vz * dt;
 
-      // Surface warming & radial spreading gradually thin the cold pool
-      p.tempDeficitK *= Math.max(0, 1.0 - 0.0018 * dt);
+      // Surface warming and radial spreading gradually thin the cold pool.
+      p.tempDeficitK *= Math.max(0, 1.0 - 0.0016 * dt);
       p.depthM = Math.max(220, p.depthM * (1.0 - 0.0009 * dt));
-      p.strength = Math.max(0, Math.min(1.0, (p.tempDeficitK / 6.5) * (1.0 - p.radiusM / 15000)));
+      p.strength = clamp((p.tempDeficitK / 5.5) * (1.0 - p.radiusM / 15000), 0, 1);
 
-      if (p.tempDeficitK < 0.45 || p.radiusM > 15500) {
+      if (p.tempDeficitK < 0.4 || p.radiusM > 15500) {
         this.coldPools.splice(i, 1);
       }
     }
@@ -675,7 +858,8 @@ export class ConvectiveCellManager {
     el: number
   ): CellLifecycleStage {
     const depth = cell.cloudTopM - cell.cloudBaseM;
-    if (cell.cloudTopM <= lcl + 80 || (cell.cloudWaterGKg + cell.cloudIceGKg) < 0.03) {
+    const suspended = cell.cloudWaterGKg + cell.supercooledWaterGKg + cell.cloudIceGKg;
+    if (cell.cloudTopM <= lcl + 80 || suspended < 0.02) {
       return 'nucleating';
     }
     if (
@@ -688,10 +872,10 @@ export class ConvectiveCellManager {
     if (Math.abs(cell.mesocycloneVorticity) > 0.011 && cell.cloudTopM > freezeZ + 2200) {
       return 'supercell';
     }
-    if (cell.anvilRadiusM > cell.radiusM * 1.35 || cell.cloudTopM > el * 0.88) {
+    if (cell.anvilRadiusM > cell.radiusM * 1.35 || cell.cloudTopM > el * 0.86) {
       return 'mature';
     }
-    if (cell.cloudTopM > freezeZ + 1600 && (cell.cloudIceGKg + cell.graupelGKg) > 0.25) {
+    if (cell.cloudTopM > freezeZ + 1400 && (cell.cloudIceGKg + cell.graupelGKg) > 0.12) {
       return 'calvus';
     }
     if (depth > 2200) {
@@ -728,7 +912,8 @@ export class ConvectiveCellManager {
     if (supercells > 0) return 'Supercell Thunderstorm';
 
     if (matureStorms >= 3) {
-      // Check linear alignment (PCA / aspect ratio of cell centers) for Squall Line vs Multicell Cluster
+      // Linear alignment (aspect ratio of the cell-centre covariance) separates a squall
+      // line from a multicell cluster.
       const meanX = this.cells.reduce((s, c) => s + c.x, 0) / this.cells.length;
       const meanZ = this.cells.reduce((s, c) => s + c.z, 0) / this.cells.length;
       let sxx = 0;

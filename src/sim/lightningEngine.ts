@@ -958,11 +958,9 @@ export class AutonomousLightningEngine {
             const ix = gx + dx;
             if (ix < 0 || ix >= grid.nx) continue;
             const d2 = dx * dx + dy * dy + dz * dz;
-            const falloff = intensity / (1.0 + d2 * 0.42);
-            const id = grid.idx(ix, iy, iz);
-            if (falloff > grid.flashIllum[id]) {
-              grid.flashIllum[id] = Math.min(1.0, falloff);
-            }
+            // The grid tracks the dirty region itself so the volume texture only repacks
+            // the voxels this flash actually touched.
+            grid.addFlashIllumination(ix, iy, iz, intensity / (1.0 + d2 * 0.42));
           }
         }
       }

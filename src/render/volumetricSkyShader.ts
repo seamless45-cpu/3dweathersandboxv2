@@ -77,7 +77,10 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
     return mix(nxy0, nxy1, f.z);
   }
 
-  // Inverted 3D cellular Worley approximation for crisp cauliflower cumulus congestus turrets
+  // Inverted 3D cellular Worley approximation for crisp cauliflower cumulus congestus turrets.
+  // One hash per neighbour cell instead of three (the jitter vector is decorrelated by
+  // irrational scaling of the same hash) cuts this from 81 to 27 hash evaluations, which is
+  // the single largest saving in the ray-march because it runs on every cloudy sample.
   float worleyBillow3D(vec3 p) {
     vec3 id = floor(p);
     vec3 fd = fract(p);
@@ -86,14 +89,10 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
           vec3 neighbor = vec3(float(x), float(y), float(z));
-          vec3 rnd = vec3(
-            hash13(id + neighbor),
-            hash13(id + neighbor + 17.3),
-            hash13(id + neighbor + 43.7)
-          );
+          float h = hash13(id + neighbor);
+          vec3 rnd = fract(vec3(h * 13.71, h * 29.33, h * 47.19) + vec3(0.13, 0.37, 0.71));
           vec3 diff = neighbor + rnd - fd;
-          float d = dot(diff, diff);
-          minDist = min(minDist, d);
+          minDist = min(minDist, dot(diff, diff));
         }
       }
     }
@@ -113,7 +112,14 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
     );
   }
 
-  // Samples physically synchronized cloud & precipitation density at worldPos
+  // Samples physically synchronized cloud & precipitation density at worldPos.
+  //
+  // Structure cost is spent only where it is visible: a low-frequency domain warp breaks up
+  // the repeating noise lattice, then the sample takes exactly one of three branches
+  //   - glaciated anvil  -> horizontally stretched fibrous ice filaments
+  //   - liquid cloud edge-> Worley cauliflower + fbm (near field only)
+  //   - liquid cloud core-> a single smooth fbm octave, because erosion is suppressed there
+  // so the 27-tap cellular noise never runs for deep cores or distant cloud.
   vec4 sampleAtmosphereVolume(vec3 wp, float distKm) {
     vec3 uvw = worldToVolumeUVW(wp);
     if (
@@ -124,7 +130,7 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       return vec4(0.0);
     }
 
-    // Softly fade outermost 4% domain boundary to avoid box edges
+    // Softly fade outermost 5% of the domain boundary to avoid visible box edges
     float edgeFade =
       smoothstep(0.005, 0.055, uvw.x) * smoothstep(0.995, 0.945, uvw.x) *
       smoothstep(0.005, 0.055, uvw.z) * smoothstep(0.995, 0.945, uvw.z);
@@ -141,38 +147,60 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
     float iceFrac = raw.b;
 
     // Distance LOD reduces high-frequency noise aliasing far away while keeping crisp close detail
-    float lodFade = clamp(1.0 - distKm / 34.0, 0.2, 1.0);
+    float lodFade = clamp(1.0 - distKm / 34.0, 0.15, 1.0);
     vec3 advPos = (wp + uWindOffset) * (0.00085 * uCloudDetail);
 
     float cloudDensity = 0.0;
     if (baseCloud > 0.008) {
-      // Liquid cumulus/congestus towers use bulbous 3D Worley + Perlin;
-      // Glaciated Cb capillatus anvils stretch horizontally into fibrous ice filaments!
-      float billow = worleyBillow3D(advPos * 1.15);
-      float fbm1 = noise3D(advPos * 2.45);
-      float fbm2 = noise3D(advPos * 5.3 - vec3(0.0, uTime * 0.04, 0.0));
+      // One cheap fbm octave displaces the whole detail lattice, so cauliflower turrets are
+      // not aligned to the 500 m voxel grid and neighbouring towers never repeat.
+      float warp = noise3D(advPos * 0.55);
+      vec3 detPos = advPos + (warp - 0.5) * vec3(0.66, 0.36, 0.58);
 
-      vec3 anvilCoord = vec3(advPos.x * 0.65, advPos.y * 2.8, advPos.z * 0.65);
-      float fibrous = noise3D(anvilCoord * 2.2) * 0.65 + noise3D(anvilCoord * 4.8) * 0.35;
+      // Erode outer cloud margins while keeping deep convective cores solid and voluminous.
+      float erosionStrength = mix(0.58, 0.34, iceFrac) * uTurbulence * (1.0 - baseCloud * 0.62);
 
-      float structureNoise = mix(
-        billow * 0.62 + fbm1 * 0.26 + fbm2 * 0.12 * lodFade,
-        fibrous * 0.72 + fbm1 * 0.28,
-        iceFrac
+      float structureNoise;
+      if (iceFrac > 0.55) {
+        // Glaciated Cb capillatus anvil: ice filaments stretched 4.7x vertically and
+        // 0.62x horizontally read as wind-sheared cirrusiform striations.
+        vec3 anvilCoord = vec3(detPos.x * 0.62, detPos.y * 2.9, detPos.z * 0.62);
+        float fibrous = noise3D(anvilCoord * 2.1) * 0.68 + noise3D(anvilCoord * 5.1) * 0.32;
+        structureNoise = fibrous * 0.74 + noise3D(detPos * 1.55) * 0.26;
+      } else if (lodFade > 0.42 && baseCloud < 0.74) {
+        // Liquid cumulus / congestus turret: bulbous Worley cells plus one detail octave.
+        float billow = worleyBillow3D(detPos * 1.15);
+        structureNoise = billow * 0.66 + noise3D(detPos * 2.45) * 0.30;
+        if (lodFade > 0.72) {
+          structureNoise += (noise3D(detPos * 5.3 - vec3(0.0, uTime * 0.04, 0.0)) - 0.5) * 0.13 * lodFade;
+        }
+      } else {
+        // Deep core or distant cloud: erosion is already suppressed here, so a single smooth
+        // octave is indistinguishable from the full stack at a fraction of the cost.
+        structureNoise = noise3D(detPos * 2.2) * 0.62 + 0.34;
+      }
+
+      cloudDensity = clamp(
+        (baseCloud - (1.0 - structureNoise) * erosionStrength) / max(0.22, 1.0 - erosionStrength * 0.6),
+        0.0,
+        1.0
       );
-
-      // Erode outer cloud margins while keeping deep convective cores solid and voluminous!
-      float erosionStrength = mix(0.56, 0.36, iceFrac) * uTurbulence * (1.0 - baseCloud * 0.65);
-      cloudDensity = clamp((baseCloud - (1.0 - structureNoise) * erosionStrength) / max(0.22, 1.0 - erosionStrength * 0.6), 0.0, 1.0);
       cloudDensity *= cloudDensity * (3.0 - 2.0 * cloudDensity);
     }
 
-    // Rain shafts & virga curtains with vertical streak anisotropy
+    // Rain shafts & virga curtains: vertically elongated, wind-slanted streaks that descend
+    // at the bulk hydrometeor fall speed (~8 m/s) instead of boiling in place.
     float precipDensity = 0.0;
     if (basePrecip > 0.008) {
-      vec3 streakCoord = vec3(wp.x * 0.0028 - uWindOffset.x * 0.0008, wp.y * 0.00035 + uTime * 0.18, wp.z * 0.0028 - uWindOffset.z * 0.0008);
-      float streak = 0.72 + 0.28 * noise3D(streakCoord * 3.0);
-      precipDensity = basePrecip * streak * 0.42;
+      vec3 shaftCoord = vec3(
+        wp.x * 0.0022 - uWindOffset.x * 0.00075,
+        wp.y * 0.00042 + uTime * 0.0034,
+        wp.z * 0.0022 - uWindOffset.z * 0.00075
+      );
+      float streak = noise3D(shaftCoord * 2.6);
+      // Sharpen into curtains rather than a uniform grey veil.
+      float curtain = 0.46 + 0.54 * (streak * streak * (3.0 - 2.0 * streak));
+      precipDensity = basePrecip * curtain * 0.34;
     }
 
     return vec4(cloudDensity, precipDensity, iceFrac, raw.a);
@@ -202,7 +230,8 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       vec3 uvw = worldToVolumeUVW(sp);
       if (uvw.y > 1.0 || uvw.x < 0.0 || uvw.x > 1.0 || uvw.z < 0.0 || uvw.z > 1.0) break;
       vec4 sv = texture(uVolTex, uvw);
-      opticalDepth += (sv.r * 1.35 + sv.g * 0.65) * (stepLen * 0.0018);
+      // Coefficients track the RGBA8 packing references (1.4 g/kg cloud, 7.0 g/kg precip).
+      opticalDepth += (sv.r * 0.62 + sv.g * 0.5) * (stepLen * 0.0018);
     }
     // Dual-octave multiple scattering approximation (Schneider 2015) so deep clouds retain realistic internal glow
     float primary = exp(-opticalDepth * 2.1);
@@ -285,35 +314,49 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
     vec3 accumLight = vec3(0.0);
     float transmittance = 1.0;
 
+    // Adaptive empty-space traversal: consecutive clear voxels grow the stride geometrically
+    // (capped at 6x) and the stride collapses back to baseStep on the first cloudy sample.
+    // A ground observer looking at a distant tower previously burned most of its step budget
+    // on empty sky; this reclaims it for the cloud itself.
+    float emptyStride = 1.0;
+
     for (int i = 0; i < 96; i++) {
       if (i >= uMaxSteps || t >= tEnd || transmittance < 0.012) break;
 
       vec3 pos = ro + rd * t;
-      float distKm = t * 0.001;
 
-      // Coarse check on raw 3D texture for fast empty-space skipping!
+      // Coarse check on raw 3D texture for fast empty-space skipping
       vec3 uvw = worldToVolumeUVW(pos);
       if (uvw.x <= 0.005 || uvw.x >= 0.995 || uvw.z <= 0.005 || uvw.z >= 0.995 || uvw.y >= 0.995) {
-        t += baseStep * 2.2;
+        t += baseStep * emptyStride;
+        emptyStride = min(emptyStride * 1.6, 6.0);
         continue;
       }
 
       vec4 coarse = texture(uVolTex, uvw);
       if (coarse.r < 0.008 && coarse.g < 0.008) {
-        // Empty sky voxel -> skip ahead rapidly!
-        t += baseStep * 2.1;
+        t += baseStep * emptyStride;
+        emptyStride = min(emptyStride * 1.6, 6.0);
         continue;
       }
+      emptyStride = 1.0;
 
+      float distKm = t * 0.001;
       vec4 vol = sampleAtmosphereVolume(pos, distKm);
       float cloudD = vol.r;
       float precipD = vol.g;
       float iceFrac = vol.b;
       float localFlash = vol.a;
 
-      float totalExtinction = cloudD * 0.0046 + precipD * 0.0014;
+      // Extinction coefficients are calibrated against the RGBA8 packing references
+      // (1.4 g/kg cloud, 7.0 g/kg precip). A saturated core is optically thick within a single
+      // 500 m voxel; a rain shaft is a dark translucent curtain you can still see terrain
+      // through, because the precipitating mass is spread over a far wider density range.
+      float totalExtinction = cloudD * 0.0026 + precipD * 0.0026;
       if (totalExtinction > 0.00004) {
-        float stepDt = baseStep;
+        // Step length follows the local density: thin wisps take longer strides, opaque
+        // cores take shorter ones, so the same budget resolves far more of the cloud.
+        float stepDt = baseStep * clamp(1.9 - totalExtinction * 290.0, 0.6, 1.9);
         float stepTrans = exp(-totalExtinction * stepDt);
 
         float sunVis = marchSunLight(pos);
@@ -322,22 +365,34 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
         float powder = 1.0 - 0.45 * exp(-cloudD * 5.5);
 
         float altFrac = clamp(pos.y / 13000.0, 0.0, 1.0);
-        vec3 ambient = mix(skyAmbientBottom, skyAmbientTop, altFrac) * mix(0.85, 0.38, precipD * 1.4);
+        // Heavy shafts cut off the skylight that reaches below cloud base, which is why the
+        // world under a storm goes grey-green before the rain arrives.
+        float shaftShadow = clamp(precipD * 2.1, 0.0, 1.0);
+        vec3 ambient = mix(skyAmbientBottom, skyAmbientTop, altFrac) * mix(0.88, 0.3, shaftShadow);
 
         vec3 direct = sunRadiance * sunVis * phase * powder * 2.45;
+        // Backlit rain shafts glow: large drops forward-scatter strongly, so a shaft between
+        // the observer and the sun lights up instead of going flat black.
+        direct += sunRadiance * sunVis * pow(max(0.0, cosTheta), 6.0) * precipD * 0.55;
         vec3 lightningGlow = evaluateBoltIllumination(pos, localFlash);
 
         // Blend crisp white-slate cloud scattering with misty gray-blue rain shaft scattering
-        vec3 mediumAlbedo = mix(vec3(0.98, 0.98, 1.0), vec3(0.58, 0.64, 0.72), clamp(precipD / max(0.01, cloudD + precipD), 0.0, 0.85));
+        vec3 mediumAlbedo = mix(
+          vec3(0.98, 0.98, 1.0),
+          vec3(0.40, 0.45, 0.53),
+          clamp(precipD / max(0.01, cloudD * 0.55 + precipD), 0.0, 0.9)
+        );
         vec3 voxelScattering = mediumAlbedo * (ambient + direct + lightningGlow);
 
         // Analytical energy-conserving step integration
         vec3 integScatter = voxelScattering * (1.0 - stepTrans);
         accumLight += transmittance * integScatter;
         transmittance *= stepTrans;
-      }
 
-      t += baseStep;
+        t += stepDt;
+      } else {
+        t += baseStep;
+      }
     }
 
     // Distance atmospheric perspective blend on distant clouds (> 18 km) so clouds sit naturally INSIDE the atmosphere!
