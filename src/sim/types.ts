@@ -92,6 +92,14 @@ export interface AtmosphereConfig {
   chargeSeparationGain: number; // 0.5 - 1.5 physical Takahashi charging scaling within observations
   cloudDetailScale: number; // 0.6 - 1.6 procedural turbulent erosion detail
   turbulenceIntensity: number; // 0.5 - 1.6 sub-grid eddy intensity
+  /**
+   * 0..1 diurnal insolation multiplier applied on top of solarHeatingFactor by the day/night
+   * cycle. Deliberately optional and mutated in place rather than routed through
+   * updateConfig(): that path recomputes the whole sounding, which is far too expensive to
+   * drive from a per-frame sun angle. The sounding's slow thermal response intentionally lags
+   * the sky, exactly as the real boundary layer does at sunset.
+   */
+  solarInsolationScale?: number;
 }
 
 export interface SoundingProfileLevel {
@@ -304,6 +312,20 @@ export interface RenderQualitySettings {
   exposure: number;
   enableBloom: boolean;
   enableCameraShake: boolean;
+  /**
+   * Render scale multiplier on the device pixel ratio, 0.1 (tenth resolution, for very weak
+   * GPUs) up to 1.0 (the engine's native cap). Scales every render target and the canvas
+   * backing store, so it is the single highest-leverage frame-time control available.
+   */
+  pixelRatioScale: number;
+  /** Physically-based per-pixel camera motion blur, gathered along depth-derived motion vectors. */
+  enableMotionBlur: boolean;
+  /** Animate the sun through a full 24 h cycle instead of holding a fixed solar elevation. */
+  enableDayNightCycle: boolean;
+  /** Wall-clock seconds for one complete 24 h solar cycle. */
+  dayNightCycleSec: number;
+  /** 0..24 local solar time; scrubbable, and the live readout while the cycle runs. */
+  timeOfDayHours: number;
 }
 
 export interface ValidationDiagnostics {
@@ -325,6 +347,11 @@ export interface PerformanceMetrics {
   activeTier: QualityTier;
   raymarchStepsActive: number;
   volumetricScaleActive: number;
+  /** Effective device pixel ratio actually being rendered at (base DPR x pixelRatioScale). */
+  pixelRatioActive: number;
+  /** Internal render width x height in device pixels, for the HUD resolution readout. */
+  renderWidthPx: number;
+  renderHeightPx: number;
 }
 
 export interface SimulationTelemetrySnapshot {

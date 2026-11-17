@@ -17,7 +17,7 @@ import {
   SimulationTelemetrySnapshot,
 } from './sim/types';
 import { EventMonitor } from './ui/EventMonitor';
-import { SettingsDrawer } from './ui/SettingsDrawer';
+import { SettingsDrawer, SunReadout } from './ui/SettingsDrawer';
 import { TopToolbar } from './ui/TopToolbar';
 import { VirtualJoystick } from './ui/VirtualJoystick';
 
@@ -65,6 +65,14 @@ export function App() {
   const [perf, setPerf] = useState<PerformanceMetrics>(
     () => ({ ...perfMgrRef.current!.metrics })
   );
+  const [sun, setSun] = useState<SunReadout>(() => ({
+    clock: '15:48',
+    timeOfDayHours: perfMgrRef.current!.settings.timeOfDayHours,
+    sunElevationDeg: coordinatorRef.current!.config.sunElevationDeg,
+    daylight: 1,
+    insolation: 1,
+    isNight: false,
+  }));
 
   // Refs mirrored into RAF loop without re-subscribing WebGL context
   const pausedRef = useRef(paused);
@@ -98,6 +106,13 @@ export function App() {
     engine.cameraCtrl.setKeyboardControlsEnabled(!mobileControls);
     engine.cameraCtrl.setJoystickInput(joystickRef.current.forward, joystickRef.current.strafe);
     engineRef.current = engine;
+
+    // Seed the HUD resolution readout immediately; otherwise it reports 0x0 until the first
+    // throttled sync lands ~160 ms later.
+    perfMgr.metrics.renderWidthPx = engine.renderWidthPx;
+    perfMgr.metrics.renderHeightPx = engine.renderHeightPx;
+    perfMgr.metrics.pixelRatioActive = perfMgr.effectivePixelRatio;
+    setPerf({ ...perfMgr.metrics });
 
     const handleResize = () => {
       if (!container || !engineRef.current) return;
@@ -182,7 +197,22 @@ export function App() {
         uiSyncAccum = 0;
         setTelemetry(coordinator.getTelemetrySnapshot());
         audioRef.current?.setEnvironment(coordinator.config.surfaceWindSpeedMS, coordinator.observerRainMMHr);
+
+        // Publish the real render size so the HUD reports what is actually on screen rather
+        // than the CSS size, which diverges as soon as the pixel-ratio slider moves.
+        perfMgr.metrics.renderWidthPx = engine.renderWidthPx;
+        perfMgr.metrics.renderHeightPx = engine.renderHeightPx;
         setPerf({ ...perfMgr.metrics });
+
+        const sc = engine.sunCycle;
+        setSun({
+          clock: sc.formatClock(),
+          timeOfDayHours: sc.timeOfDayHours,
+          sunElevationDeg: sc.sunElevationDeg,
+          daylight: sc.daylight,
+          insolation: sc.insolation,
+          isNight: sc.sunElevationDeg < -0.5,
+        });
         setFov(engine.cameraCtrl.fov);
       }
     };
@@ -246,8 +276,38 @@ export function App() {
 
   const handleUpdateQuality = useCallback((patch: Partial<RenderQualitySettings>) => {
     const perfMgr = perfMgrRef.current!;
-    perfMgr.settings = { ...perfMgr.settings, ...patch };
+    const previous = perfMgr.settings;
+    perfMgr.settings = { ...previous, ...patch };
     setQuality({ ...perfMgr.settings });
+
+    const engine = engineRef.current;
+    if (!engine) return;
+
+    // Render scale has to reach the renderer itself: it resizes the canvas backing store and
+    // reallocates every render target, which a plain settings write cannot do.
+    if (
+      patch.pixelRatioScale !== undefined &&
+      patch.pixelRatioScale !== previous.pixelRatioScale
+    ) {
+      engine.setPixelRatioScale(patch.pixelRatioScale, perfMgr.settings.volumetricScale);
+    }
+
+    // Scrubbing local solar time repositions the sun immediately, cycle running or not.
+    if (patch.timeOfDayHours !== undefined) {
+      engine.sunCycle.setTimeOfDay(patch.timeOfDayHours);
+      perfMgr.settings.timeOfDayHours = engine.sunCycle.timeOfDayHours;
+      setQuality({ ...perfMgr.settings });
+    }
+
+    // Switching the cycle on starts from wherever the manual slider had the sun, so the scene
+    // does not jump to a different time of day the moment the checkbox is ticked.
+    if (patch.enableDayNightCycle === true && !previous.enableDayNightCycle) {
+      engine.sunCycle.setTimeOfDayFromElevation(
+        coordinatorRef.current!.config.sunElevationDeg
+      );
+      perfMgr.settings.timeOfDayHours = engine.sunCycle.timeOfDayHours;
+      setQuality({ ...perfMgr.settings });
+    }
   }, []);
 
   const handleSelectManualTier = useCallback((tier: QualityTier) => {
@@ -345,6 +405,7 @@ export function App() {
                   onSelectManualTier={handleSelectManualTier}
                   telemetry={telemetry}
                   perf={perf}
+                  sun={sun}
                 />
               )}
             </div>

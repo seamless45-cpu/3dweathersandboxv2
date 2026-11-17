@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { AtmosphereSimulationCoordinator } from '../sim/atmosphereCoordinator';
-import { AdaptivePerformanceManager } from '../sim/performanceManager';
+import { AdaptivePerformanceManager, MAX_DEVICE_PIXEL_RATIO } from '../sim/performanceManager';
 import { DOMAIN_MAX_ALT, DOMAIN_SIZE } from '../sim/types';
 import { ObserverCameraController } from './cameraController';
 import { LightningAndTLERenderer } from './lightningAndTLERenderer';
@@ -8,6 +8,7 @@ import { BloomPass } from '../performance/bloom';
 import { LightningCameraShake } from '../performance/cameraShake';
 import { NearFieldPrecipitationRenderer } from './precipitationRenderer';
 import { GroundEnvironmentRenderer } from './terrainRenderer';
+import { SunCycle } from './sunCycle';
 import {
   COMPOSITE_POST_FRAG,
   FULLSCREEN_QUAD_VERT,
@@ -15,6 +16,24 @@ import {
   SKY_DOME_VERT,
   VOLUMETRIC_CLOUD_FRAG,
 } from './volumetricSkyShader';
+
+/**
+ * Halton low-discrepancy sequence, used to rotate the volumetric buffer's sub-pixel offset.
+ * Base 2 and 3 decorrelate horizontally from vertically, so consecutive frames land on
+ * different sub-texel positions and the temporal reprojection in the composite pass
+ * reconstructs detail the sub-resolution buffer could not resolve on its own.
+ */
+function halton(index: number, base: number): number {
+  let f = 1;
+  let r = 0;
+  let i = index;
+  while (i > 0) {
+    f /= base;
+    r += f * (i % base);
+    i = Math.floor(i / base);
+  }
+  return r;
+}
 
 const COPY_FRAG_GLSL3 = /* glsl */ `
   precision highp float;
@@ -56,6 +75,12 @@ export class AtmosphericSceneEngine {
   private width = 1;
   private height = 1;
   private dpr = 1;
+  /** Device pixel ratio before the user's render-scale slider, clamped to the engine cap. */
+  private basePixelRatio = 1;
+  /** User render-scale multiplier in [0.1, 1.0]; 1.0 reproduces the native resolution. */
+  private pixelRatioScale = 1;
+  private volW = 2;
+  private volH = 2;
   private frameIndex = 0;
   private realTimeElapsed = 0;
   private windOffset = new THREE.Vector3();
@@ -64,6 +89,11 @@ export class AtmosphericSceneEngine {
   private shakeAxis = new THREE.Vector3();
   private shakeQuat = new THREE.Quaternion();
   private autoExposureCurrent = 1.0;
+  /** Diurnal solar geometry: drives sun/moon direction, daylight and surface insolation. */
+  public readonly sunCycle = new SunCycle();
+  private viewProj = new THREE.Matrix4();
+  private prevViewProj = new THREE.Matrix4();
+  private hasPrevViewProj = false;
 
   constructor(
     container: HTMLElement,
@@ -72,7 +102,12 @@ export class AtmosphericSceneEngine {
   ) {
     this.width = Math.max(1, container.clientWidth);
     this.height = Math.max(1, container.clientHeight);
-    this.dpr = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1, 1.75);
+    this.basePixelRatio = Math.min(
+      typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
+      MAX_DEVICE_PIXEL_RATIO
+    );
+    this.pixelRatioScale = Math.min(1, Math.max(0.1, perfMgr.clampedPixelRatioScale));
+    this.dpr = this.basePixelRatio * this.pixelRatioScale;
 
     this.renderer = new THREE.WebGLRenderer({
       antialias: false,
@@ -128,6 +163,9 @@ export class AtmosphericSceneEngine {
       depthTest: false,
       uniforms: {
         uSunDir: { value: new THREE.Vector3(0.4, 0.55, -0.7).normalize() },
+        uMoonDir: { value: new THREE.Vector3(-0.4, 0.55, 0.7).normalize() },
+        uDaylight: { value: 1 },
+        uTime: { value: 0 },
         uRainHaze: { value: 0 },
         uLightningFlash: { value: 0 },
       },
@@ -172,7 +210,10 @@ export class AtmosphericSceneEngine {
         uNear: { value: this.cameraCtrl.camera.near },
         uFar: { value: this.cameraCtrl.camera.far },
         uSunDir: { value: new THREE.Vector3() },
+        uMoonDir: { value: new THREE.Vector3() },
+        uDaylight: { value: 1 },
         uTime: { value: 0 },
+        uSubPixelJitter: { value: new THREE.Vector2() },
         uWindOffset: { value: new THREE.Vector3() },
         uDomainSize: { value: DOMAIN_SIZE },
         uMaxAlt: { value: DOMAIN_MAX_ALT },
@@ -197,9 +238,17 @@ export class AtmosphericSceneEngine {
         uSceneTex: { value: null },
         uVolCloudTex: { value: null },
         uPrevVolTex: { value: null },
+        uDepthTex: { value: null },
         uTexelSize: { value: new THREE.Vector2(1 / 800, 1 / 600) },
+        uResolution: { value: new THREE.Vector2(800, 600) },
         uExposure: { value: 1.0 },
         uTemporalBlend: { value: 0.42 },
+        uInvProj: { value: new THREE.Matrix4() },
+        uInvView: { value: new THREE.Matrix4() },
+        uPrevViewProj: { value: new THREE.Matrix4() },
+        uCameraPos: { value: new THREE.Vector3() },
+        uMotionBlur: { value: 0.0 },
+        uJitter: { value: 0.0 },
       },
     });
 
@@ -227,6 +276,8 @@ export class AtmosphericSceneEngine {
     const pixelH = Math.max(2, Math.floor(this.height * this.dpr));
     const volW = Math.max(2, Math.floor(pixelW * volScale));
     const volH = Math.max(2, Math.floor(pixelH * volScale));
+    this.volW = volW;
+    this.volH = volH;
 
     if (this.sceneRT) this.sceneRT.dispose();
     if (this.outputRT) this.outputRT.dispose();
@@ -259,8 +310,45 @@ export class AtmosphericSceneEngine {
 
     this.volCloudMat.uniforms.uDepthTex.value = this.sceneRT.depthTexture;
     this.compositeMat.uniforms.uSceneTex.value = this.sceneRT.texture;
+    this.compositeMat.uniforms.uDepthTex.value = this.sceneRT.depthTexture;
     this.compositeMat.uniforms.uTexelSize.value.set(1.0 / volW, 1.0 / volH);
+    this.compositeMat.uniforms.uResolution.value.set(pixelW, pixelH);
     if (this.bloomPass) this.bloomPass.setSize(pixelW, pixelH);
+
+    // A resolution change invalidates the previous frame's volume: its texels no longer line
+    // up with the new grid, so reprojecting it would smear the whole sky for a few frames.
+    this.hasPrevViewProj = false;
+  }
+
+  /** Internal render size in device pixels, for the HUD resolution readout. */
+  public get renderWidthPx(): number {
+    return Math.max(2, Math.floor(this.width * this.dpr));
+  }
+
+  public get renderHeightPx(): number {
+    return Math.max(2, Math.floor(this.height * this.dpr));
+  }
+
+  /** The pixel-ratio multiplier currently in effect, after clamping. */
+  public get activePixelRatioScale(): number {
+    return this.pixelRatioScale;
+  }
+
+  /**
+   * Applies the user's render-scale slider. This is the highest-leverage frame-time control in
+   * the whole pipeline: it scales the canvas backing store and every render target, so a 0.5x
+   * setting quarters the fragment work in the scene pass, the ray-march, the composite and the
+   * bloom chain at once. The scale is clamped to [0.1, 1.0], i.e. from a tenth of native
+   * resolution up to the engine's own device-pixel-ratio cap.
+   */
+  public setPixelRatioScale(scale: number, volScale: number): void {
+    const clamped = Math.min(1, Math.max(0.1, scale));
+    if (Math.abs(clamped - this.pixelRatioScale) < 1e-4) return;
+    this.pixelRatioScale = clamped;
+    this.dpr = this.basePixelRatio * clamped;
+    this.renderer.setPixelRatio(this.dpr);
+    this.renderer.setSize(this.width, this.height);
+    this.allocateRenderTargets(volScale);
   }
 
   public resize(width: number, height: number, volScale: number): void {
@@ -305,16 +393,25 @@ export class AtmosphericSceneEngine {
       coordinator.grid.textureDirty = false;
     }
 
-    // Solar direction from configured elevation angle
-    const elevRad = (coordinator.config.sunElevationDeg * Math.PI) / 180.0;
-    const azimRad = -0.62; // Sun in West-Southwest casting dramatic side-lighting across convective towers!
-    this.sunDir
-      .set(
-        Math.cos(elevRad) * Math.sin(azimRad),
-        Math.sin(elevRad),
-        Math.cos(elevRad) * Math.cos(azimRad)
-      )
-      .normalize();
+    // ---- Diurnal solar geometry ---------------------------------------------------------
+    // Either advance local solar time through the 24 h cycle, or hold the sun at whatever
+    // elevation the manual slider specifies. Both paths run through the same solver, so the
+    // scene looks identical at a given sun altitude regardless of which mode produced it.
+    const settings = perfMgr.settings;
+    this.sunCycle.cycleSeconds = settings.dayNightCycleSec;
+    if (settings.enableDayNightCycle) {
+      this.sunCycle.update(realDtSec, true);
+    } else {
+      this.sunCycle.applyManualElevation(coordinator.config.sunElevationDeg);
+    }
+    this.sunDir.copy(this.sunCycle.sunDir);
+    const daylight = this.sunCycle.daylight;
+
+    // Feed insolation back into the convection scheme so thermals build through the morning
+    // and the boundary layer stops being driven after sunset. This mutates the config field
+    // directly instead of going through updateConfig(), which would rebuild the entire
+    // sounding every frame; the sounding's thermal response is meant to lag the sky anyway.
+    coordinator.config.solarInsolationScale = this.sunCycle.insolation;
 
     // Advect sub-voxel procedural cloud turbulence smoothly with ambient mid-level wind
     // (scalar accessors: no per-frame level-object allocation).
@@ -337,6 +434,9 @@ export class AtmosphericSceneEngine {
 
     // Update Sky Dome
     this.skyDomeMat.uniforms.uSunDir.value.copy(this.sunDir);
+    this.skyDomeMat.uniforms.uMoonDir.value.copy(this.sunCycle.moonDir);
+    this.skyDomeMat.uniforms.uDaylight.value = daylight;
+    this.skyDomeMat.uniforms.uTime.value = this.realTimeElapsed;
     this.skyDomeMat.uniforms.uRainHaze.value = rainHaze;
     this.skyDomeMat.uniforms.uLightningFlash.value = Math.min(1.2, flashIntensity * 0.45);
 
@@ -344,6 +444,8 @@ export class AtmosphericSceneEngine {
     this.groundRenderer.update({
       timeSec: this.realTimeElapsed,
       sunDir: this.sunDir,
+      moonDir: this.sunCycle.moonDir,
+      daylight,
       cameraPos: cam.position,
       isGroundMode: this.cameraCtrl.mode === 'ground',
       wetness: coordinator.surfaceWetness,
@@ -381,6 +483,8 @@ export class AtmosphericSceneEngine {
     vu.uInvView.value.copy(cam.matrixWorld);
     vu.uCameraPos.value.copy(cam.position);
     vu.uSunDir.value.copy(this.sunDir);
+    vu.uMoonDir.value.copy(this.sunCycle.moonDir);
+    vu.uDaylight.value = daylight;
     vu.uTime.value = this.realTimeElapsed;
     vu.uWindOffset.value.copy(this.windOffset);
     vu.uMaxSteps.value = perfMgr.settings.raymarchSteps;
@@ -388,6 +492,19 @@ export class AtmosphericSceneEngine {
     vu.uTurbulence.value = coordinator.config.turbulenceIntensity;
     vu.uShadowsEnabled.value = perfMgr.settings.enableShadows ? 1.0 : 0.0;
     vu.uFrameJitter.value = (this.frameIndex % 16) * 0.61803398875;
+    // Rotating sub-pixel offset: with reprojection enabled the low-res volume buffer is
+    // supersampled over time, so four frames reconstruct detail none of them holds alone.
+    // Disabled alongside TAA, where a jittered buffer with no history would just look soft.
+    const temporalOn = settings.enableTemporalAccum;
+    if (temporalOn) {
+      const seq = (this.frameIndex % 16) + 1;
+      vu.uSubPixelJitter.value.set(
+        (halton(seq, 2) - 0.5) / this.volW,
+        (halton(seq, 3) - 0.5) / this.volH
+      );
+    } else {
+      vu.uSubPixelJitter.value.set(0, 0);
+    }
     vu.uBoltLight0.value.copy(this.lightningRenderer.boltLights[0]);
     vu.uBoltLight1.value.copy(this.lightningRenderer.boltLights[1]);
     vu.uBoltLight2.value.copy(this.lightningRenderer.boltLights[2]);
@@ -403,11 +520,29 @@ export class AtmosphericSceneEngine {
       (targetExp - this.autoExposureCurrent) * Math.min(1.0, realDtSec * 14.0);
 
     // PASS 3: Composite Scene + Upsampled Temporal Volumetric Clouds + HDR Bloom to Screen
-    this.compositeMat.uniforms.uVolCloudTex.value = this.volCurrRT.texture;
-    this.compositeMat.uniforms.uPrevVolTex.value = this.volPrevRT.texture;
-    this.compositeMat.uniforms.uExposure.value = this.autoExposureCurrent;
-    this.compositeMat.uniforms.uTemporalBlend.value =
-      perfMgr.settings.enableTemporalAccum && flashIntensity < 0.2 ? 0.38 : 0.0;
+    // Reprojection needs this frame's and last frame's view-projection. The first frame after
+    // any resize has no valid history, so it is seeded with the current matrix to keep the
+    // motion vector at zero rather than smearing the sky across the screen for one frame.
+    this.viewProj.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    if (!this.hasPrevViewProj) {
+      this.prevViewProj.copy(this.viewProj);
+      this.hasPrevViewProj = true;
+    }
+
+    const cu = this.compositeMat.uniforms;
+    cu.uVolCloudTex.value = this.volCurrRT.texture;
+    cu.uPrevVolTex.value = this.volPrevRT.texture;
+    cu.uExposure.value = this.autoExposureCurrent;
+    cu.uInvProj.value.copy(cam.projectionMatrixInverse);
+    cu.uInvView.value.copy(cam.matrixWorld);
+    cu.uPrevViewProj.value.copy(this.prevViewProj);
+    cu.uCameraPos.value.copy(cam.position);
+    cu.uJitter.value = this.frameIndex * 0.61803398875;
+    cu.uMotionBlur.value = settings.enableMotionBlur ? 1.0 : 0.0;
+    // Reprojection is now genuinely motion-compensated, so history can carry much more weight
+    // than the old same-UV resample could without ghosting. That is what lets the volume pass
+    // run at a fraction of output resolution and still converge to the same image.
+    cu.uTemporalBlend.value = temporalOn && flashIntensity < 0.2 ? 0.58 : 0.0;
 
     this.quadMesh.material = this.compositeMat;
     this.renderer.setRenderTarget(this.outputRT);
@@ -422,8 +557,10 @@ export class AtmosphericSceneEngine {
       this.renderer.render(this.postScene, this.postCamera);
     }
 
+    this.prevViewProj.copy(this.viewProj);
+
     // Copy volCurrRT -> volPrevRT for next frame's temporal smoothing
-    if (perfMgr.settings.enableTemporalAccum) {
+    if (temporalOn) {
       this.copyMat.uniforms.uSrc.value = this.volCurrRT.texture;
       this.quadMesh.material = this.copyMat;
       this.renderer.setRenderTarget(this.volPrevRT);

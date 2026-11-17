@@ -13,6 +13,20 @@ import {
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
+/**
+ * Surface insolation actually available to the boundary layer right now.
+ *
+ * The user's solar heating preference is a fixed scaling on how strongly this atmosphere
+ * responds to sunshine; the diurnal cycle supplies the time-of-day term on top of it. Keeping
+ * them multiplied here rather than writing the product back into the config means the slider
+ * keeps showing what the user chose, and night genuinely stops thermals from forming instead of
+ * just dimming the lighting.
+ */
+function effectiveSolarInsolation(cfg: AtmosphereConfig): number {
+  const scale = cfg.solarInsolationScale === undefined ? 1 : cfg.solarInsolationScale;
+  return cfg.solarHeatingFactor * scale;
+}
+
 export class ConvectiveCellManager {
   public cells: ConvectiveCell[] = [];
   public coldPools: ColdPool[] = [];
@@ -68,9 +82,10 @@ export class ConvectiveCellManager {
     cfg: AtmosphereConfig
   ): void {
     const inst = sounding.instability;
+    const solar = effectiveSolarInsolation(cfg);
 
     // 1. Progressive boundary-layer solar warming from t=0 clear sky
-    const insolationRate = cfg.solarHeatingFactor * 0.018;
+    const insolationRate = solar * 0.018;
     this.boundaryLayerThermalEnergy = Math.min(
       1.6,
       this.boundaryLayerThermalEnergy + insolationRate * dt
@@ -84,7 +99,7 @@ export class ConvectiveCellManager {
     // t=0 value. Without this a modest cap suppresses convection forever, which is why cells
     // never left the nucleating stage.
     const erosionRate =
-      (0.028 + 0.052 * cfg.solarHeatingFactor) *
+      (0.028 + 0.052 * solar) *
       (0.35 + Math.min(1.4, this.boundaryLayerThermalEnergy)) +
       this.gustFrontMixing * 0.9;
     this.capErosionFrac = Math.min(0.93, this.capErosionFrac + erosionRate * dt * 0.016);
@@ -200,7 +215,7 @@ export class ConvectiveCellManager {
       // extra buoyancy of its own. This is the perturbation that lets convection initiate when
       // the mixed-layer parcel profile is still marginally stable.
       const thermalExcessK =
-        (0.85 + 1.15 * cfg.solarHeatingFactor * Math.min(1.35, this.boundaryLayerThermalEnergy)) *
+        (0.85 + 1.15 * solar * Math.min(1.35, this.boundaryLayerThermalEnergy)) *
         (1.0 + 0.5 * gustFrontLiftBoost);
       const excessBuoyancy =
         (PHYS.G * thermalExcessK) / Math.max(240, sounding.tempKAt(zEval));
@@ -467,6 +482,7 @@ export class ConvectiveCellManager {
 
     const inst = sounding.instability;
     const rh0 = cfg.surfaceRelHumidity;
+    const solar = effectiveSolarInsolation(cfg);
 
     // Require initial boundary-layer solar warmup from t=0 clear sky so clouds condense progressively!
     if (this.boundaryLayerThermalEnergy < 0.14 && this.coldPools.length === 0) {
@@ -504,7 +520,7 @@ export class ConvectiveCellManager {
       // Mechanical gust-front lifting w ~ 0.6 c overcomes far more CIN than solar thermals alone.
       const gustKineticEnergy = 0.5 * Math.pow(p1.expansionSpeedMS * (1.0 + collisionBoost * 0.5), 2);
       if (
-        gustKineticEnergy + 28.0 * cfg.solarHeatingFactor > inst.cin * 0.75 &&
+        gustKineticEnergy + 28.0 * solar > inst.cin * 0.75 &&
         rh0 > 38 &&
         !this.isNearExistingUpdraft(candX, candZ, 3400)
       ) {
@@ -523,13 +539,13 @@ export class ConvectiveCellManager {
     }
 
     // Candidate 2: Solar boundary-layer thermal plumes over sunlit terrain hotspots.
-    if (rh0 < 29 || inst.lcl > 4100 || cfg.solarHeatingFactor < 0.15) {
+    if (rh0 < 29 || inst.lcl > 4100 || solar < 0.15) {
       // Too dry or no surface heating -> clear sky persists naturally!
       return;
     }
 
     const thermalEnergyJPerKg =
-      38.0 * cfg.solarHeatingFactor * this.boundaryLayerThermalEnergy +
+      38.0 * solar * this.boundaryLayerThermalEnergy +
       Math.max(0, (rh0 - 50) * 0.9);
     if (thermalEnergyJPerKg < inst.cin * 0.55) {
       return;
@@ -548,13 +564,13 @@ export class ConvectiveCellManager {
       if (thermalSpot + orographicBonus > 0.03 && !this.isNearExistingUpdraft(candX, candZ, 3900)) {
         const prob =
           0.11 *
-          cfg.solarHeatingFactor *
+          solar *
           Math.min(1.5, this.boundaryLayerThermalEnergy) *
           (rh0 / 62.0) *
           checkDt;
         if (this.rand() < prob) {
           const initialRadius = 700 + this.rand() * 440;
-          const initialW = 2.2 + cfg.solarHeatingFactor * 1.5;
+          const initialW = 2.2 + solar * 1.5;
           this.spawnNucleatingThermal(candX, candZ, sounding, initialRadius, initialW);
           break;
         }

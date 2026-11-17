@@ -34,13 +34,22 @@ export const CADENCE_BY_TIER: Record<string, PhysicsCadence> = {
 
 /**
  * The Eulerian solve is the one pass whose cost cannot be predicted from the tier alone: it
- * scales with how much of the domain a storm system occupies. When a solve takes long enough
+ * scales with how much of the domain a storm system occupies. When a solve grows large enough
  * to blow the frame budget, running it on a fixed interval turns into a visible periodic hitch
- * instead of a smooth simulation. The coordinator therefore stretches the interval whenever the
- * previous solve was expensive, trading a little temporal resolution for even frame times.
+ * instead of a smooth simulation, so the interval stretches to trade a little temporal
+ * resolution for even frame times.
+ *
+ * The stretch is driven by the *active voxel count*, not by a measured wall-clock duration.
+ * Timing the solve would make the physics cadence depend on machine load, and because the
+ * cadence sets the dt each Eulerian pass integrates, that would make the storm itself
+ * non-reproducible: the same scenario would diverge between runs on the same hardware. Active
+ * volume is a deterministic O(cost) proxy, and genuinely slow hardware is already handled one
+ * layer up by the adaptive quality tier, which is where wall-clock feedback belongs.
  */
-const SOLVE_HITCH_MS = 7.0;
 const CADENCE_STRETCH_MAX = 3.0;
+/** Active-region fraction at which the cadence starts stretching, and where it saturates. */
+const STRETCH_ONSET_FRAC = 0.4;
+const STRETCH_FULL_FRAC = 0.9;
 
 export class AtmosphereSimulationCoordinator {
   public config: AtmosphereConfig;
@@ -192,12 +201,15 @@ export class AtmosphereSimulationCoordinator {
         this.cellManager.coldPools,
         this.config
       );
+      // Recorded purely as a diagnostic for the HUD; it deliberately does not feed back into
+      // the cadence, which would reintroduce the timing dependence explained above.
       this.lastFluidSolveMs = nowMs() - t0;
-      // Relax the stretch back toward 1 whenever a solve was cheap, tighten it when expensive.
-      this.cadenceStretch =
-        this.lastFluidSolveMs > SOLVE_HITCH_MS
-          ? Math.min(CADENCE_STRETCH_MAX, this.cadenceStretch + 0.35)
-          : Math.max(1, this.cadenceStretch - 0.12);
+      const gridVoxels = this.grid.nx * this.grid.ny * this.grid.nz;
+      const regionFrac = gridVoxels > 0 ? this.grid.lastRegionVoxels / gridVoxels : 0;
+      const load = clamp01(
+        (regionFrac - STRETCH_ONSET_FRAC) / (STRETCH_FULL_FRAC - STRETCH_ONSET_FRAC)
+      );
+      this.cadenceStretch = 1.0 + (CADENCE_STRETCH_MAX - 1.0) * load;
     }
     // The texture must be repacked every frame: lightning glow inside clouds is a real-time
     // visual effect even while the fluid itself advances more slowly.
@@ -362,7 +374,12 @@ export class AtmosphereSimulationCoordinator {
       const wetRate = (0.004 + this.observerRainMMHr * 0.00065) * simDt;
       this.surfaceWetness = Math.min(1.0, this.surfaceWetness + wetRate);
     } else {
-      const dryRate = 0.00045 * this.config.solarHeatingFactor * simDt;
+      // Ground dries at a rate set by available insolation, so a wet surface stays wet
+      // through the night and only bakes off once the sun is back up.
+      const insolation = this.config.solarInsolationScale === undefined
+        ? 1
+        : this.config.solarInsolationScale;
+      const dryRate = 0.00045 * this.config.solarHeatingFactor * insolation * simDt;
       this.surfaceWetness = Math.max(0, this.surfaceWetness - dryRate);
     }
   }
@@ -483,4 +500,8 @@ function nowMs(): number {
   return typeof performance !== 'undefined' && performance.now
     ? performance.now()
     : Date.now();
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
 }
