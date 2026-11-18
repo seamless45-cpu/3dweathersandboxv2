@@ -54,6 +54,8 @@ interface SliderRowProps {
   step: number;
   unit?: string;
   decimals?: number;
+  /** Multiplies the stored value for display only, so 1.0 can read as "100%". */
+  displayScale?: number;
   onChange: (val: number) => void;
 }
 
@@ -65,13 +67,14 @@ const SliderRow: React.FC<SliderRowProps> = ({
   step,
   unit = '',
   decimals = 1,
+  displayScale = 1,
   onChange,
 }) => (
   <div className="space-y-0.5">
     <div className="flex items-center justify-between text-[10px]">
       <span className="text-slate-300">{label}</span>
       <span className="font-mono text-sky-300">
-        {value.toFixed(decimals)}
+        {(value * displayScale).toFixed(decimals)}
         {unit}
       </span>
     </div>
@@ -646,6 +649,26 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
                 className="accent-sky-400"
               />
             </label>
+
+            {quality.enableMotionBlur && (
+              <div className="space-y-0.5">
+                <SliderRow
+                  label="Blur Intensity"
+                  value={quality.motionBlurIntensity}
+                  min={0}
+                  max={3.5}
+                  step={0.05}
+                  decimals={0}
+                  displayScale={100}
+                  unit="%"
+                  onChange={(v) => onUpdateQuality({ motionBlurIntensity: v })}
+                />
+                <div className="text-[8.5px] text-slate-500 leading-tight -mt-0.5">
+                  100% is the true frame-to-frame motion vector. Above that the smear is
+                  exaggerated for a speed-ramp look; below it tightens toward a crisp frame.
+                </div>
+              </div>
+            )}
 
             {/* Day / night cycle. Drives the solar geometry, the sky/terrain/volume lighting
                 rigs, and the surface insolation the convection scheme is fed. */}

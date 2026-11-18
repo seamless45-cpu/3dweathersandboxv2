@@ -17,6 +17,12 @@ const RAIN_STREAK_VERT = /* glsl */ `
 
   varying float vAlpha;
   varying vec2 vLocalUv;
+  // Cross-section basis and view direction, so the fragment shader can reconstruct a surface
+  // normal for the water cylinder and shade it as a lens rather than as a flat decal.
+  varying vec3 vSide;
+  varying vec3 vViewDir;
+  varying float vDist;
+  varying float vScale;
 
   void main() {
     // Cull excess instances smoothly based on rain rate
@@ -44,8 +50,12 @@ const RAIN_STREAK_VERT = /* glsl */ `
       + velDir * (aCornerY - 0.5) * uStreakLength * aDropScale
       + side * (aCornerX * uStreakWidth * aDropScale);
 
-    vAlpha = (1.0 - smoothstep(boxSpan * 0.32, boxSpan * 0.49, dist)) * 0.55;
+    vAlpha = 1.0 - smoothstep(boxSpan * 0.32, boxSpan * 0.49, dist);
     vLocalUv = vec2(aCornerX * 0.5 + 0.5, aCornerY);
+    vSide = side;
+    vViewDir = viewDir;
+    vDist = dist;
+    vScale = aDropScale;
 
     gl_Position = projectionMatrix * viewMatrix * vec4(worldPt, 1.0);
   }
@@ -56,16 +66,71 @@ const RAIN_STREAK_FRAG = /* glsl */ `
 
   uniform vec3 uTint;
   uniform float uLightningBoost;
+  uniform vec3 uLightDir;
+  uniform vec3 uLightColor;
+  uniform vec3 uHazeColor;
+  uniform float uFrozenShare;
 
   varying float vAlpha;
   varying vec2 vLocalUv;
+  varying vec3 vSide;
+  varying vec3 vViewDir;
+  varying float vDist;
+  varying float vScale;
 
   void main() {
-    if (vAlpha <= 0.005) discard;
-    float edge = 1.0 - abs(vLocalUv.x * 2.0 - 1.0);
-    float tipFade = sin(vLocalUv.y * 3.14159);
-    float a = vAlpha * edge * tipFade;
-    vec3 col = uTint * (1.0 + uLightningBoost * 2.6);
+    if (vAlpha <= 0.004) discard;
+
+    // ---- Cross-section: a falling drop is a water cylinder, not a flat quad ----------------
+    // The old profile was a linear falloff to the edges, which reads as a painted stripe.
+    // Modelling the actual chord through a cylinder gives a bright axis, softly refracting
+    // flanks, and a surface normal that can carry a specular highlight.
+    float x = vLocalUv.x * 2.0 - 1.0;
+    float cyl = 1.0 - x * x;
+    if (cyl <= 0.0015) discard;
+    float chord = sqrt(cyl);            // optical path length through the drop
+    vec3 V = normalize(vViewDir);
+    vec3 N = normalize(vSide * x + V * chord);
+
+    float ndl = max(dot(N, uLightDir), 0.0);
+    vec3 H = normalize(uLightDir + V);
+    // A tight lobe for the sun/moon glint on the drop surface, plus a broad one for the
+    // refracted light thrown through the drop, which is what makes rain look wet rather
+    // than dusty.
+    float spec = pow(max(dot(N, H), 0.0), 64.0) + 0.22 * pow(max(dot(N, H), 0.0), 9.0);
+
+    // ---- Along the streak ------------------------------------------------------------------
+    // sin(pi*y) made every streak a lozenge: bright in the middle, pinched at both ends. A
+    // motion-blurred drop is instead near-uniform along its length with soft ends, so use a
+    // flat-topped profile. Frozen pellets are compact, so they blend toward a centred blob.
+    float y = vLocalUv.y;
+    float streakProfile = smoothstep(0.0, 0.16, y) * smoothstep(1.0, 0.84, y);
+    float pelletProfile = exp(-pow((y - 0.5) / 0.20, 2.0));
+    float along = mix(streakProfile, pelletProfile, uFrozenShare);
+
+    // Larger drops are slightly brighter and carry a harder glint; small ones are diffuse.
+    float sizeBoost = 0.72 + 0.42 * clamp(vScale, 0.0, 1.4);
+
+    float a = vAlpha * along * chord * sizeBoost * 0.62;
+
+    // ---- Aerial perspective ----------------------------------------------------------------
+    // Distant streaks lose contrast and take on the haze colour, which is the main cue that
+    // separates a curtain of rain from a wall of identical quads.
+    float haze = smoothstep(9.0, 46.0, vDist);
+    vec3 body = uTint * (0.42 + 0.58 * ndl);
+    vec3 col = body + uLightColor * spec * (0.85 + uFrozenShare * 1.5);
+    col = mix(col, uHazeColor, haze * 0.74);
+    a *= 1.0 - haze * 0.52;
+
+    // Ice pellets are brighter and whiter than rain: they scatter rather than refract.
+    col = mix(col, vec3(0.93, 0.96, 1.0) * (0.5 + 0.5 * ndl), uFrozenShare * 0.45);
+
+    // Lightning lights drops from inside the shaft, and the specular term reacts hardest.
+    col *= 1.0 + uLightningBoost * 2.6;
+    col += uLightColor * spec * uLightningBoost * 3.4;
+    a = clamp(a * (1.0 + uLightningBoost * 0.7), 0.0, 1.0);
+
+    if (a < 0.004) discard;
     gl_FragColor = vec4(col, a);
   }
 `;
@@ -80,6 +145,8 @@ const SPLASH_VERT = /* glsl */ `
 
   varying vec2 vUv;
   varying float vLife;
+  varying float vEnergy;
+  varying float vSpin;
 
   void main() {
     float idFrac = fract(aPhase * 3.71);
@@ -89,13 +156,22 @@ const SPLASH_VERT = /* glsl */ `
       return;
     }
 
-    float cycle = fract(uTime * 3.2 + aPhase);
+    // Slightly slower cycle than before: real crown-and-ring splashes read as too frantic at
+    // 3.2 Hz when the ring profile is resolved properly.
+    float cycle = fract(uTime * 2.45 + aPhase);
     vLife = 1.0 - cycle;
     vUv = uv;
+    // Impact energy varies drop to drop, so the splash population is not a uniform lattice of
+    // identical rings -- the single most artificial thing about the old version.
+    vEnergy = 0.55 + 0.9 * fract(aPhase * 7.13 + 0.31);
+    vSpin = fract(aPhase * 11.7) * 6.28318;
 
     float span = 26.0;
     vec2 relXZ = mod(aSplashOffset.xz - uObserverGround.xz + span * 0.5, span) - span * 0.5;
-    float radius = mix(0.03, 0.24, cycle);
+    // Final crater size scales with impact energy, and expansion decelerates: capillary rings
+    // open fast then slow as surface tension and viscosity take over, so radius ~ t^0.6 rather
+    // than the previous linear ramp.
+    float radius = mix(0.03, 0.16 + 0.16 * vEnergy, pow(cycle, 0.6));
 
     vec3 worldPos = vec3(
       uObserverGround.x + relXZ.x + position.x * radius,
@@ -111,19 +187,64 @@ const SPLASH_FRAG = /* glsl */ `
   precision mediump float;
 
   uniform float uLightningBoost;
+  uniform vec3 uLightColor;
   varying vec2 vUv;
   varying float vLife;
+  varying float vEnergy;
+  varying float vSpin;
 
   void main() {
     if (vLife <= 0.01) discard;
-    float r = length(vUv * 2.0 - 1.0);
-    float ring = exp(-pow((r - 0.78) / 0.16, 2.0));
-    float alpha = ring * vLife * 0.48;
-    if (alpha < 0.01) discard;
-    vec3 col = vec3(0.75, 0.84, 0.94) * (0.85 + uLightningBoost * 1.8);
+    float cycle = 1.0 - vLife;
+
+    // Rotate the sample so the crown is not a perfect circle on every instance; real impact
+    // craters are lopsided because the drop is rarely vertical and the surface rarely flat.
+    vec2 p = vUv * 2.0 - 1.0;
+    float cs = cos(vSpin), sn = sin(vSpin);
+    p = vec2(p.x * cs - p.y * sn, p.x * sn + p.y * cs);
+    float lopsided = 1.0 + 0.20 * sin(atan(p.y, p.x) * 3.0 + vSpin * 2.0);
+    float r = length(p) * lopsided;
+
+    // ---- Primary capillary ring: opens fast, thins as it expands --------------------------
+    float ringR = 0.80 * pow(cycle, 0.6);
+    float ringW = mix(0.30, 0.075, cycle);
+    float ring = exp(-pow((r - ringR) / ringW, 2.0));
+
+    // ---- Secondary rebound ring, slower and inside the first ------------------------------
+    float ring2R = 0.44 * pow(cycle, 0.78);
+    float ring2 = exp(-pow((r - ring2R) / (ringW * 1.7), 2.0)) * 0.45 * (1.0 - cycle * 0.6);
+
+    // ---- Crown sheet: the flared lip thrown up at impact, brightest in the first moments ---
+    float crown = exp(-pow((r - ringR * 1.16) / 0.20, 2.0)) * exp(-cycle * 5.5) * 0.7;
+
+    // ---- Central impact flash, decays almost immediately ----------------------------------
+    float core = exp(-r * r * 22.0) * exp(-cycle * 11.0);
+
+    // ---- Wet spot that outlives the rings -------------------------------------------------
+    // Drawn as a dark translucent disc: this is what makes a splash leave something behind on
+    // the ground instead of flashing and vanishing.
+    float wet = exp(-r * r * 6.0) * (1.0 - smoothstep(0.15, 0.95, cycle)) * 0.30;
+
+    float bright = (ring + ring2 + crown) * vLife * vEnergy * 0.52 + core * vEnergy * 0.60;
+    float alpha = clamp(bright, 0.0, 1.0);
+
+    // A glint on the ring crest where it catches the light.
+    float glint = pow(max(0.0, ring + crown), 2.0) * 0.55;
+
+    vec3 water = vec3(0.72, 0.82, 0.93) + uLightColor * glint;
+    water *= 0.85 + uLightningBoost * 2.1;
+
+    // Composite: the bright crown and rings over a darkening wet disc.
+    vec3 col = mix(vec3(0.055, 0.06, 0.07), water, clamp(bright * 1.6, 0.0, 1.0));
+    alpha = clamp(alpha + wet * (1.0 - alpha * 0.6), 0.0, 1.0);
+
+    if (alpha < 0.008) discard;
     gl_FragColor = vec4(col, alpha);
   }
 `;
+
+const NIGHT_HAZE = new THREE.Color(0.075, 0.095, 0.145);
+const MOON_GLINT = new THREE.Color(0.55, 0.66, 0.92);
 
 export class NearFieldPrecipitationRenderer {
   public streakMesh: THREE.Mesh;
@@ -147,6 +268,10 @@ export class NearFieldPrecipitationRenderer {
         uStreakLength: { value: 0.65 },
         uTint: { value: new THREE.Color(0.72, 0.8, 0.9) },
         uLightningBoost: { value: 0 },
+        uLightDir: { value: new THREE.Vector3(0.4, 0.8, -0.45).normalize() },
+        uLightColor: { value: new THREE.Color(1.0, 0.97, 0.92) },
+        uHazeColor: { value: new THREE.Color(0.42, 0.47, 0.53) },
+        uFrozenShare: { value: 0 },
       },
     });
 
@@ -163,6 +288,7 @@ export class NearFieldPrecipitationRenderer {
         uObserverGround: { value: new THREE.Vector3() },
         uSplashActive: { value: 0 },
         uLightningBoost: { value: 0 },
+        uLightColor: { value: new THREE.Color(1.0, 0.97, 0.92) },
       },
     });
 
@@ -246,6 +372,14 @@ export class NearFieldPrecipitationRenderer {
     frozenFraction?: number;
     /** 0..1 gustiness from nearby downdrafts and gust fronts; slants the streaks further. */
     gustFactor?: number;
+    /** Dominant light direction (sun by day, moon by night), used for the drop glint. */
+    lightDir?: THREE.Vector3;
+    /** Colour of that light, so the glint goes warm at sunset and cold under the moon. */
+    lightColor?: THREE.Color;
+    /** Distance haze colour for aerial perspective on far streaks. */
+    hazeColor?: THREE.Color;
+    /** 0..1 daylight, used to pull the haze colour toward night. */
+    daylight?: number;
   }): void {
     // Perceived density saturates well below a torrential core rate, so use a compressive
     // curve: a 10 mm/h shower already fills the view, and 150 mm/h reads as a solid curtain.
@@ -265,6 +399,19 @@ export class NearFieldPrecipitationRenderer {
       u.uCameraPos.value.copy(params.cameraPos);
       u.uActiveFraction.value = Math.pow(active, 0.6);
       u.uLightningBoost.value = params.lightningFlash;
+      u.uFrozenShare.value = frozen;
+
+      // Water optics need a light. Fall back to a high sun if the scene does not supply one so
+      // the material is never left shading against a zero vector.
+      if (params.lightDir && params.lightDir.lengthSq() > 1e-6) {
+        u.uLightDir.value.copy(params.lightDir).normalize();
+      }
+      if (params.lightColor) u.uLightColor.value.copy(params.lightColor);
+      if (params.hazeColor) u.uHazeColor.value.copy(params.hazeColor);
+      const day = clamp01(params.daylight ?? 1.0);
+      // At night the haze goes to the moonlit blue-grey and the drops lose their warm glint.
+      u.uHazeColor.value.lerp(NIGHT_HAZE, 1.0 - day);
+      u.uLightColor.value.lerp(MOON_GLINT, (1.0 - day) * 0.85);
 
       // Falling hydrometeors reach ~75-90 % of the horizontal wind (drag-limited), and snow
       // couples more tightly than hail because it stays airborne far longer.
@@ -310,6 +457,8 @@ export class NearFieldPrecipitationRenderer {
       su.uObserverGround.value.set(params.cameraPos.x, groundY, params.cameraPos.z);
       su.uSplashActive.value = Math.min(1.0, liquidActive * 1.25);
       su.uLightningBoost.value = params.lightningFlash;
+      // Share the streak material's resolved light colour so the crown glint matches the drops.
+      su.uLightColor.value.copy(this.streakMat.uniforms.uLightColor.value);
     }
   }
 

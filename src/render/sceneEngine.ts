@@ -55,8 +55,17 @@ export class AtmosphericSceneEngine {
   private groundRenderer: GroundEnvironmentRenderer;
   private lightningRenderer: LightningAndTLERenderer;
   private precipRenderer: NearFieldPrecipitationRenderer;
+  /** Scratch vectors/colours for the precipitation light, reused every frame. */
+  private precipLightDir = new THREE.Vector3(0.4, 0.8, -0.45);
+  private precipLightColor = new THREE.Color(1, 0.97, 0.92);
+  private precipHazeColor = new THREE.Color(0.42, 0.47, 0.53);
 
   private volTexture3D: THREE.Data3DTexture;
+  /**
+   * R8 map of persistent surface water saturation, one texel per 500 m ground column. Backs
+   * the same Uint8Array the simulation writes, so uploading is a straight buffer copy.
+   */
+  private groundSatTexture: THREE.DataTexture;
 
   private sceneRT!: THREE.WebGLRenderTarget;
   private outputRT!: THREE.WebGLRenderTarget;
@@ -150,6 +159,22 @@ export class AtmosphericSceneEngine {
     this.volTexture3D.unpackAlignment = 1;
     this.volTexture3D.needsUpdate = true;
 
+    // Persistent ground saturation, consumed by the terrain shader to place puddles where rain
+    // actually landed rather than everywhere the global wetness scalar happens to be high.
+    this.groundSatTexture = new THREE.DataTexture(
+      coordinator.grid.groundSatTex,
+      coordinator.grid.nx,
+      coordinator.grid.nz,
+      THREE.RedFormat,
+      THREE.UnsignedByteType
+    );
+    this.groundSatTexture.minFilter = THREE.LinearFilter;
+    this.groundSatTexture.magFilter = THREE.LinearFilter;
+    this.groundSatTexture.wrapS = THREE.ClampToEdgeWrapping;
+    this.groundSatTexture.wrapT = THREE.ClampToEdgeWrapping;
+    this.groundSatTexture.unpackAlignment = 1;
+    this.groundSatTexture.needsUpdate = true;
+
     // Build 3D World Scene
     this.mainScene = new THREE.Scene();
 
@@ -176,7 +201,7 @@ export class AtmosphericSceneEngine {
     this.mainScene.add(this.skyDomeMesh);
 
     // 2. Ground Terrain & Wind-Driven Grass
-    this.groundRenderer = new GroundEnvironmentRenderer(this.volTexture3D);
+    this.groundRenderer = new GroundEnvironmentRenderer(this.volTexture3D, this.groundSatTexture);
     this.mainScene.add(this.groundRenderer.terrainMesh);
     this.mainScene.add(this.groundRenderer.grassMesh);
 
@@ -392,6 +417,11 @@ export class AtmosphericSceneEngine {
       this.volTexture3D.needsUpdate = true;
       coordinator.grid.textureDirty = false;
     }
+    // 64 x 64 bytes, and only on the frames the bucket actually changed.
+    if (coordinator.grid.groundSatDirty) {
+      this.groundSatTexture.needsUpdate = true;
+      coordinator.grid.groundSatDirty = false;
+    }
 
     // ---- Diurnal solar geometry ---------------------------------------------------------
     // Either advance local solar time through the 24 h cycle, or hold the sun at whatever
@@ -458,6 +488,29 @@ export class AtmosphericSceneEngine {
       shadowsEnabled: perfMgr.settings.enableShadows,
     });
 
+    // Resolve the dominant light for the precipitation shader: sun by day, moon by night,
+    // blended through twilight exactly as the composite pass does, plus a warm->cold colour
+    // shift with solar elevation so drop glints match the rest of the scene.
+    {
+      const moon = this.sunCycle.moonDir;
+      const d = daylight;
+      this.precipLightDir
+        .copy(this.sunDir)
+        .multiplyScalar(d)
+        .addScaledVector(moon, 1.0 - d);
+      if (this.precipLightDir.lengthSq() < 1e-6) this.precipLightDir.set(0.4, 0.8, -0.45);
+      this.precipLightDir.normalize();
+
+      const sunElev = Math.max(0, this.sunDir.y);
+      // Warm at the horizon, neutral overhead -- the same ramp the volumetric pass uses.
+      const warm = 1.0 - Math.min(1, sunElev / 0.42);
+      this.precipLightColor.setRGB(1.0, 0.97 - 0.36 * warm, 0.92 - 0.58 * warm);
+
+      // Haze the far streaks fade into: rain-lit sky by day, deep blue-grey at night.
+      const hazeLift = 0.30 + 0.30 * d + Math.min(0.22, rainHaze * 0.30);
+      this.precipHazeColor.setRGB(hazeLift * 0.96, hazeLift * 1.0, hazeLift * 1.10);
+    }
+
     // Update Near-Field Precipitation & Splashes
     this.precipRenderer.update({
       realTimeSec: this.realTimeElapsed,
@@ -470,6 +523,12 @@ export class AtmosphericSceneEngine {
       fallSpeedMS: coordinator.observerPrecipFallSpeedMS,
       frozenFraction: coordinator.observerFrozenFraction,
       gustFactor: coordinator.observerGustFactor,
+      // Drops are shaded as water: they need the same dominant light the rest of the scene
+      // uses, so the glint goes warm at sunset and cold under the moon.
+      lightDir: this.precipLightDir,
+      lightColor: this.precipLightColor,
+      hazeColor: this.precipHazeColor,
+      daylight: this.sunCycle.daylight,
     });
 
     // PASS 1: Render 3D Scene (Sky + Terrain + Grass + Bolts + TLEs + Rain Streaks) into sceneRT + depthTexture
@@ -538,7 +597,12 @@ export class AtmosphericSceneEngine {
     cu.uPrevViewProj.value.copy(this.prevViewProj);
     cu.uCameraPos.value.copy(cam.position);
     cu.uJitter.value = this.frameIndex * 0.61803398875;
-    cu.uMotionBlur.value = settings.enableMotionBlur ? 1.0 : 0.0;
+    // Intensity is a user-facing multiplier on the smear length, 0..3.5 (0-350%). At 1.0 the
+    // gather spans the true frame-to-frame motion vector; beyond that it exaggerates it, which
+    // is what a speed-ramp look needs.
+    cu.uMotionBlur.value = settings.enableMotionBlur
+      ? Math.max(0, Math.min(3.5, settings.motionBlurIntensity))
+      : 0.0;
     // Reprojection is now genuinely motion-compensated, so history can carry much more weight
     // than the old same-UV resample could without ghosting. That is what lets the volume pass
     // run at a fraction of output resolution and still converge to the same image.
@@ -581,6 +645,7 @@ export class AtmosphericSceneEngine {
     this.compositeMat.dispose();
     this.copyMat.dispose();
     this.volTexture3D.dispose();
+    this.groundSatTexture.dispose();
     this.sceneRT.dispose();
     this.outputRT.dispose();
     this.bloomPass.dispose();

@@ -61,6 +61,7 @@ export class AdaptivePerformanceManager {
       enableCameraShake: true,
       pixelRatioScale: 1.0,
       enableMotionBlur: true,
+      motionBlurIntensity: 1.0,
       enableDayNightCycle: false,
       dayNightCycleSec: 240,
       // ~15.8 h reproduces the 34 deg solar elevation the manual lighting mode defaults to,

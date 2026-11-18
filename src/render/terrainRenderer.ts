@@ -19,6 +19,7 @@ const TERRAIN_FRAG = /* glsl */ `
   precision highp sampler3D;
 
   uniform sampler3D uVolTex;
+  uniform sampler2D uGroundSatTex;
   uniform vec3 uSunDir;
   uniform vec3 uMoonDir;
   uniform float uDaylight;
@@ -74,6 +75,30 @@ const TERRAIN_FRAG = /* glsl */ `
     return exp(-shadowExt * 0.95);
   }
 
+  // Persistent surface water saturation for this column, 0..1, from the simulation's
+  // ground-water bucket. Mapped straight from world XZ onto the 64 x 64 grid the domain uses.
+  float sampleGroundSaturation(vec3 worldPos) {
+    vec2 gUv = vec2(
+      (worldPos.x + uDomainSize * 0.5) / uDomainSize,
+      (worldPos.z + uDomainSize * 0.5) / uDomainSize
+    );
+    if (gUv.x < 0.0 || gUv.x > 1.0 || gUv.y < 0.0 || gUv.y > 1.0) return 0.0;
+    return texture(uGroundSatTex, gUv).r;
+  }
+
+  // Precipitation landing in this column right now. Two low-level taps only: virga has
+  // evaporated well above here, so anything left at 600-1400 m is rain that is reaching ground.
+  float sampleRainNow(vec3 worldPos) {
+    vec2 gUv = vec2(
+      (worldPos.x + uDomainSize * 0.5) / uDomainSize,
+      (worldPos.z + uDomainSize * 0.5) / uDomainSize
+    );
+    if (gUv.x < 0.0 || gUv.x > 1.0 || gUv.y < 0.0 || gUv.y > 1.0) return 0.0;
+    float low = texture(uVolTex, vec3(gUv.x, 0.035, gUv.y)).g;
+    float mid = texture(uVolTex, vec3(gUv.x, 0.078, gUv.y)).g;
+    return clamp((low * 0.7 + mid * 0.3) * 2.4, 0.0, 1.0);
+  }
+
   void main() {
     vec3 N = normalize(vNormalW);
     vec3 V = normalize(uCameraPos - vWorldPos);
@@ -92,18 +117,43 @@ const TERRAIN_FRAG = /* glsl */ `
     float grassMask = smoothstep(0.32, 0.05, slope) * smoothstep(260.0, 95.0, vWorldPos.y);
     vec3 baseAlbedo = mix(drySoil, mix(lushGrass, dryPrairie, nMid * 0.55), grassMask);
 
-    // Puddle formation in flat micro-depressions when uWetness rises
+    // ---- Puddles, as a consequence of where the rain actually fell ----------------------
+    // Saturation is local and persistent: it is fed only by precipitation that reached the
+    // lowest model levels in this column, and it drains on a ~20 minute timescale. So water
+    // collects under a rain shaft, stays behind when the shaft drifts on, and soaks away -
+    // rather than springing up in every flat depression the moment it rains anywhere in the
+    // domain, which is what a single global wetness scalar produced.
+    float localSat = sampleGroundSaturation(vWorldPos);
+
+    // Terrain still decides *where within a wet column* water pools: flat micro-depressions.
     float puddleDepression = smoothstep(0.56, 0.34, nMid * 0.7 + nMacro * 0.3) * smoothstep(0.08, 0.01, slope);
-    float puddleMask = clamp((uWetness - 0.28) * 1.9, 0.0, 1.0) * puddleDepression;
+    // A threshold, not a straight scale: trace dampness darkens soil but should not pool.
+    // Only columns that have genuinely accumulated water become puddles.
+    float puddleMask = clamp((localSat - 0.12) * 1.55, 0.0, 1.0) * puddleDepression;
+
+    // General damp-darkening of soil follows the same local field, with a small contribution
+    // from the observer-scale wetness so the ground under the camera still reads as wet.
+    float groundWet = clamp(localSat * 0.85 + uWetness * 0.22, 0.0, 1.0);
 
     // Wet soil & foliage darkening
-    baseAlbedo *= mix(1.0, 0.52, uWetness * (1.0 - puddleMask * 0.5));
+    baseAlbedo *= mix(1.0, 0.52, groundWet * (1.0 - puddleMask * 0.5));
 
-    // Ripple normal perturbation in active puddles during rain
+    // Ripple normal perturbation, but only in puddles that are being rained into right now.
+    // A pool the shaft has already left behind settles toward a mirror, which is the difference
+    // between water that looks like a surface and water that looks like a texture.
     if (puddleMask > 0.05) {
-      float ripple = sin(length(vWorldPos.xz * 3.5 - floor(vWorldPos.xz * 0.5) * 7.0) * 12.0 - uTime * 16.0);
-      vec3 puddleN = normalize(vec3(ripple * 0.03 * uRainHaze, 1.0, ripple * 0.03 * uRainHaze));
-      N = normalize(mix(N, puddleN, puddleMask * 0.92));
+      float rainNow = sampleRainNow(vWorldPos);
+      float rippleAmp = puddleMask * rainNow;
+      if (rippleAmp > 0.01) {
+        vec2 rp = vWorldPos.xz * 2.6;
+        // Two overlapping ring trains at incommensurate rates, so the interference pattern
+        // does not visibly repeat across a large pool.
+        float r1 = sin(length(rp - floor(rp * 0.22) * 4.5) * 9.5 - uTime * 13.5);
+        float r2 = sin(length(rp * 1.63 + vec2(3.11, 1.77)) * 6.2 - uTime * 9.3);
+        float grad = (r1 + r2 * 0.55) * 0.034 * rippleAmp;
+        vec3 puddleN = normalize(vec3(grad, 1.0, grad * 0.82));
+        N = normalize(mix(N, puddleN, clamp(rippleAmp, 0.0, 1.0) * 0.92));
+      }
     }
 
     // Direct solar + sky hemisphere + real-time 3D cloud shadow, across the diurnal cycle
@@ -140,7 +190,7 @@ const TERRAIN_FRAG = /* glsl */ `
 
     // Wet surface & puddle Fresnel reflection of sky & lightning flash
     float fresnel = pow(1.0 - max(0.0, dot(N, V)), 4.0);
-    float reflectivity = mix(0.02, 0.68, puddleMask) + uWetness * 0.16;
+    float reflectivity = mix(0.02, 0.68, puddleMask) + groundWet * 0.16;
     vec3 dayRefl = mix(vec3(0.22, 0.28, 0.36), vec3(0.42, 0.56, 0.76), cloudShadow * sunHeight);
     vec3 reflSky = mix(vec3(0.020, 0.028, 0.048), dayRefl, daylight) +
                    vec3(0.82, 0.88, 1.0) * boltAtten * 0.95;
@@ -235,7 +285,7 @@ export class GroundEnvironmentRenderer {
   private terrainMat: THREE.ShaderMaterial;
   private grassMat: THREE.ShaderMaterial;
 
-  constructor(volTexture: THREE.Data3DTexture) {
+  constructor(volTexture: THREE.Data3DTexture, groundSatTexture: THREE.DataTexture) {
     // High-resolution terrain grid (200 x 200 vertices across 32km x 32km)
     const segs = 196;
     const geom = new THREE.PlaneGeometry(DOMAIN_SIZE, DOMAIN_SIZE, segs, segs);
@@ -255,6 +305,7 @@ export class GroundEnvironmentRenderer {
       fragmentShader: TERRAIN_FRAG,
       uniforms: {
         uVolTex: { value: volTexture },
+        uGroundSatTex: { value: groundSatTexture },
         uSunDir: { value: new THREE.Vector3(0.4, 0.55, -0.72).normalize() },
         uMoonDir: { value: new THREE.Vector3(-0.4, 0.55, 0.72).normalize() },
         uDaylight: { value: 1.0 },

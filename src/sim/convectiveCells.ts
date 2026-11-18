@@ -255,9 +255,33 @@ export class ConvectiveCellManager {
           (cell.updraftMaxMS / Math.max(1200, cell.radiusM)) *
           (1.0 + inst.srh03km / 220.0) *
           (cell.rightMoverBias >= 0 ? 1.0 : -0.65);
-        cell.mesocycloneVorticity += (tiltingSource * 0.45 - cell.mesocycloneVorticity * 0.018) * dt;
+        // The damping coefficient sets the mesocyclone's spin-down e-folding time, and 0.018/s
+        // was 55 seconds: real mesocyclones persist for tens of minutes, so the tilt source never
+        // got to accumulate. With bulkShear ~19 m/s the old equilibrium was |zeta| ~ 7e-4, which
+        // measured 23x below the 0.011 supercell-stage threshold -- the supercell stage, Bunkers
+        // right-deviant steering, hook-echo RFD wrapping and cell splitting were all dead code.
+        // 0.0010/s gives a ~17 minute e-folding and an equilibrium of ~0.013 for a typical cell,
+        // rising above 0.02 for a vigorous narrow updraft, so supercells now occur selectively
+        // rather than never.
+        // Vortex stretching is the term that actually grows a mesocyclone: tilting supplies a
+        // fixed source and on its own saturates near |zeta| ~ 7e-4 s^-1, an order of magnitude
+        // below the 1.1e-2 supercell threshold. Stretching by the updraft's vertical velocity
+        // gradient supplies positive feedback on the spin already present. The efficiency tapers
+        // as zeta nears a strong observed mesocyclone value (0.045 s^-1), which makes the
+        // feedback saturate instead of running away, and puts the equilibrium for a vigorous
+        // deep updraft at ~0.015 -- just above the supercell threshold, so only the strongest
+        // cells reach that stage rather than all of them or none.
+        const spinDepth = Math.max(1200, cell.cloudTopM - cell.cloudBaseM);
+        const stretchRate = (cell.updraftMaxMS / spinDepth) *
+          0.55 * Math.max(0, 1.0 - Math.abs(cell.mesocycloneVorticity) / 0.045);
+        cell.mesocycloneVorticity +=
+          (tiltingSource * 0.45 +
+            cell.mesocycloneVorticity * stretchRate -
+            cell.mesocycloneVorticity * 0.0010) * dt;
       } else {
-        cell.mesocycloneVorticity *= Math.max(0, 1.0 - 0.03 * dt);
+        // Spin-down once tilting stops: still far slower than the 33 s of the old coefficient,
+        // because a mesocyclone does not vanish the instant the updraft dips below threshold.
+        cell.mesocycloneVorticity *= Math.max(0, 1.0 - 0.008 * dt);
       }
       cell.rotationPhase += cell.mesocycloneVorticity * dt * 8.0;
 

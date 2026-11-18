@@ -1,21 +1,31 @@
 import { AtmosphereSimulationCoordinator } from '../src/sim/atmosphereCoordinator';
-const c = new AtmosphereSimulationCoordinator();
-const g: any = c.grid;
-let maxAnv=0, firstAnv=-1;
-const stages: Record<string,number> = {};
-for (let f = 0; f < 22000; f++) {
-  c.config.solarInsolationScale = 1.0;   // what the engine writes at the default afternoon sun
-  c.step(1/60, 12, false, 0, 0);
-  for (const cell of c.cellManager.cells) {
-    if (cell.anvilRadiusM > maxAnv) maxAnv = cell.anvilRadiusM;
-    if (cell.anvilRadiusM > 400 && firstAnv < 0) firstAnv = c.simTimeSec/60;
-    stages[cell.stage] = (stages[cell.stage]||0)+1;
+function run(burn: boolean) {
+  const c = new AtmosphereSimulationCoordinator();
+  const g: any = c.grid;
+  let flashes = 0, tles = 0;
+  const seen = new Set<string>();
+  for (let f = 0; f < 9000; f++) {
+    c.config.solarInsolationScale = 1.0;
+    c.step(1/60, 12, false, 0, 0);
+    if (burn && f % 300 === 0) { const t = Date.now(); while (Date.now() - t < 4) {} }
+    for (const cell of c.cellManager.cells) seen.add(cell.stage);
   }
+  flashes = c.lightning.totalFlashes; tles = c.lightning.totalTLEs;
+  let satSum = 0, satMax = 0, wet = 0;
+  for (let i = 0; i < g.groundSat.length; i++) {
+    satSum += g.groundSat[i];
+    if (g.groundSat[i] > satMax) satMax = g.groundSat[i];
+    if (g.groundSat[i] > 0.01) wet++;
+  }
+  return `rain=${c.observerRainMMHr.toFixed(9)} flash=${flashes} tle=${tles} cells=${c.cellManager.cells.length} ` +
+         `maxW=${Math.max(0,...c.cellManager.cells.map((x:any)=>x.updraftMaxMS)).toFixed(6)} ` +
+         `satSum=${satSum.toFixed(6)} satMax=${satMax.toFixed(6)} wetCols=${wet} ` +
+         `E=${c.electrification.maxElectricFieldKVm.toFixed(6)} drift=${c.waterMassDriftPercent}`;
 }
-const t = c.getTelemetrySnapshot();
-console.log(`firstAnvil ${firstAnv.toFixed(1)}min  peakAnv ${(maxAnv/1000).toFixed(1)}km  stretch=${c.cadenceStretchFactor.toFixed(2)}`);
-console.log('stages', JSON.stringify(stages));
-console.log('drift', t.validation.waterConservationDriftPct.toFixed(3)+'%', 'maxRain', t.maxSurfaceRainMMHr.toFixed(1),
-  'flashes', t.totalFlashes, 'tles', t.totalTLEs, 'CFL', t.validation.maxCFL.toFixed(3),
-  'divRes', t.validation.massContinuityResidual.toExponential(2), 'thermoOK', t.validation.thermodynamicConsistent);
-console.log('cover', (g.domainCloudCoverFraction*100).toFixed(1)+'%', 'cells', c.cellManager.cells.length, 'pools', c.cellManager.coldPools.length);
+const a = run(false);
+const b = run(true);
+const c2 = run(false);
+console.log('clean    :', a);
+console.log('CPU-burn :', b);
+console.log('clean #2 :', c2);
+console.log('\nDETERMINISTIC (no wall-clock coupling):', a === b && b === c2);

@@ -27,9 +27,24 @@ function clamp01_2(v: number): number {
   return v <= 0 ? 0 : v >= 2.2 ? 2.2 : v;
 }
 
+/**
+ * Effective breakdown threshold for cloud air, scaled to local density.
+ *
+ * This is a *runaway-electron* (relativistic feedback) threshold, not the conventional DC
+ * spark value of ~300 kV/m at STP. That distinction matters: measured in-cloud fields in
+ * thunderstorms rarely exceed 10-100 kV/m, yet they flash constantly, because runaway
+ * breakdown needs roughly an order of magnitude less field than conventional breakdown.
+ *
+ * The previous coefficient of 206 was too close to the conventional scale. It put the
+ * threshold at the main negative charge layer (FL + 2100 m, ~6.7 km) at about 109 kV/m while
+ * the solved field only ever reached ~102 kV/m there -- so the main negative region could not
+ * break down at all, and every single discharge initiated in the upper positive region. All
+ * 766 sampled initiations were above FL + 1500 m with positive local charge, which is why
+ * Negative CG (-CG) collapsed to 2 events against 25 Positive CG (+CG): the real atmosphere is
+ * the other way round, ~90% negative CG.
+ */
 export function breakdownThresholdKVm(rhoKgM3: number): number {
-  // Empirical cloud-air runaway/breakdown threshold scaled to local air density.
-  return 206.0 * (rhoKgM3 / 1.225);
+  return 155.0 * (rhoKgM3 / 1.225);
 }
 
 export function mixedPhaseChargeReversalFraction(lwcGKg: number, temperatureK: number): number {
@@ -114,14 +129,25 @@ export class AtmosphericElectrificationEngine {
           cell.supercooledWaterGKg,
           mixedPhaseTemperatureK
         );
+        // mainLayerSign > 0 is the normal non-inductive regime: graupel in the -15 C charging
+        // zone collects negative charge, so the main region goes NEGATIVE and the charge it
+        // sheds is deposited as positive above and (weakly) below -- the classic tripole.
+        // Reversal (high LWC, warmer) flips the graupel sign and hence mainLayerSign.
+        //
+        // The signs here were inverted relative to the field names, which produced a tripole
+        // upside down: upperPosChargeNCm3 measured -1.49 nC/m3 and mainNegChargeNCm3 +0.98 in a
+        // mature cell. Because the deposition into rhoQ copies these moments through unchanged,
+        // the whole 3D charge field was reversed -- positive charge sitting at the main negative
+        // level and negative charge up in the anvil. That is why Positive CG (+CG) could never
+        // occur: there was no upper positive charge centre for it to originate from.
         const mainLayerSign = 1.0 - 2.0 * reversalFraction;
         const upperShare = 1.0 - 0.36 * Math.min(0.9, reversalFraction);
         const lowerShare = 0.14 + 0.36 * Math.min(0.9, reversalFraction);
         const totalPositiveShare = upperShare + lowerShare;
         const dqTotal = 0.011 * collisionKernel * dt;
-        const upperDelta = -mainLayerSign * dqTotal * (upperShare / totalPositiveShare);
-        const lowerDelta = -mainLayerSign * dqTotal * (lowerShare / totalPositiveShare);
-        const mainDelta = mainLayerSign * dqTotal;
+        const upperDelta = mainLayerSign * dqTotal * (upperShare / totalPositiveShare);
+        const lowerDelta = mainLayerSign * dqTotal * (lowerShare / totalPositiveShare);
+        const mainDelta = -mainLayerSign * dqTotal;
 
         // The transferred charge is pairwise balanced: upper + lower + main = 0
         // before the independent corona/precipitation leakage terms are applied.
@@ -130,10 +156,13 @@ export class AtmosphericElectrificationEngine {
         cell.mainNegChargeNCm3 = Math.max(-5.8, Math.min(5.8, cell.mainNegChargeNCm3 + mainDelta));
 
         if (cell.peakElectricFieldKVm > 35.0) {
+          // Inductive charging reinforces the existing dipole: falling graupel polarises in the
+          // ambient field and adds to the main region, balanced by the two positive regions.
+          // Same sign convention as the non-inductive term above (was inverted there too).
           const indRate = 0.004 * (cell.peakElectricFieldKVm / 100.0) * cell.graupelGKg * dt;
-          cell.upperPosChargeNCm3 = Math.max(-5.6, Math.min(5.6, cell.upperPosChargeNCm3 - mainLayerSign * indRate * 0.7));
-          cell.lowerPosChargeNCm3 = Math.max(-3.5, Math.min(3.5, cell.lowerPosChargeNCm3 - mainLayerSign * indRate * 0.3));
-          cell.mainNegChargeNCm3 = Math.max(-6.0, Math.min(6.0, cell.mainNegChargeNCm3 + mainLayerSign * indRate));
+          cell.upperPosChargeNCm3 = Math.max(-5.6, Math.min(5.6, cell.upperPosChargeNCm3 + mainLayerSign * indRate * 0.7));
+          cell.lowerPosChargeNCm3 = Math.max(-3.5, Math.min(3.5, cell.lowerPosChargeNCm3 + mainLayerSign * indRate * 0.3));
+          cell.mainNegChargeNCm3 = Math.max(-6.0, Math.min(6.0, cell.mainNegChargeNCm3 - mainLayerSign * indRate));
         }
 
         if (cell.anvilRadiusM > 2200) {
@@ -218,6 +247,15 @@ export class AtmosphericElectrificationEngine {
       const zUpperPos = Math.min(cell.cloudTopM - 600, inst.freezingLevel + 5200);
       const zScreen = cell.cloudTopM;
 
+      // The upper positive charge lives partly over the convective core and partly over the
+      // glaciated anvil outflow. It used to be deposited in FULL over the core below *and* again
+      // over the anvil at 0.68 weight, which double-counted it: the atmosphere then carried far
+      // more positive than negative charge, the upper positive region dominated the solved
+      // field, and discharges came out overwhelmingly positive (81% of cloud-to-ground were +CG
+      // against the ~5-10% observed). Splitting one budget between the two regions keeps
+      // upper + main + lower + screen summing to zero as the charging increments already do.
+      const anvilUpperShare = cell.anvilRadiusM > 1200 ? 0.55 : 0.0;
+
       // Vertical Gaussian layer profiles are functions of iy only: hoisting them out of the
       // horizontal loops removes four exp() evaluations per grid point per cell.
       const maxIy = Math.min(ny - 2, Math.ceil((cell.cloudTopM + 900) / grid.dy));
@@ -230,7 +268,7 @@ export class AtmosphericElectrificationEngine {
         const pScreen = wy > zScreen - 1700 ? Math.exp(-Math.pow((wy - zScreen) / 550.0, 2)) : 0;
         this.profMain[iy] = cell.mainNegChargeNCm3 * pMain;
         this.profLpcc[iy] = cell.lowerPosChargeNCm3 * pLpcc;
-        this.profUpper[iy] = cell.upperPosChargeNCm3 * pUpper;
+        this.profUpper[iy] = cell.upperPosChargeNCm3 * (1.0 - anvilUpperShare) * pUpper;
         this.profScreen[iy] = cell.anvilScreenChargeNCm3 * pScreen;
         if (pMain > 0.02 || pLpcc > 0.02 || pUpper > 0.02 || pScreen > 0.02) anyLayer = true;
       }
@@ -307,7 +345,7 @@ export class AtmosphericElectrificationEngine {
           const wy = grid.gridToWorldY(iy);
           const upperShape = Math.exp(-Math.pow((wy - zUpperPos) / 1450.0, 2));
           const screenShape = Math.exp(-Math.pow((wy - zScreen) / 550.0, 2));
-          const upperQ = cell.upperPosChargeNCm3 * 0.68 * upperShape;
+          const upperQ = cell.upperPosChargeNCm3 * anvilUpperShare * upperShape;
           const screenQ = cell.anvilScreenChargeNCm3 * screenShape;
           if (Math.abs(upperQ) < 1e-4 && Math.abs(screenQ) < 1e-4) continue;
           const rowOff = nx * iy;

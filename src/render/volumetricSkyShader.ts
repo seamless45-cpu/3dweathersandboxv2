@@ -708,13 +708,24 @@ export const COMPOSITE_POST_FRAG = /* glsl */ `
       vec2 vel = vUv - prevUv;
       float speedPx = length(vel * uResolution);
       if (speedPx > 0.8) {
+        // uMotionBlur is the user's intensity multiplier, 0..3.5 (0-350%). At 1.0 the gather
+        // spans exactly the frame-to-frame motion vector; beyond that it exaggerates it.
         float maxPx = 30.0 * uMotionBlur;
         vec2 offset = speedPx > maxPx ? vel * (maxPx / speedPx) : vel;
+        float blurPx = length(offset * uResolution);
+        // Tap count has to grow with the smear, or a long blur degenerates into visible bands:
+        // the old fixed 8 taps left ~13 px gaps at 350%, which strobes as the camera moves.
+        // Capping at 24 keeps the worst case bounded; past ~72 px the per-pixel phase jitter and
+        // the temporal accumulator hide the residual spacing. So blur cost scales with the
+        // intensity the user actually asked for instead of being paid at 100% too.
+        int taps = int(clamp(ceil(blurPx / 3.0), 4.0, 24.0));
+        float invTaps = 1.0 / float(taps);
         float jitter = hash21(vUv * uResolution + uJitter * 7.31);
         vec3 acc = vec3(0.0);
         float wSum = 0.0;
-        for (int i = 0; i < 8; i++) {
-          float f = (float(i) + jitter) / 8.0 - 0.5;
+        for (int i = 0; i < 24; i++) {
+          if (i >= taps) break;
+          float f = (float(i) + jitter) * invTaps - 0.5;
           vec2 suv = clamp(vUv + offset * f, vec2(0.0005), vec2(0.9995));
           float nd = texture(uDepthTex, suv).r;
           float w = 1.0 / (1.0 + abs(nd - centerDepth) * 320.0);
