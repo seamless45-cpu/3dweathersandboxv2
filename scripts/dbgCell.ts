@@ -1,31 +1,28 @@
 import { AtmosphereSimulationCoordinator } from '../src/sim/atmosphereCoordinator';
-function run(burn: boolean) {
+function run(tag: string) {
   const c = new AtmosphereSimulationCoordinator();
-  const g: any = c.grid;
-  let flashes = 0, tles = 0;
-  const seen = new Set<string>();
-  for (let f = 0; f < 9000; f++) {
-    c.config.solarInsolationScale = 1.0;
-    c.step(1/60, 12, false, 0, 0);
-    if (burn && f % 300 === 0) { const t = Date.now(); while (Date.now() - t < 4) {} }
-    for (const cell of c.cellManager.cells) seen.add(cell.stage);
+  const g: any = c.grid; const rod: any = c.lightningRod;
+  let nan = 0, checked = 0, maxW = 0, maxV = 0, torn = 0;
+  const fields = [g.u, g.vy, g.w, g.qc, g.qi, g.qr, g.rhoQ, g.phi, g.ex, g.ey, g.ez];
+  for (let f = 0; f < 20000; f++) {
+    c.config.solarInsolationScale = 1.0; c.step(1/60, 12, false, 0, 0);
+    if (f % 250 === 0) {
+      for (const arr of fields) {
+        for (let i = 0; i < arr.length; i += 97) { checked++; if (!Number.isFinite(arr[i])) nan++; }
+      }
+    }
+    for (const cell of c.cellManager.cells) if ((cell as any).updraftMaxMS > maxW) maxW = (cell as any).updraftMaxMS;
+    for (const t of c.tornadoes.active) if (t.maxTangentialMS > maxV) maxV = t.maxTangentialMS;
+    torn = c.tornadoes.totalFormed;
   }
-  flashes = c.lightning.totalFlashes; tles = c.lightning.totalTLEs;
-  let satSum = 0, satMax = 0, wet = 0;
-  for (let i = 0; i < g.groundSat.length; i++) {
-    satSum += g.groundSat[i];
-    if (g.groundSat[i] > satMax) satMax = g.groundSat[i];
-    if (g.groundSat[i] > 0.01) wet++;
-  }
-  return `rain=${c.observerRainMMHr.toFixed(9)} flash=${flashes} tle=${tles} cells=${c.cellManager.cells.length} ` +
-         `maxW=${Math.max(0,...c.cellManager.cells.map((x:any)=>x.updraftMaxMS)).toFixed(6)} ` +
-         `satSum=${satSum.toFixed(6)} satMax=${satMax.toFixed(6)} wetCols=${wet} ` +
-         `E=${c.electrification.maxElectricFieldKVm.toFixed(6)} drift=${c.waterMassDriftPercent}`;
+  const sig = [c.lightning.totalFlashes, c.lightning.totalTLEs, torn,
+    +maxW.toFixed(6), +maxV.toFixed(6), +g.maxCFL.toFixed(6),
+    +g.domainCloudCoverFraction.toFixed(6), rod.upwardLeaders,
+    c.lightning.rodUpwardFlashes, rod.interceptedStrikes, nan].join('|');
+  console.log(`${tag} ${sig}`);
+  console.log(`   nonfinite ${nan} / ${checked} sampled   CFL ${g.maxCFL.toFixed(3)}  divRes ${g.maxDivergenceResidual.toExponential(2)}  maxUpdraft ${maxW.toFixed(1)}  peakTornado ${maxV.toFixed(1)} m/s`);
+  return sig;
 }
-const a = run(false);
-const b = run(true);
-const c2 = run(false);
-console.log('clean    :', a);
-console.log('CPU-burn :', b);
-console.log('clean #2 :', c2);
-console.log('\nDETERMINISTIC (no wall-clock coupling):', a === b && b === c2);
+const a = run('RUN A');
+const b = run('RUN B');
+console.log(`\nDETERMINISTIC: ${a === b}`);

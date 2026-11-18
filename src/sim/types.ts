@@ -1,5 +1,10 @@
-export const DOMAIN_HALF_SIZE = 16000; // meters (-16km to +16km -> 32km x 32km horizontal domain)
-export const DOMAIN_SIZE = 32000; // meters
+// Horizontal extent of the simulated atmosphere. Widened from 32 km to 48 km so convection is
+// not visibly confined to a box: at 32 km the domain edge sat inside the camera's view from
+// almost anywhere on the ground, and clouds were hard-clipped at a straight vertical wall.
+// GRID_NX/GRID_NZ were raised to 96 in the same change so dx stays at exactly 500 m -- the
+// cloud field keeps its original resolution and only the covered area grows (2.25x).
+export const DOMAIN_HALF_SIZE = 24000; // meters (-24km to +24km -> 48km x 48km horizontal domain)
+export const DOMAIN_SIZE = 48000; // meters
 export const DOMAIN_MAX_ALT = 18000; // meters for tropospheric/lower-stratospheric 3D fluid grid
 export const TLE_MAX_ALT = 92000; // meters for upper-atmospheric phenomena (sprites, jets, ELVES)
 
@@ -51,6 +56,42 @@ export type PrecipitationType =
   | 'Hail & Heavy Rain'
   | 'Snow / Ice Pellets'
   | 'Mixed-Phase Precipitation';
+
+/**
+ * Cloud structural archetypes. These are *formation* regimes, not the WMO genera -- the genera
+ * are resolved in the shader from altitude and phase. What differs here is the shape the
+ * condensate is injected in: how wide the tower grows, how high it tops out, and how much
+ * anvil it throws downshear.
+ */
+/** Lightweight per-frame view of one tornadic vortex, for the HUD. */
+export interface TornadoSnapshot {
+  id: string;
+  x: number;
+  z: number;
+  /** Peak tangential wind at the core radius, m/s. */
+  windMS: number;
+  efScale: number;
+  /** Radius of maximum wind, m. */
+  radiusM: number;
+  /** Cyclostrophic core pressure deficit, Pa (negative). */
+  pressureDeficitPa: number;
+  /** 0..1, how far the condensation funnel has descended from cloud base. */
+  funnelDrop: number;
+  /** Cloud base of the parent storm, m ASL. */
+  cloudBaseM: number;
+  ageSec: number;
+  phase: string;
+}
+
+export type CloudMorphology =
+  /** Narrow deep tower, strong anvil: classic single-cell Cb capillatus. */
+  | 'tower'
+  /** Wide moderately-deep cluster, weak anvil: multicell line / MCS. */
+  | 'multicell'
+  /** Shallow, capped near or below the freezing level: Cu humilis to mediocris. */
+  | 'shallow'
+  /** Very wide, low, stratiform deck with no anvil: Sc / Ns sheet. */
+  | 'stratiform';
 
 export type LightningClassification =
   | 'Negative CG (-CG)'
@@ -139,6 +180,14 @@ export interface ConvectiveCell {
   vz: number; // m/s actual cell motion Z
   ageSec: number; // s since thermal nucleation
   stage: CellLifecycleStage;
+
+  /**
+   * Structural archetype, fixed at nucleation. Every cell used to grow by the same radius,
+   * cloud-top and anvil laws, so every storm in the domain converged on one shape -- a single
+   * tower with an anvil -- no matter what the environment supported. The archetype biases those
+   * growth laws so the domain produces genuinely different cloud structures side by side.
+   */
+  morphology: CloudMorphology;
 
   // 3D Geometry & Circulation
   radiusM: number; // m core convective tower radius
@@ -384,6 +433,14 @@ export interface SimulationTelemetrySnapshot {
   maxNegChargeNCm3: number;
   totalFlashes: number;
   totalTLEs: number;
+  /** Grounded mast: corona point-discharge brightness, 0..1. */
+  rodCorona: number;
+  /** Flashes that terminated on the rod instead of open ground. */
+  rodInterceptions: number;
+  /** Self-initiated upward leaders launched by the rod under strong ambient field. */
+  rodUpwardLeaders: number;
+  /** Active tornadic vortices, strongest first. */
+  tornadoes: TornadoSnapshot[];
   cells: ConvectiveCell[];
   events: EventMonitorRecord[];
   validation: ValidationDiagnostics;

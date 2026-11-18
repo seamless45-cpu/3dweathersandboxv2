@@ -10,13 +10,17 @@ import {
 } from './types';
 
 /**
- * Simulation grid resolution. 64 x 36 x 64 over a 32 km x 18 km x 32 km domain gives
+ * Simulation grid resolution. 96 x 36 x 96 over a 48 km x 18 km x 48 km domain gives
  * 500 m voxels — fine enough that a 1.5 km convective tower is resolved by several voxels
  * across instead of two, which is what makes the cloud silhouette read as a cloud.
+ *
+ * The horizontal counts were raised from 64 together with DOMAIN_SIZE going 32 km -> 48 km,
+ * specifically so the voxel size stays at 500 m. Widening the domain without raising them
+ * would have coarsened the cloud field to 1 km and undone the detail the raymarch relies on.
  */
-export const GRID_NX = 64;
+export const GRID_NX = 96;
 export const GRID_NY = 36;
-export const GRID_NZ = 64;
+export const GRID_NZ = 96;
 
 /** Subset of the instability telemetry the convective injection needs. */
 export interface ConvectiveInjectionInstability {

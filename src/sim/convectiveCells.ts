@@ -4,6 +4,7 @@ import { AtmosphericSounding } from './thermodynamics';
 import {
   AtmosphereConfig,
   CellLifecycleStage,
+  CloudMorphology,
   ColdPool,
   ConvectiveCell,
   DOMAIN_HALF_SIZE,
@@ -166,7 +167,15 @@ export class ConvectiveCellManager {
       const mpOut = stepCellMicrophysics(cell, dt, sounding, cfg);
 
       const cloudDepth = Math.max(300, cell.cloudTopM - cell.cloudBaseM);
-      const dilutionFactor = Math.exp(-cell.entrainmentRate * (cloudDepth / 1000.0));
+      // Structural archetype: biases every growth law below, so a tower, a multicell cluster, a
+      // shallow cumulus and a stratiform deck all evolve from the same physics but end up as
+      // visibly different clouds rather than four copies of one shape.
+      const morph = ConvectiveCellManager.MORPH_FACTORS[cell.morphology];
+      // Wider cores entrain less per unit depth (eps ~ 1/R), so the entrain factor scales the
+      // dilution exponent: stratiform decks mix out fast, narrow towers stay intact.
+      const dilutionFactor = Math.exp(
+        -cell.entrainmentRate * morph.entrain * (cloudDepth / 1000.0)
+      );
       const updraftRadiusEff = Math.min(4200, Math.max(320, cell.radiusM));
 
       // ---- Vertical momentum balance -------------------------------------------------
@@ -344,9 +353,10 @@ export class ConvectiveCellManager {
         const capRiseFactor = clamp(0.88 - 0.44 * (cloudDepth / 9000.0), 0.4, 0.88);
         const capRise = cell.updraftMaxMS * capRiseFactor;
         const maxPhysicalTop =
-          inst.cape > 80
+          (inst.cape > 80
             ? inst.el + Math.min(2400, cell.updraftMaxMS * 42.0)
-            : inst.lcl + 900 + cell.updraftMaxMS * 180.0;
+            : inst.lcl + 900 + cell.updraftMaxMS * 180.0) *
+          morph.top;
         if (cell.cloudTopM < maxPhysicalTop) {
           cell.cloudTopM += capRise * dt;
         } else {
@@ -378,16 +388,22 @@ export class ConvectiveCellManager {
           ? cell.radiusM * (1.0 - 0.0016 * dt)
           : clamp(
               Math.max(continuityRadius, depthRadius) *
+                morph.radius *
                 (1.0 + Math.min(0.35, Math.abs(cell.mesocycloneVorticity) * 9.0)),
-              480,
-              4600
+              420,
+              7200
             );
       cell.radiusM += (targetRadius - cell.radiusM) * (1.0 - Math.exp(-dt / 240.0));
 
       // Upper tropospheric anvil divergence near the Equilibrium Level (Cb capillatus).
       if (cell.cloudTopM > inst.el * 0.82 && (cell.cloudIceGKg + cell.snowGKg) > 0.1) {
         const anvilOutflowSpeed = Math.max(3.5, cell.updraftMaxMS * 0.5 + dAnvMag * 0.45);
-        cell.anvilRadiusM = Math.min(13500, cell.anvilRadiusM + anvilOutflowSpeed * dt);
+        // morph.anvil ~0 for shallow and stratiform archetypes: they simply never reach the
+        // divergence level, so they grow no anvil at all instead of a small one.
+        cell.anvilRadiusM = Math.min(
+          13500,
+          cell.anvilRadiusM + anvilOutflowSpeed * morph.anvil * dt
+        );
       } else if (cell.stage === 'dissipating') {
         cell.anvilRadiusM = Math.max(0, cell.anvilRadiusM - 1.4 * dt);
       } else {
@@ -602,6 +618,54 @@ export class ConvectiveCellManager {
     }
   }
 
+  /**
+   * Chooses a structural archetype for a newly nucleated cell.
+   *
+   * The draw is weighted by the environment rather than uniform, because morphology is not
+   * arbitrary: a deep moist sheared profile supports narrow towering Cb, a weakly capped
+   * shallow-CAPE environment can only make Cu humilis, and low CAPE with weak shear produces
+   * stratiform decks. This is what lets the domain show several distinct cloud structures at
+   * once instead of a field of identical towers.
+   */
+  private pickMorphology(inst: {
+    cape: number;
+    bulkShear06km: number;
+    lcl: number;
+    el: number;
+  }): CloudMorphology {
+    const r = this.rand();
+    const depthKm = Math.max(0.5, (inst.el - inst.lcl) / 1000);
+    // Deep profiles favour towers; shear lets a tower stay narrow instead of ventilating apart.
+    const towerWeight = Math.min(
+      0.44,
+      0.1 + (depthKm / 12) * 0.3 + Math.min(0.12, inst.bulkShear06km / 320)
+    );
+    const shallowWeight = inst.cape < 900 ? 0.3 : 0.14;
+    const stratiformWeight = inst.cape < 700 && inst.bulkShear06km < 14 ? 0.26 : 0.1;
+    if (r < towerWeight) return 'tower';
+    if (r < towerWeight + shallowWeight) return 'shallow';
+    if (r < towerWeight + shallowWeight + stratiformWeight) return 'stratiform';
+    return 'multicell';
+  }
+
+  /**
+   * Per-archetype multipliers on the radius, cloud-top, anvil and entrainment growth laws, in
+   * one table so the four regimes are directly comparable and tunable in one place.
+   */
+  public static readonly MORPH_FACTORS: Record<
+    CloudMorphology,
+    { radius: number; top: number; anvil: number; entrain: number }
+  > = {
+    // Narrow and tall: a strong single core that punches to the EL and spreads a wide anvil.
+    tower: { radius: 0.72, top: 1.16, anvil: 1.45, entrain: 0.82 },
+    // Broad cluster: several merged cores, moderate depth, little organised anvil.
+    multicell: { radius: 1.38, top: 0.96, anvil: 0.72, entrain: 1.05 },
+    // Capped shallow cumulus: tops out low, small core, essentially no anvil.
+    shallow: { radius: 0.62, top: 0.58, anvil: 0.05, entrain: 1.28 },
+    // Stratiform deck: very wide, low, sheet-like, no anvil.
+    stratiform: { radius: 1.95, top: 0.44, anvil: 0.02, entrain: 1.42 },
+  };
+
   private spawnNucleatingThermal(
     x: number,
     z: number,
@@ -631,6 +695,9 @@ export class ConvectiveCellManager {
       vz: lowW,
       ageSec: 0,
       stage: 'nucleating',
+      // Deterministic: drawn from this.rand() so a fixed seed always produces the same mix of
+      // archetypes and the run stays reproducible.
+      morphology: this.pickMorphology(sounding.instability),
       radiusM,
       cloudBaseM: startTop * 0.42,
       cloudTopM: startTop,
@@ -691,6 +758,7 @@ export class ConvectiveCellManager {
       x: parent.x + perpX * parent.radiusM * 0.75,
       z: parent.z + perpZ * parent.radiusM * 0.75,
       radiusM: parent.radiusM * 0.82,
+      morphology: parent.morphology,
       anvilRadiusM: parent.anvilRadiusM * 0.7,
       updraftMaxMS: parent.updraftMaxMS * 0.84,
       mesocycloneVorticity: -Math.abs(parent.mesocycloneVorticity) * 0.75, // Anticyclonic left-mover!
