@@ -175,7 +175,41 @@ export class AutonomousLightningEngine {
       let allowGroundStrike = false;
       let isAnvilHorizontal = false;
 
+      // Ground-directed potential gradient, evaluated FIRST. The intra-cloud sinks below are
+      // only reached when this does not hold, which is what "exceeds intra-cloud sink" means --
+      // the previous branch order evaluated them the other way round, so a strongly vertical
+      // field was always captured as a cloud-to-cloud or anvil-crawler flash and neither
+      // polarity of cloud-to-ground could be reached from the upper part of the cloud.
+      //
+      // (-CG) route. A leader's propagation direction is set by the enormous field enhancement
+      // at its own tip, not by the ambient field at the point where breakdown first occurred, so
+      // the right question is *which charge centre the discharge taps*. The previous gate asked
+      // for an upward ambient field (cand.ey > 0), which only exists BELOW the main negative
+      // centre -- and with the density-scaled breakdown threshold plus the shielding lower
+      // positive charge, essentially no candidates form there: 10 of 1214 sampled initiations.
+      // That is why Negative CG (-CG) stayed at zero even after the charge tripole was fixed.
+      // Tapping the main negative layer from at or below its top, with a negative potential and
+      // an LPCC too weak to short the channel out, is the physically meaningful condition.
+      const zMainNeg = sounding.instability.freezingLevel + 2100;
+      const groundDirectedNegative =
+        localPhi < -8.0 && initY < zMainNeg + 1400 && lpccStrength < mainNegStrength * 0.52;
+      // (+CG) route: positive space charge with a downward-pointing field, i.e. the upper
+      // positive centre or the downshear anvil overhang.
+      // Threshold is deliberately above the diffuse anvil fringe: a (+CG) needs a genuine upper
+      // positive charge centre. Measured over 22000-frame storms, 0.12 let the spread-out anvil
+      // charge qualify too often (34% of CG flashes were +CG, against ~5-10% observed) and 0.25
+      // shut the route off entirely (+CG = 0). 0.17 lands between them.
+      const groundDirectedPositive =
+        cand.localRhoQ > 0.17 && cand.ey < 0.0 && initY > sounding.instability.freezingLevel + 1500;
+      const groundDirectedLow = initY < sounding.instability.freezingLevel + 600;
+      // A genuinely ground-directed gradient takes precedence over the horizontally-driven
+      // intra-cloud modes; weakly-directed cases do not, so anvil crawlers and CC flashes keep
+      // their variety.
+      const strongGroundDirected =
+        groundDirectedNegative || (groundDirectedPositive && cand.ey < -8.0);
+
       if (
+        !strongGroundDirected &&
         cell &&
         anvilRadius > 4600 &&
         initY > sounding.instability.freezingLevel + 2600 &&
@@ -190,6 +224,7 @@ export class AutonomousLightningEngine {
         targetZ = cell.z + Math.sin(spreadAngle) * crawlDist;
         targetY = initY + (this.rand() - 0.5) * 900;
       } else if (
+        !strongGroundDirected &&
         neighborCell &&
         initY > sounding.instability.freezingLevel + 1200 &&
         Math.hypot(cand.ex, cand.ez) > Math.abs(cand.ey) * 0.52
@@ -199,12 +234,7 @@ export class AutonomousLightningEngine {
         targetX = neighborCell.x + (this.rand() - 0.5) * neighborCell.radiusM * 0.6;
         targetZ = neighborCell.z + (this.rand() - 0.5) * neighborCell.radiusM * 0.6;
         targetY = Math.max(neighborCell.cloudBaseM + 900, initY + (this.rand() - 0.5) * 1800);
-      } else if (
-        // Ground-directed potential gradient exceeds intra-cloud sink when LPCC is moderate/displaced or positive anvil overhangs clear ground
-        (localPhi < -8.0 && cand.ey > 0 && lpccStrength < mainNegStrength * 0.52) ||
-        (localPhi > 9.0 && cand.ey < 0 && initY > sounding.instability.freezingLevel + 1800) ||
-        initY < sounding.instability.freezingLevel + 600
-      ) {
+      } else if (groundDirectedNegative || groundDirectedPositive || groundDirectedLow) {
         allowGroundStrike = true;
         // Bolt-from-the-Blue emerges naturally when initiated near upper/mid lateral boundary of sheared tower!
         const lateralDistFromCore = cell ? Math.hypot(initX - cell.x, initZ - cell.z) : 0;
@@ -496,7 +526,6 @@ export class AutonomousLightningEngine {
       target[2] - start[2]
     );
     const numMainSteps = Math.max(14, Math.min(48, Math.floor(totalDist / 240)));
-    const stepLen = totalDist / numMainSteps;
 
     let cx = start[0];
     let cy = start[1];
@@ -508,6 +537,15 @@ export class AutonomousLightningEngine {
       const remY = target[1] - cy;
       const remZ = target[2] - cz;
       const remDist = Math.max(1.0, Math.hypot(remX, remY, remZ));
+
+      // Step length is recomputed from the distance still to cover rather than fixed up front.
+      // With a constant stepLen the vertical advance per step is only ~0.8 * stepLen (the rest
+      // goes to the field-alignment and tortuosity terms), so a channel summed to roughly 80% of
+      // the distance it needed and undershot its target -- a leader aimed at the ground from the
+      // main negative layer at 6.7 km arrived short and never attached, which is the other half
+      // of why Negative CG (-CG) could not occur. Dividing the remainder by the steps left makes
+      // the march converge on the target exactly while keeping the same tortuosity.
+      const stepLen = remDist / Math.max(1, numMainSteps - s);
 
       // Blend target attraction with local 3D E-field alignment and realistic dielectric tortuosity
       const gx = grid.worldToGridX(cx);

@@ -196,7 +196,13 @@ export function App() {
       if (uiSyncAccum >= 0.16) {
         uiSyncAccum = 0;
         setTelemetry(coordinator.getTelemetrySnapshot());
-        audioRef.current?.setEnvironment(coordinator.config.surfaceWindSpeedMS, coordinator.observerRainMMHr);
+        audioRef.current?.setEnvironment(
+          coordinator.config.surfaceWindSpeedMS,
+          coordinator.observerRainMMHr,
+          coordinator.observerPrecipType,
+          coordinator.observerFrozenFraction,
+          coordinator.observerGustFactor
+        );
 
         // Publish the real render size so the HUD reports what is actually on screen rather
         // than the CSS size, which diverges as soon as the pixel-ratio slider moves.

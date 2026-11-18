@@ -320,6 +320,12 @@ export interface RenderQualitySettings {
   pixelRatioScale: number;
   /** Physically-based per-pixel camera motion blur, gathered along depth-derived motion vectors. */
   enableMotionBlur: boolean;
+  /**
+   * Multiplier on the motion-blur smear length, 0..3.5 (i.e. 0-350%). At 1.0 the gather spans
+   * the true frame-to-frame motion vector, which is the physically correct length; above that
+   * it exaggerates for a speed-ramp look, below it tightens toward a crisp frame.
+   */
+  motionBlurIntensity: number;
   /** Animate the sun through a full 24 h cycle instead of holding a fixed solar elevation. */
   enableDayNightCycle: boolean;
   /** Wall-clock seconds for one complete 24 h solar cycle. */

@@ -184,6 +184,20 @@ export class AtmosphericFluidGrid {
   public ez: Float32Array; // kV/m
   public flashIllum: Float32Array; // volumetric lightning flash glow [0..1]
 
+  /**
+   * Persistent surface water saturation, one value per ground column (nx x nz), in 0..1.
+   *
+   * This is the state that makes puddles a *consequence* of rainfall rather than a global
+   * decoration. It is fed only by precipitation reaching the lowest model levels, so virga that
+   * evaporates aloft never wets the ground, and it decays on a ~20 minute timescale so a shaft
+   * that has moved on leaves standing water behind it that slowly soaks away.
+   */
+  public readonly groundSat: Float32Array;
+  /** Saturation packed to R8 for GPU upload; the terrain shader reads it to place puddles. */
+  public readonly groundSatTex: Uint8Array;
+  /** True when groundSatTex changed since the last upload. */
+  public groundSatDirty = true;
+
   // Packed RGBA8 3D texture data uploaded to WebGL2 sampler3D
   public readonly volTexData: Uint8Array;
   /** True when volTexData changed since the last upload — the renderer skips clean frames. */
@@ -255,6 +269,8 @@ export class AtmosphericFluidGrid {
     this.flashIllum = new Float32Array(this.totalCells);
 
     this.volTexData = new Uint8Array(this.totalCells * 4);
+    this.groundSat = new Float32Array(nx * nz);
+    this.groundSatTex = new Uint8Array(nx * nz);
 
     // Condensate reaches full optical density near ~2.4 g/kg, precipitation near ~1.5 g/kg,
     // which are the observed values inside convective cores.
@@ -291,6 +307,9 @@ export class AtmosphericFluidGrid {
     this.ez.fill(0);
     this.flashIllum.fill(0);
     this.volTexData.fill(0);
+    this.groundSat.fill(0);
+    this.groundSatTex.fill(0);
+    this.groundSatDirty = true;
     this.maxDivergenceResidual = 0;
     this.maxCFL = 0;
     this.totalCondensateMassKg = 0;
@@ -560,7 +579,80 @@ export class AtmosphericFluidGrid {
     this.condBox = unionBox(advectCondBox, injectBox);
     this.condensateChanged = true;
 
+    // 7. Surface wetting from the rain actually reaching the ground this step.
+    this.stepGroundSaturation(this.condBox, stepDt);
+
     this.computeFlowDiagnostics(nextFlowBox, stepDt);
+  }
+
+  /**
+   * Accumulates surface water saturation from precipitation reaching the lowest model levels.
+   *
+   * Only the bottom two levels are sampled, deliberately: that is what separates rain that wets
+   * the ground from virga that evaporates on the way down. The balance is a first-order bucket —
+   * input proportional to near-surface mixing ratio, loss exponential on an infiltration plus
+   * evaporation timescale — which reaches saturation under a heavy core and drains over roughly
+   * twenty simulated minutes once the shaft moves away.
+   */
+  private stepGroundSaturation(box: ActiveBox, dt: number): void {
+    const nx = this.nx;
+    const nz = this.nz;
+    const slice = this.sliceStride;
+    if (this.ny < 3) return;
+    const stepDt = Math.min(dt, 60.0);
+    // Wetting gain per (g/kg) per second, and the drainage/evaporation time constant. Their
+    // product sets the equilibrium saturation a given rain rate holds: ~1.0 in a heavy core,
+    // ~0.27 in a light shower, so the map stays a gradient rather than a binary flag.
+    const gain = 4.5e-4 * stepDt;
+    const decay = Math.exp(-stepDt / 1200.0);
+
+    // Every column drains, rain box or not, so ground dries out behind a departing shaft.
+    // The packed byte has to be refreshed here too: the terrain shader reads the texture, not
+    // the float, so draining one without the other would leave puddles frozen at their peak.
+    const sat = this.groundSat;
+    const packedTex = this.groundSatTex;
+    for (let id = 0; id < sat.length; id++) {
+      const v = sat[id];
+      if (v <= 0) continue;
+      const drained = v * decay < 1e-4 ? 0 : v * decay;
+      sat[id] = drained;
+      const packed = (drained * 255.0) | 0;
+      if (packed !== packedTex[id]) {
+        packedTex[id] = packed;
+        this.groundSatDirty = true;
+      }
+    }
+
+    if (boxIsEmpty(box)) return;
+
+    // Lowest two levels: 500 m and 1000 m AGL on the 500 m grid. Note the layout is
+    // id = sliceStride*iz + nx*iy + ix, so the *level* offset is nx*iy and the *slice* offset
+    // is sliceStride*iz -- mixing those two strides up silently reads a completely different
+    // plane, which is exactly what the first version of this did.
+    const iyOff1 = nx * 1;
+    const iyOff2 = nx * 2;
+    const ixLo = Math.max(0, box.minIx);
+    const ixHi = Math.min(nx - 1, box.maxIx);
+    const izLo = Math.max(0, box.minIz);
+    const izHi = Math.min(nz - 1, box.maxIz);
+
+    for (let iz = izLo; iz <= izHi; iz++) {
+      const zOff = slice * iz;
+      const colBase = iz * nx;
+      for (let ix = ixLo; ix <= ixHi; ix++) {
+        const nearSurfaceQ =
+          this.qr[zOff + iyOff1 + ix] * 0.7 + this.qr[zOff + iyOff2 + ix] * 0.3;
+        if (nearSurfaceQ <= 0.004) continue;
+        const id = colBase + ix;
+        const next = Math.min(1.0, sat[id] + nearSurfaceQ * gain);
+        sat[id] = next;
+        const packed = (next * 255.0) | 0;
+        if (packed !== packedTex[id]) {
+          packedTex[id] = packed;
+          this.groundSatDirty = true;
+        }
+      }
+    }
   }
 
   /**
