@@ -446,6 +446,23 @@ export function App() {
               <span className="font-mono hidden md:inline">
                 |E| {telemetry.maxElectricFieldKVm.toFixed(0)} kV/m
               </span>
+              {/* Lightning rod: shows corona point-discharge and any strike it has taken. */}
+              {(telemetry.rodCorona > 0.02 || telemetry.rodInterceptions > 0) && (
+                <>
+                  <span className="text-slate-600 hidden md:inline">·</span>
+                  <span
+                    className={`font-mono hidden md:inline ${
+                      telemetry.rodInterceptions > 0 ? 'text-amber-300' : 'text-sky-300/80'
+                    }`}
+                    title="Grounded mast: corona point-discharge and intercepted strikes"
+                  >
+                    Rod{' '}
+                    {telemetry.rodInterceptions > 0
+                      ? `⚡${telemetry.rodInterceptions}`
+                      : `corona ${(telemetry.rodCorona * 100).toFixed(0)}%`}
+                  </span>
+                </>
+              )}
               <span className="text-slate-600 hidden lg:inline">·</span>
               <span className="text-slate-400 hidden lg:inline">
                 {mobileControls
@@ -453,6 +470,28 @@ export function App() {
                   : 'WASD / arrows · 120 km/h · drag to look · H hide UI'}
               </span>
             </div>
+
+            {/* Tornado warning pill: strongest active vortex, straight from the sim. */}
+            {telemetry.tornadoes.length > 0 && (() => {
+              const t = telemetry.tornadoes[0];
+              return (
+                <div className="pointer-events-none flex items-center gap-1.5 px-2.5 py-1 rounded bg-red-950/70 backdrop-blur-md border border-red-400/40 text-[10px] text-red-100">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+                  <span className="font-semibold tracking-wide">
+                    TORNADO EF{t.efScale}
+                  </span>
+                  <span className="font-mono text-red-200/85">
+                    {(t.windMS * 3.6).toFixed(0)} km/h · core {Math.round(t.radiusM)}m ·{' '}
+                    {(t.pressureDeficitPa / 100).toFixed(0)} hPa · {t.phase}
+                  </span>
+                  {telemetry.tornadoes.length > 1 && (
+                    <span className="font-mono text-red-300/70">
+                      +{telemetry.tornadoes.length - 1}
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Compact Latest Autonomous Discharge Pill (when Event Monitor drawer is closed) */}
             {!monitorOpen && latestEvent && (

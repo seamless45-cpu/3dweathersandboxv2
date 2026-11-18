@@ -14,6 +14,7 @@ const RAIN_STREAK_VERT = /* glsl */ `
   uniform float uActiveFraction;
   uniform float uStreakWidth;
   uniform float uStreakLength;
+  uniform float uPixelWorldAt1m;
 
   varying float vAlpha;
   varying vec2 vLocalUv;
@@ -44,11 +45,29 @@ const RAIN_STREAK_VERT = /* glsl */ `
 
     vec3 velDir = normalize(uFallVel);
     vec3 viewDir = normalize(uCameraPos - dropCenter);
-    vec3 side = normalize(cross(viewDir, velDir));
+    vec3 side = cross(viewDir, velDir);
+    // Looking straight along the fall direction makes that cross product vanish, and
+    // normalize(0) is NaN -- which propagates into gl_Position and silently drops the
+    // primitive. Fall back to any axis perpendicular to velDir in that case.
+    float sideLen2 = dot(side, side);
+    if (sideLen2 < 1e-8) {
+      vec3 ref = abs(velDir.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+      side = cross(ref, velDir);
+      sideLen2 = dot(side, side);
+    }
+    side = side * inversesqrt(max(sideLen2, 1e-8));
+
+    // Distance-compensated width. uStreakWidth is a physical size (~1.5 cm for rain), which at
+    // 20 m subtends well under a pixel, so the whole curtain of rain rasterised away to nothing.
+    // Clamp to a minimum angular width instead: real rain looks like fine streaks at any range,
+    // and keeping them at least ~1.7 px wide is what makes them read as droplets rather than as
+    // a faint grey haze.
+    float minWorld = uPixelWorldAt1m * dist * 1.7;
+    float halfWidth = max(uStreakWidth * aDropScale, minWorld) * 0.5;
 
     vec3 worldPt = dropCenter
       + velDir * (aCornerY - 0.5) * uStreakLength * aDropScale
-      + side * (aCornerX * uStreakWidth * aDropScale);
+      + side * (aCornerX * halfWidth * 2.0);
 
     vAlpha = 1.0 - smoothstep(boxSpan * 0.32, boxSpan * 0.49, dist);
     vLocalUv = vec2(aCornerX * 0.5 + 0.5, aCornerY);
@@ -259,6 +278,11 @@ export class NearFieldPrecipitationRenderer {
       fragmentShader: RAIN_STREAK_FRAG,
       transparent: true,
       depthWrite: false,
+      // Camera-facing quads built from side = cross(viewDir, velDir). The geometric normal of
+      // that quad works out to velDir*(viewDir.velDir) - viewDir, whose -viewDir term dominates,
+      // so the winding is BACK-facing for most drops and the default FrontSide culling threw
+      // essentially all of them away. Billboards of this construction must be double-sided.
+      side: THREE.DoubleSide,
       uniforms: {
         uTime: { value: 0 },
         uCameraPos: { value: new THREE.Vector3() },
@@ -272,6 +296,8 @@ export class NearFieldPrecipitationRenderer {
         uLightColor: { value: new THREE.Color(1.0, 0.97, 0.92) },
         uHazeColor: { value: new THREE.Color(0.42, 0.47, 0.53) },
         uFrozenShare: { value: 0 },
+        // World size of one pixel at 1 m distance, used to keep far drops above a pixel wide.
+        uPixelWorldAt1m: { value: 0.001 },
       },
     });
 
@@ -283,6 +309,8 @@ export class NearFieldPrecipitationRenderer {
       fragmentShader: SPLASH_FRAG,
       transparent: true,
       depthWrite: false,
+      // Horizontal ground planes: from below the observer they are back-facing too.
+      side: THREE.DoubleSide,
       uniforms: {
         uTime: { value: 0 },
         uObserverGround: { value: new THREE.Vector3() },
@@ -380,6 +408,10 @@ export class NearFieldPrecipitationRenderer {
     hazeColor?: THREE.Color;
     /** 0..1 daylight, used to pull the haze colour toward night. */
     daylight?: number;
+    /** Vertical field of view in degrees, for the distance-compensated streak width. */
+    fovDeg?: number;
+    /** Render target height in device pixels, for the same. */
+    renderHeightPx?: number;
   }): void {
     // Perceived density saturates well below a torrential core rate, so use a compressive
     // curve: a 10 mm/h shower already fills the view, and 150 mm/h reads as a solid curtain.
@@ -400,6 +432,12 @@ export class NearFieldPrecipitationRenderer {
       u.uActiveFraction.value = Math.pow(active, 0.6);
       u.uLightningBoost.value = params.lightningFlash;
       u.uFrozenShare.value = frozen;
+
+      // World size of one pixel at 1 m from the camera: 2*tan(fov/2) / heightPx. The streak
+      // width clamp in the vertex shader multiplies it by the drop distance.
+      const fov = params.fovDeg ?? 60;
+      const hPx = Math.max(1, params.renderHeightPx ?? 1080);
+      u.uPixelWorldAt1m.value = (2.0 * Math.tan((fov * Math.PI) / 360.0)) / hPx;
 
       // Water optics need a light. Fall back to a high sun if the scene does not supply one so
       // the material is never left shading against a zero vector.

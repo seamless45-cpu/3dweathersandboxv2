@@ -1,5 +1,10 @@
-import { AtmosphericElectrificationEngine, BreakdownCandidate } from './electrification';
+import {
+  AtmosphericElectrificationEngine,
+  BreakdownCandidate,
+  breakdownThresholdKVm,
+} from './electrification';
 import { AtmosphericFluidGrid } from './fluidGrid';
+import { LightningRod } from './lightningRod';
 import { getTerrainHeight } from './terrainField';
 import { AtmosphericSounding } from './thermodynamics';
 import {
@@ -25,6 +30,16 @@ export class AutonomousLightningEngine {
   private nextTLENum = 1;
   private rngState = 987654321;
   private jetCooldownByCell = new Map<string, number>();
+  /** Grounded rod, when the coordinator supplies one, so discharges can be intercepted. */
+  private rod: LightningRod | null = null;
+  private rodSimTime = 0;
+  /** Flashes whose descending leader terminated on the rod rather than on open ground. */
+  public rodInterceptedFlashes = 0;
+  /** Discharges whose attachment point the rod bent toward itself, including full captures. */
+  public rodAttractions = 0;
+  /** Upward flashes the rod initiated itself, without an incoming descending leader. */
+  public rodUpwardFlashes = 0;
+  private lastRodUpwardLeaders = 0;
 
   private rand(): number {
     let x = this.rngState;
@@ -44,6 +59,10 @@ export class AutonomousLightningEngine {
     this.nextFlashNum = 1;
     this.nextTLENum = 1;
     this.rngState = 987654321;
+    this.lastRodUpwardLeaders = 0;
+    this.rodAttractions = 0;
+    this.rodInterceptedFlashes = 0;
+    this.rodUpwardFlashes = 0;
     this.jetCooldownByCell.clear();
   }
 
@@ -60,8 +79,13 @@ export class AutonomousLightningEngine {
     grid: AtmosphericFluidGrid,
     sounding: AtmosphericSounding,
     cells: ConvectiveCell[],
-    elec: AtmosphericElectrificationEngine
+    elec: AtmosphericElectrificationEngine,
+    rod: LightningRod | null = null,
+    simTimeForRod = 0
   ): void {
+    this.rod = rod;
+    this.rodSimTime = simTimeForRod;
+
     // 1. Advance active lightning discharge temporal phases (in real visual milliseconds so flashes look authentic at any sim speed!)
     this.updateActiveDischarges(realDtMs, simTimeSec, grid);
 
@@ -87,8 +111,94 @@ export class AutonomousLightningEngine {
       }
     }
 
+    // 3b. Rod-triggered upward lightning.
+    // Tall grounded structures do not merely wait to be struck: once the enhanced tip field
+    // passes corona onset the mast launches its own upward leader, and if that leader finds a
+    // charge centre overhead it completes a full discharge. This is the dominant flash mechanism
+    // for tall towers and is why the rod is an active participant in the storm rather than a
+    // passive ornament that only matters on the rare overhead strike.
+    if (this.rod && this.rod.upwardLeaders > this.lastRodUpwardLeaders) {
+      this.lastRodUpwardLeaders = this.rod.upwardLeaders;
+      this.tryInitiateRodUpwardDischarge(grid, sounding, cells, elec, simTimeSec);
+    } else if (this.rod) {
+      this.lastRodUpwardLeaders = this.rod.upwardLeaders;
+    }
+
     // 4. Evaluate Autonomous Cloud-Top Stratospheric Breakdown (Blue Jets & Gigantic Jets)
     this.evaluateCloudTopJets(simDtSec, simTimeSec, cells, elec);
+  }
+
+  /**
+   * Attempts to complete an upward discharge from the rod into a charge centre overhead.
+   *
+   * The upward leader only connects if there is genuinely charge to connect to: a cell close
+   * enough horizontally that its charge centre is within the leader's propagation distance, and
+   * carrying enough charge to sustain the channel. Without that the leader just corona-discharges
+   * and dies, which is what happens most of the time and is counted separately by the rod.
+   */
+  private tryInitiateRodUpwardDischarge(
+    grid: AtmosphericFluidGrid,
+    sounding: AtmosphericSounding,
+    cells: ConvectiveCell[],
+    elec: AtmosphericElectrificationEngine,
+    simTimeSec: number
+  ): void {
+    const rod = this.rod;
+    if (!rod || this.activeDischarges.length >= 5) return;
+
+    // Nearest cell whose charge centre the leader can actually reach. An upward leader from a
+    // ~170 m mast propagates on the order of a kilometre or two before it either connects or
+    // stalls, so a cell several kilometres off to the side will not be tapped.
+    let best: ConvectiveCell | null = null;
+    let bestDist = Infinity;
+    for (const cell of cells) {
+      if (cell.stage === 'nucleating') continue;
+      const horiz = Math.hypot(cell.x - rod.x, cell.z - rod.z);
+      // Reach grows with the cell's own footprint: a wide, close cell base is easier to connect to.
+      const reach = 2600 + cell.radiusM * 0.55;
+      if (horiz > reach) continue;
+      const charge = Math.max(
+        Math.abs(cell.mainNegChargeNCm3),
+        Math.abs(cell.lowerPosChargeNCm3),
+        Math.abs(cell.upperPosChargeNCm3) * 0.7
+      );
+      // Needs real charge overhead, not a dissipating remnant.
+      if (charge < 0.55) continue;
+      if (horiz < bestDist) {
+        bestDist = horiz;
+        best = cell;
+      }
+    }
+    if (!best) return;
+
+    const ix = Math.max(1, Math.min(grid.nx - 2, grid.worldToGridX(rod.x)));
+    const iy = Math.max(1, Math.min(grid.ny - 2, grid.worldToGridY(rod.tipY)));
+    const iz = Math.max(1, Math.min(grid.nz - 2, grid.worldToGridZ(rod.z)));
+    const id = grid.idx(ix, iy, iz);
+    const eMag = Math.hypot(grid.ex[id], grid.ey[id], grid.ez[id]);
+    // Same density-scaled threshold the field sweep uses, recomputed here because the engine's
+    // per-level table is private to it.
+    const thresh = breakdownThresholdKVm(sounding.densityAt(grid.gridToWorldY(iy)));
+
+    const cand: BreakdownCandidate = {
+      ix,
+      iy,
+      iz,
+      x: rod.x,
+      y: rod.tipY,
+      z: rod.z,
+      eMagKVm: eMag,
+      eThresholdKVm: thresh,
+      ratio: eMag / Math.max(1, thresh),
+      ex: grid.ex[id],
+      ey: grid.ey[id],
+      ez: grid.ez[id],
+      localRhoQ: grid.rhoQ[id],
+      nearestCell: best,
+    };
+
+    this.rodUpwardFlashes++;
+    this.initiateAutonomousDischarge(cand, simTimeSec, grid, sounding, cells, elec, true);
   }
 
   private initiateAutonomousDischarge(
@@ -97,7 +207,8 @@ export class AutonomousLightningEngine {
     grid: AtmosphericFluidGrid,
     sounding: AtmosphericSounding,
     cells: ConvectiveCell[],
-    elec: AtmosphericElectrificationEngine
+    elec: AtmosphericElectrificationEngine,
+    rodUpward = false
   ): void {
     const cell = cand.nearestCell;
     const initX = cand.x;
@@ -112,12 +223,15 @@ export class AutonomousLightningEngine {
     const terrainYBelow = getTerrainHeight(initX, initZ);
 
     // Check elevated terrain upward-initiated condition vs cloud-initiated condition
+    // A rod-initiated upward flash follows the same physics as one off an elevated terrain
+    // ridge: the leader starts at a grounded conductor and propagates up into cloud charge.
     const isElevatedTerrainUpward =
-      terrainYBelow > 135 &&
+      rodUpward ||
+      (terrainYBelow > 135 &&
       initY < terrainYBelow + 1400 &&
       Math.abs(cand.ey) > 95 &&
       cell !== null &&
-      cell.anvilRadiusM > 3200;
+      cell.anvilRadiusM > 3200);
 
     const segments: LightningSegment[] = [];
     let branchCount = 0;
@@ -130,8 +244,9 @@ export class AutonomousLightningEngine {
     let hitGround = false;
 
     if (isElevatedTerrainUpward && cell) {
-      // Upward leader initiating from tall terrain ridge into charged cloud base/anvil!
-      const startGroundY = terrainYBelow;
+      // Upward leader initiating from a grounded conductor -- tall terrain ridge, or the rod --
+      // propagating up into the charged cloud base or anvil.
+      const startGroundY = rodUpward && this.rod ? this.rod.tipY : terrainYBelow;
       const targetY = Math.min(cell.cloudTopM - 800, sounding.instability.freezingLevel + 2400);
       const targetX = cell.x + (this.rand() - 0.5) * cell.radiusM * 1.2;
       const targetZ = cell.z + (this.rand() - 0.5) * cell.radiusM * 1.2;
@@ -174,6 +289,7 @@ export class AutonomousLightningEngine {
       let targetZ = initZ;
       let allowGroundStrike = false;
       let isAnvilHorizontal = false;
+      let interceptedByRod = false;
 
       // Ground-directed potential gradient, evaluated FIRST. The intra-cloud sinks below are
       // only reached when this does not hold, which is what "exceeds intra-cloud sink" means --
@@ -259,7 +375,29 @@ export class AutonomousLightningEngine {
         }
         targetX = Math.max(-DOMAIN_HALF_SIZE + 800, Math.min(DOMAIN_HALF_SIZE - 800, targetX));
         targetZ = Math.max(-DOMAIN_HALF_SIZE + 800, Math.min(DOMAIN_HALF_SIZE - 800, targetZ));
-        targetY = getTerrainHeight(targetX, targetZ);
+
+        // ---- Rod attraction ------------------------------------------------------------
+        // On this terrain the mast is by far the most elevated grounded conductor for
+        // kilometres, so it wins the attachment point whenever the leader is committed anywhere
+        // in its neighbourhood. The pull is partial and falls off with distance, so far strokes
+        // are barely deflected while near ones terminate on the rod outright. A nominal 30 kA
+        // first-stroke current sets the electro-geometric scale.
+        if (this.rod) {
+          const steered = this.rod.steerGroundTarget(targetX, targetZ, 30.0);
+          const moved = Math.hypot(steered.x - targetX, steered.z - targetZ) > 1.0;
+          targetX = Math.max(-DOMAIN_HALF_SIZE + 800, Math.min(DOMAIN_HALF_SIZE - 800, steered.x));
+          targetZ = Math.max(-DOMAIN_HALF_SIZE + 800, Math.min(DOMAIN_HALF_SIZE - 800, steered.z));
+          if (steered.captured) {
+            // Aimed exactly at the tip: the march ends on the mast, not on the ground beside it.
+            targetX = this.rod.x;
+            targetZ = this.rod.z;
+            interceptedByRod = true;
+          }
+          if (moved || interceptedByRod) this.rodAttractions++;
+        }
+        targetY = interceptedByRod && this.rod
+          ? this.rod.tipY
+          : getTerrainHeight(targetX, targetZ);
       } else {
         // Intracloud or Cloud-to-Air discharge governed by dipole/tripole charge centers
         if (cell) {
@@ -289,8 +427,14 @@ export class AutonomousLightningEngine {
         [targetX, targetY, targetZ],
         grid,
         false,
-        isAnvilHorizontal
+        isAnvilHorizontal,
+        allowGroundStrike,
+        interceptedByRod
       );
+      if (res.rodAttached) {
+        interceptedByRod = true;
+        this.rod!.markIntercept(this.rodSimTime);
+      }
       segments.push(...res.segments);
       branchCount = res.branchCount;
       termX = res.endPoint[0];
@@ -298,22 +442,30 @@ export class AutonomousLightningEngine {
       termZ = res.endPoint[2];
 
       const groundAtTerm = getTerrainHeight(termX, termZ);
-      if (allowGroundStrike && termY <= groundAtTerm + 240) {
+      // A rod interception terminates at the mast tip, which sits heightM above the terrain, so
+      // allow the attachment test to reach up the mast rather than only to the bare ground.
+      const attachReach = interceptedByRod && this.rod ? this.rod.heightM + 240 : 240;
+      if (allowGroundStrike && termY <= groundAtTerm + attachReach) {
         hitGround = true;
-        // Add Upward Connecting Leader rising from highest nearby terrain point to meet downward stepped leader!
+        if (interceptedByRod) this.rodInterceptedFlashes++;
+        // Upward connecting leader rising to meet the downward stepped leader. On a rod
+        // interception this segment *is* the mast, so it is drawn straight and heavy instead of
+        // jittered -- a solid grounded conductor, not a branching plasma channel.
         const connectY = termY;
+        const straight = interceptedByRod ? 0.0 : 35.0;
         segments.push({
           x1: termX,
           y1: groundAtTerm,
           z1: termZ,
-          x2: termX + (this.rand() - 0.5) * 35,
+          x2: termX + (this.rand() - 0.5) * straight,
           y2: connectY,
-          z2: termZ + (this.rand() - 0.5) * 35,
+          z2: termZ + (this.rand() - 0.5) * straight,
           generation: 0,
-          radiusWeight: 1.0,
+          radiusWeight: interceptedByRod ? 1.85 : 1.0,
           progressOrder: 0.99,
         });
-        termY = groundAtTerm;
+        // A rod interception ends at the tip; only bare-ground attachment collapses to terrain.
+        termY = interceptedByRod && this.rod ? this.rod.tipY : groundAtTerm;
       }
     }
 
@@ -511,12 +663,22 @@ export class AutonomousLightningEngine {
     target: [number, number, number],
     grid: AtmosphericFluidGrid,
     upwardBranching: boolean,
-    horizontalSpider: boolean
+    horizontalSpider: boolean,
+    groundDirected = false,
+    rodPreAimed = false
   ): {
     segments: LightningSegment[];
     branchCount: number;
     endPoint: [number, number, number];
+    /** True when the march was met by the rod's upward connecting leader. */
+    rodAttached: boolean;
   } {
+    // Rod interception is a 3D test, not a plan-view one: an upward connecting leader meets a
+    // descending channel that passes within its reach of the mast tip, wherever that channel's
+    // eventual ground target happened to be. Only meaningful for a ground-directed discharge.
+    const rodTest = groundDirected && this.rod !== null && !rodPreAimed;
+    const rodReach = rodTest ? this.rod!.connectingLeaderReachM() : 0;
+    let rodAttached = false;
     const segments: LightningSegment[] = [];
     let branchCount = 0;
 
@@ -559,7 +721,8 @@ export class AutonomousLightningEngine {
       const eSign = remY * ey + remX * ex + remZ * ez >= 0 ? 1.0 : -1.0;
 
       const jitterAmp = (1.0 - progress * 0.55) * stepLen * 0.58;
-      const nx =
+      // nx / nz are `let` because a rod interception redirects the march onto the mast tip.
+      let nx =
         cx +
         ((remX / remDist) * 0.76 + (eSign * ex / eMag) * 0.24) * stepLen +
         (this.rand() - 0.5) * jitterAmp * 2.0;
@@ -567,13 +730,38 @@ export class AutonomousLightningEngine {
         cy +
         ((remY / remDist) * 0.8 + (eSign * ey / eMag) * 0.2) * stepLen +
         (this.rand() - 0.5) * jitterAmp * (horizontalSpider ? 0.55 : 1.1);
-      const nz =
+      let nz =
         cz +
         ((remZ / remDist) * 0.76 + (eSign * ez / eMag) * 0.24) * stepLen +
         (this.rand() - 0.5) * jitterAmp * 2.0;
 
+      // Upward connecting leader from the mast meets the descending tip.
+      if (rodTest && !rodAttached) {
+        const rdx = nx - this.rod!.x;
+        const rdy = ny - this.rod!.tipY;
+        const rdz = nz - this.rod!.z;
+        if (Math.hypot(rdx, rdy, rdz) <= rodReach) {
+          rodAttached = true;
+          nx = this.rod!.x;
+          ny = this.rod!.tipY;
+          nz = this.rod!.z;
+          // Add the mast itself as a straight heavy segment from ground to tip.
+          segments.push({
+            x1: this.rod!.x,
+            y1: this.rod!.groundY,
+            z1: this.rod!.z,
+            x2: this.rod!.x,
+            y2: this.rod!.tipY,
+            z2: this.rod!.z,
+            generation: 0,
+            radiusWeight: 1.85,
+            progressOrder: 0.985,
+          });
+        }
+      }
+
       const groundH = getTerrainHeight(nx, nz);
-      if (!upwardBranching && ny < groundH) {
+      if (!upwardBranching && ny < groundH && !rodAttached) {
         ny = groundH;
       }
 
@@ -613,6 +801,7 @@ export class AutonomousLightningEngine {
       cx = nx;
       cy = ny;
       cz = nz;
+      if (rodAttached) break;
       if (!upwardBranching && cy <= groundH + 5) break;
     }
 
@@ -620,6 +809,7 @@ export class AutonomousLightningEngine {
       segments,
       branchCount,
       endPoint: [cx, cy, cz],
+      rodAttached,
     };
   }
 

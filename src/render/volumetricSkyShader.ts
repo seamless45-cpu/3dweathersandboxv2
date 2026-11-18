@@ -143,17 +143,21 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
   vec4 sampleAtmosphereVolume(vec3 wp, float distKm, float cheap) {
     vec3 uvw = worldToVolumeUVW(wp);
     if (
-      uvw.x <= 0.005 || uvw.x >= 0.995 ||
+      uvw.x <= 0.002 || uvw.x >= 0.998 ||
       uvw.y <= 0.002 || uvw.y >= 0.995 ||
-      uvw.z <= 0.005 || uvw.z >= 0.995
+      uvw.z <= 0.002 || uvw.z >= 0.998
     ) {
       return vec4(0.0);
     }
 
-    // Softly fade outermost 5% of the domain boundary to avoid visible box edges
+    // Dissolve the outer 16% of the domain horizontally. The simulated atmosphere is a finite
+    // box and the ground now runs to the horizon beyond it, so a 5% fade was not enough: the
+    // cloud field ended in a visible vertical wall, which is the "bounding geometry" the box
+    // read as from the ground. A 16% taper (~7.7 km on a 48 km domain) makes the cloud deck
+    // thin out gradually the way a real deck thins toward the horizon instead of being cut.
     float edgeFade =
-      smoothstep(0.005, 0.055, uvw.x) * smoothstep(0.995, 0.945, uvw.x) *
-      smoothstep(0.005, 0.055, uvw.z) * smoothstep(0.995, 0.945, uvw.z);
+      smoothstep(0.002, 0.16, uvw.x) * smoothstep(0.998, 0.84, uvw.x) *
+      smoothstep(0.002, 0.16, uvw.z) * smoothstep(0.998, 0.84, uvw.z);
 
     vec4 raw = texture(uVolTex, uvw);
     raw.rg *= edgeFade;
@@ -184,23 +188,87 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       // Erode outer cloud margins while keeping deep convective cores solid and voluminous.
       float erosionStrength = mix(0.58, 0.34, iceFrac) * uTurbulence * (1.0 - baseCloud * 0.62);
 
+      // ---- Cloud genus ------------------------------------------------------------------
+      // The ten WMO genera are defined by exactly two things: which etage the cloud sits in
+      // and what phase/form it has. Both are already available per sample -- altitude from
+      // wp.y and phase from iceFrac -- so one density field can render as cirrus filaments,
+      // altocumulus cells, stratocumulus rolls or cumulus cauliflower without the simulation
+      // having to label anything. Weights are smoothstep-blended so there is no hard seam at
+      // an etage boundary.
+      float hKm = wp.y * 0.001;
+      float wHigh = smoothstep(6.4, 9.4, hKm);
+      float wLow = 1.0 - smoothstep(1.3, 3.5, hKm);
+      float wMid = clamp(1.0 - wHigh - wLow, 0.0, 1.0);
+
+      // Deep, dense cloud is convective whatever its altitude; thin cloud takes its etage's
+      // genus. This single weight is what separates a cumulonimbus tower from a stratus deck
+      // occupying the same density range.
+      float convWeight = smoothstep(0.28, 0.70, baseCloud);
+
+      // Wind-aligned axis, for undulatus roll banding. Guarded: uWindOffset starts at zero.
+      vec2 wd = uWindOffset.xz;
+      float wdLen = length(wd);
+      wd = wdLen > 1.0 ? wd * (1.0 / wdLen) : vec2(1.0, 0.0);
+      float alongWind = detPos.x * wd.x + detPos.z * wd.y;
+
       float structureNoise;
       if (cheap > 0.5) {
         // Deep interior or beyond detail range: one smooth octave.
         structureNoise = noise3D(detPos * 2.2) * 0.62 + 0.34;
       } else if (iceFrac > 0.55) {
-        // Glaciated Cb capillatus anvil: ice filaments stretched 4.7x vertically and
-        // 0.62x horizontally read as wind-sheared cirrusiform striations.
-        vec3 anvilCoord = vec3(detPos.x * 0.62, detPos.y * 2.9, detPos.z * 0.62);
+        // ---- Ice genera: cirrus / cirrostratus / Cb capillatus anvil --------------------
+        // Vertically compressed coordinates give the wind-sheared horizontal striation that
+        // reads as ice. Thin high cirrus gets finer, hook-like filaments and more erosion;
+        // a dense glaciated anvil gets coarser, more solid striation.
+        float cirrusness = smoothstep(8.0, 11.5, hKm) * (1.0 - convWeight * 0.65);
+        vec3 anvilCoord = vec3(
+          detPos.x * mix(0.62, 0.34, cirrusness),
+          detPos.y * mix(2.9, 5.6, cirrusness),
+          detPos.z * mix(0.62, 0.34, cirrusness)
+        );
         float fibrous = noise3D(anvilCoord * 2.1) * 0.68 + noise3D(anvilCoord * 5.1) * 0.32;
         structureNoise = fibrous * 0.74 + noise3D(detPos * 1.55) * 0.26;
-      } else if (lodFade > 0.42 && baseCloud < 0.74) {
-        // Liquid cumulus / congestus turret: bulbous Worley cells plus one detail octave.
-        float billow = worleyBillow3D(detPos * 1.15);
-        structureNoise = billow * 0.66 + noise3D(detPos * 2.45) * 0.30;
+        // Wispy hook streaks along the wind, only for genuine high cirrus.
+        structureNoise += (noise3D(vec3(alongWind * 3.4, detPos.y * 7.5, detPos.z * 0.8)) - 0.5)
+          * 0.30 * cirrusness;
+        erosionStrength *= 1.0 + cirrusness * 0.85;
+      } else if (lodFade > 0.42 && baseCloud < 0.78) {
+        // ---- Liquid genera, one Worley call with genus-selected coordinates -------------
+        // Cost note: worleyBillow3D is 27 hash13 taps, by far the dominant term in this
+        // shader, so exactly one call is made per sample and the genus is expressed by
+        // *where* it is sampled plus two cheap noise3D octaves. Flattening the vertical
+        // coordinate turns the same cellular field into pancakes (altocumulus,
+        // stratocumulus); leaving it isotropic gives cumulus cauliflower. Total stays at
+        // the 43 hashes the previous cumulus branch cost.
+        // NB: deliberately not named "flat" -- that is a reserved interpolation qualifier in
+        // GLSL ES 3.00 and the driver rejects the declaration.
+        float flattenAmt = clamp(wLow * 0.62 + wMid * 0.50, 0.0, 0.72) * (1.0 - convWeight);
+        float cellScale = mix(1.15, 1.75, flattenAmt);
+        vec3 billowCoord = vec3(
+          detPos.x * cellScale,
+          detPos.y * cellScale * (1.0 - flattenAmt * 0.88),
+          detPos.z * cellScale
+        );
+        float billow = worleyBillow3D(billowCoord);
+
+        // Detail octave; sharpened into small turrets (castellanus) at mid level.
+        float detail = noise3D(detPos * vec3(2.45, mix(2.45, 4.6, wMid), 2.45));
+
+        // Undulatus: sinusoidal rolls aligned to the wind, weighted to the low etage where
+        // stratocumulus and altocumulus billow fields actually organise into bands.
+        float rollBand = 0.5 + 0.5 * sin(alongWind * 2.85 + noise3D(detPos * 0.85) * 2.4);
+        float rollWeight = wLow * 0.55 + wMid * 0.22;
+        rollWeight *= 1.0 - convWeight;
+
+        structureNoise = billow * 0.62 + detail * 0.26;
+        structureNoise = mix(structureNoise, structureNoise * 0.42 + rollBand * 0.58, rollWeight * 0.72);
+
         if (lodFade > 0.72) {
           structureNoise += (noise3D(detPos * 5.3 - vec3(0.0, uTime * 0.04, 0.0)) - 0.5) * 0.13 * lodFade;
         }
+
+        // Layer cloud shreds at its margins; convective cores stay solid.
+        erosionStrength *= mix(1.0, 1.38, rollWeight) * mix(1.0, 0.62, convWeight);
       } else {
         // Deep core or distant cloud: erosion is already suppressed here, so a single smooth
         // octave is indistinguishable from the full stack at a fraction of the cost.

@@ -41,7 +41,10 @@ export class ObserverCameraController {
   private domElement: HTMLElement | null = null;
 
   constructor(aspect: number) {
-    this.camera = new THREE.PerspectiveCamera(DEFAULT_FOV, aspect, 0.35, 95000);
+    // Far plane raised to enclose the horizon-distance terrain (200 km half-extent) and the
+    // 300 km sky dome. With a 0.35 m near plane the depth precision is dominated by near, not
+    // far, so this extension is effectively free.
+    this.camera = new THREE.PerspectiveCamera(DEFAULT_FOV, aspect, 0.35, 420000);
     this.resetToGroundObserver();
   }
 

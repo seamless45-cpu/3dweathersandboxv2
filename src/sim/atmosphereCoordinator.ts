@@ -1,7 +1,13 @@
 import { ConvectiveCellManager } from './convectiveCells';
-import { AtmosphericElectrificationEngine, BreakdownCandidate } from './electrification';
+import {
+  AtmosphericElectrificationEngine,
+  BreakdownCandidate,
+  breakdownThresholdKVm,
+} from './electrification';
 import { AtmosphericFluidGrid, GRID_NX, GRID_NY, GRID_NZ } from './fluidGrid';
 import { AutonomousLightningEngine } from './lightningEngine';
+import { LightningRod } from './lightningRod';
+import { TornadoEngine } from './tornado';
 import { AtmosphericSounding, DEFAULT_ATMOSPHERE_CONFIG } from './thermodynamics';
 import {
   AtmosphereConfig,
@@ -58,6 +64,14 @@ export class AtmosphereSimulationCoordinator {
   public grid: AtmosphericFluidGrid;
   public electrification: AtmosphericElectrificationEngine;
   public lightning: AutonomousLightningEngine;
+  /**
+   * Grounded mast standing in the observer's meadow. It enhances the local field, bleeds charge
+   * by corona point-discharge, and intercepts descending leaders that come inside its
+   * electro-geometric attractive radius.
+   */
+  public readonly lightningRod: LightningRod;
+  /** Tornadic vortices spun up by supercell mesocyclones, coupled into the resolved flow. */
+  public readonly tornadoes: TornadoEngine;
 
   public simTimeSec = 0;
   public surfaceWetness = 0; // 0..1 ground wetness & puddle state around observer
@@ -97,6 +111,10 @@ export class AtmosphereSimulationCoordinator {
     this.grid = new AtmosphericFluidGrid(GRID_NX, GRID_NY, GRID_NZ);
     this.electrification = new AtmosphericElectrificationEngine();
     this.lightning = new AutonomousLightningEngine();
+    // Placed just off the observer's starting meadow so it is in view from the default camera
+    // and so the strikes the observer actually sees are the ones within its capture radius.
+    this.lightningRod = new LightningRod(-320, 4880, 168);
+    this.tornadoes = new TornadoEngine();
     this.computeBaselineVaporMass();
   }
 
@@ -142,6 +160,8 @@ export class AtmosphereSimulationCoordinator {
     this.grid.reset();
     this.electrification.reset();
     this.lightning.reset();
+    this.lightningRod.reset();
+    this.tornadoes.reset();
     this.computeBaselineVaporMass();
   }
 
@@ -239,6 +259,18 @@ export class AtmosphereSimulationCoordinator {
       this.electrification.step(totalSimDt, this.grid, this.sounding, this.cellManager.cells, this.config, false);
     }
 
+    // --- Lightning rod: corona point-discharge, upward leaders, strike interception --------
+    // Stepped after the field solve so it reads the freshly solved |E|, and before the
+    // discharge engine so the charge it bleeds and the leaders it launches are already in
+    // place when a descending leader is routed this step.
+    this.lightningRod.step(
+      this.grid,
+      this.sounding.densityAt(this.lightningRod.tipY),
+      breakdownThresholdKVm(this.sounding.densityAt(this.lightningRod.tipY)),
+      totalSimDt,
+      this.simTimeSec
+    );
+
     // --- Autonomous dielectric breakdown lightning & TLEs (real-time millisecond phases) ---
     this.lightning.step(
       totalSimDt,
@@ -248,8 +280,15 @@ export class AtmosphereSimulationCoordinator {
       this.grid,
       this.sounding,
       this.cellManager.cells,
-      this.electrification
+      this.electrification,
+      this.lightningRod,
+      this.simTimeSec
     );
+
+    // --- Tornadogenesis from supercell mesocyclones ---------------------------------------
+    // Stepped after the fluid solve so the vortex is written into a flow field that has already
+    // been projected this step, and will be re-projected against the environment next step.
+    this.tornadoes.step(totalSimDt, this.cellManager.cells, this.grid);
 
     this.updateObserverGroundEnvironment(totalSimDt, clampedRealDt, observerX, observerZ);
   }
@@ -452,6 +491,24 @@ export class AtmosphereSimulationCoordinator {
       maxNegChargeNCm3: this.electrification.maxNegChargeNCm3,
       totalFlashes: this.lightning.totalFlashes,
       totalTLEs: this.lightning.totalTLEs,
+      rodCorona: this.lightningRod.coronaIntensity,
+      rodInterceptions: this.lightningRod.interceptedStrikes,
+      rodUpwardLeaders: this.lightningRod.upwardLeaders,
+      tornadoes: this.tornadoes.active
+        .map((t) => ({
+          id: t.id,
+          x: t.x,
+          z: t.z,
+          windMS: t.maxTangentialMS,
+          efScale: t.efScale,
+          radiusM: t.radiusM,
+          pressureDeficitPa: t.pressureDeficitPa,
+          funnelDrop: t.funnelDrop,
+          cloudBaseM: t.cloudBaseM,
+          ageSec: t.ageSec,
+          phase: t.phase,
+        }))
+        .sort((a, b) => b.windMS - a.windMS),
       cells: cells.map((c) => ({ ...c })),
       events: this.lightning.eventHistory.slice(0, 35),
       validation: {

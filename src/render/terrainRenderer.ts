@@ -210,7 +210,10 @@ const TERRAIN_FRAG = /* glsl */ `
       vec3(0.75, 0.82, 0.98),
       clamp(boltAtten * 0.35, 0.0, 0.65)
     );
-    col = mix(col, horizonHazeColor, clamp(fogFactor, 0.0, 0.96));
+    // Clamped to 1.0 rather than 0.96 so distant ground dissolves completely into the horizon
+    // haze colour. The old 0.96 cap left 4% of the surface showing, which is what made the far
+    // edge of the terrain read as a hard line against the sky.
+    col = mix(col, horizonHazeColor, clamp(fogFactor, 0.0, 1.0));
 
     fragColor = vec4(col, 1.0);
   }
@@ -279,6 +282,13 @@ const GRASS_FRAG = /* glsl */ `
   }
 `;
 
+/**
+ * Half-extent of the rendered ground. Far larger than the simulated domain: the terrain is an
+ * unbounded procedural surface, so it can be drawn out to the horizon even though the fluid
+ * solve only covers DOMAIN_SIZE. Sized against the camera far plane.
+ */
+const TERRAIN_HALF_EXTENT = 200000;
+
 export class GroundEnvironmentRenderer {
   public terrainMesh: THREE.Mesh;
   public grassMesh: THREE.Mesh;
@@ -286,18 +296,7 @@ export class GroundEnvironmentRenderer {
   private grassMat: THREE.ShaderMaterial;
 
   constructor(volTexture: THREE.Data3DTexture, groundSatTexture: THREE.DataTexture) {
-    // High-resolution terrain grid (200 x 200 vertices across 32km x 32km)
-    const segs = 196;
-    const geom = new THREE.PlaneGeometry(DOMAIN_SIZE, DOMAIN_SIZE, segs, segs);
-    geom.rotateX(-Math.PI / 2);
-
-    const posAttr = geom.attributes.position as THREE.BufferAttribute;
-    for (let i = 0; i < posAttr.count; i++) {
-      const x = posAttr.getX(i);
-      const z = posAttr.getZ(i);
-      posAttr.setY(i, getTerrainHeight(x, z));
-    }
-    geom.computeVertexNormals();
+    const geom = this.buildTerrainGeometry();
 
     this.terrainMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -341,6 +340,100 @@ export class GroundEnvironmentRenderer {
 
     this.grassMesh = this.buildInstancedGrass(15000);
     this.grassMesh.frustumCulled = false;
+  }
+
+  /**
+   * Builds the ground as one mesh that runs from the observer to the horizon.
+   *
+   * It used to be a flat PlaneGeometry exactly DOMAIN_SIZE across, which is the "bounding
+   * geometry" that read as a box: the ground simply stopped at the domain edge in a straight
+   * line, and beyond it was void. The simulated atmosphere is still DOMAIN_SIZE wide, but the
+   * *terrain* is a real surface evaluated from the same unbounded procedural height field, so
+   * it now continues for TERRAIN_HALF_EXTENT and the distance haze in the fragment shader
+   * dissolves it into the sky instead of ending it at an edge.
+   *
+   * Vertex spacing is non-uniform: fine (~200 m) across the simulated domain where the camera
+   * can get close and where cloud shadow, puddles and slope all need real geometry, then
+   * geometrically coarsening outward. Nothing out there is ever seen closer than tens of
+   * kilometres and is almost fully hazed, so spending vertices on it would be waste -- this
+   * keeps the mesh at ~66k vertices for a 400 km span instead of the millions a uniform grid
+   * would need -- and the vertex budget is spent where the camera can actually get close.
+   */
+  private buildTerrainGeometry(): THREE.BufferGeometry {
+    const innerHalf = DOMAIN_HALF_SIZE + 2000;
+    const innerStep = 250;
+    const coords = this.buildTerrainCoords(innerHalf, innerStep, TERRAIN_HALF_EXTENT);
+    const n = coords.length;
+
+    const positions = new Float32Array(n * n * 3);
+    const normals = new Float32Array(n * n * 3);
+    const uvs = new Float32Array(n * n * 2);
+
+    for (let iz = 0; iz < n; iz++) {
+      const z = coords[iz];
+      for (let ix = 0; ix < n; ix++) {
+        const x = coords[ix];
+        const i = iz * n + ix;
+        const h = getTerrainHeight(x, z);
+        positions[i * 3] = x;
+        positions[i * 3 + 1] = h;
+        positions[i * 3 + 2] = z;
+        // The material derives its shading normal analytically from the height field's
+        // screen-space derivatives plus procedural detail, so vertex normals only need to be
+        // broadly right for the slope term. Central differences on the actual function keep
+        // them correct across the non-uniform spacing, which computeVertexNormals would not
+        // (it weights by triangle area, and these triangles vary in size by two orders).
+        const d = Math.max(60, (ix > 0 && ix < n - 1 ? (coords[ix + 1] - coords[ix - 1]) : innerStep) * 0.5);
+        const hx = getTerrainHeight(x + d, z) - getTerrainHeight(x - d, z);
+        const hz = getTerrainHeight(x, z + d) - getTerrainHeight(x, z - d);
+        const nx = -hx / (2 * d);
+        const nz = -hz / (2 * d);
+        const inv = 1.0 / Math.sqrt(nx * nx + 1.0 + nz * nz);
+        normals[i * 3] = nx * inv;
+        normals[i * 3 + 1] = inv;
+        normals[i * 3 + 2] = nz * inv;
+        uvs[i * 2] = ix / (n - 1);
+        uvs[i * 2 + 1] = iz / (n - 1);
+      }
+    }
+
+    const indices: number[] = [];
+    for (let iz = 0; iz < n - 1; iz++) {
+      for (let ix = 0; ix < n - 1; ix++) {
+        const a = iz * n + ix;
+        const b = a + 1;
+        const c = a + n;
+        const d = c + 1;
+        indices.push(a, c, b, b, c, d);
+      }
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geom.setIndex(indices);
+    return geom;
+  }
+
+  /**
+   * Coordinate ramp for the terrain mesh: uniform across the simulated domain, then geometric
+   * growth outward on both sides so the horizon is reached with a handful of extra rings.
+   */
+  private buildTerrainCoords(innerHalf: number, innerStep: number, outerHalf: number): number[] {
+    const pos: number[] = [];
+    for (let x = 0; x <= innerHalf + 1e-6; x += innerStep) pos.push(x);
+    let cur = pos[pos.length - 1];
+    let step = innerStep;
+    while (cur < outerHalf) {
+      step *= 1.32;
+      cur += step;
+      pos.push(Math.min(cur, outerHalf));
+      if (cur >= outerHalf) break;
+    }
+    // Mirror to negative x, dropping the duplicated zero.
+    const neg = pos.slice(1).reverse().map((v) => -v);
+    return neg.concat(pos);
   }
 
   private buildInstancedGrass(count: number): THREE.Mesh {

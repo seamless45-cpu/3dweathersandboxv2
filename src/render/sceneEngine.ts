@@ -6,6 +6,8 @@ import { ObserverCameraController } from './cameraController';
 import { LightningAndTLERenderer } from './lightningAndTLERenderer';
 import { BloomPass } from '../performance/bloom';
 import { LightningCameraShake } from '../performance/cameraShake';
+import { LightningRodRenderer } from './lightningRodRenderer';
+import { TornadoRenderer } from './tornadoRenderer';
 import { NearFieldPrecipitationRenderer } from './precipitationRenderer';
 import { GroundEnvironmentRenderer } from './terrainRenderer';
 import { SunCycle } from './sunCycle';
@@ -55,6 +57,8 @@ export class AtmosphericSceneEngine {
   private groundRenderer: GroundEnvironmentRenderer;
   private lightningRenderer: LightningAndTLERenderer;
   private precipRenderer: NearFieldPrecipitationRenderer;
+  private rodRenderer: LightningRodRenderer;
+  private tornadoRenderer: TornadoRenderer;
   /** Scratch vectors/colours for the precipitation light, reused every frame. */
   private precipLightDir = new THREE.Vector3(0.4, 0.8, -0.45);
   private precipLightColor = new THREE.Color(1, 0.97, 0.92);
@@ -179,7 +183,11 @@ export class AtmosphericSceneEngine {
     this.mainScene = new THREE.Scene();
 
     // 1. Sky Dome
-    const skyGeom = new THREE.SphereGeometry(86000, 32, 20);
+    // Enlarged with the terrain: the ground now runs to the horizon (200 km half-extent), so
+    // the dome has to enclose it or the far terrain would be drawn outside the sky. Radius is
+    // cheap here -- depth precision is set almost entirely by the near plane (1/near dominates
+    // 1/near - 1/far), so pushing the far plane from 95 km to 420 km costs about 0.001% of it.
+    const skyGeom = new THREE.SphereGeometry(300000, 32, 20);
     this.skyDomeMat = new THREE.ShaderMaterial({
       vertexShader: SKY_DOME_VERT,
       fragmentShader: SKY_DOME_FRAG,
@@ -212,8 +220,16 @@ export class AtmosphericSceneEngine {
 
     // 4. Near-Field Wind-Slanted Precipitation & Ground Splashes
     this.precipRenderer = new NearFieldPrecipitationRenderer();
+
+    // Grounded lightning rod in the observer's meadow. Reads its position from the simulation so
+    // the rendered mast and the physical rod are always the same object in the same place.
+    const rod = coordinator.lightningRod;
+    this.rodRenderer = new LightningRodRenderer(rod.x, rod.z, rod.groundY, rod.heightM);
+    this.tornadoRenderer = new TornadoRenderer();
     this.mainScene.add(this.precipRenderer.splashMesh);
     this.mainScene.add(this.precipRenderer.streakMesh);
+    this.mainScene.add(this.rodRenderer.group);
+    this.mainScene.add(this.tornadoRenderer.group);
 
     // Post-Processing & Ray-Marching Fullscreen Quad Infrastructure
     this.postScene = new THREE.Scene();
@@ -488,6 +504,41 @@ export class AtmosphericSceneEngine {
       shadowsEnabled: perfMgr.settings.enableShadows,
     });
 
+    this.tornadoRenderer.update({
+      tornadoes: coordinator.tornadoes.active.map((t) => ({
+        id: t.id,
+        x: t.x,
+        z: t.z,
+        windMS: t.maxTangentialMS,
+        efScale: t.efScale,
+        radiusM: t.radiusM,
+        pressureDeficitPa: t.pressureDeficitPa,
+        funnelDrop: t.funnelDrop,
+        cloudBaseM: t.cloudBaseM,
+        ageSec: t.ageSec,
+        phase: t.phase,
+      })),
+      realDtSec,
+      sunDir: this.sunDir,
+      daylight,
+      cameraPos: cam.position,
+      lightningIntensity: flashIntensity * 2.5,
+      lightningPos: this.lightningRenderer.dominantGroundBoltPos,
+    });
+
+    this.rodRenderer.update({
+      sunDir: this.sunDir,
+      moonDir: this.sunCycle.moonDir,
+      daylight,
+      cameraPos: cam.position,
+      coronaIntensity: coordinator.lightningRod.coronaIntensity,
+      lightningIntensity: flashIntensity * 2.5,
+      lightningPos: this.lightningRenderer.dominantGroundBoltPos,
+      upwardLeaders: coordinator.lightningRod.upwardLeaders,
+      interceptedStrikes: coordinator.lightningRod.interceptedStrikes,
+      realDtSec,
+    });
+
     // Resolve the dominant light for the precipitation shader: sun by day, moon by night,
     // blended through twilight exactly as the composite pass does, plus a warm->cold colour
     // shift with solar elevation so drop glints match the rest of the scene.
@@ -529,6 +580,8 @@ export class AtmosphericSceneEngine {
       lightColor: this.precipLightColor,
       hazeColor: this.precipHazeColor,
       daylight: this.sunCycle.daylight,
+      fovDeg: cam.fov,
+      renderHeightPx: this.renderHeightPx,
     });
 
     // PASS 1: Render 3D Scene (Sky + Terrain + Grass + Bolts + TLEs + Rain Streaks) into sceneRT + depthTexture
@@ -646,6 +699,8 @@ export class AtmosphericSceneEngine {
     this.copyMat.dispose();
     this.volTexture3D.dispose();
     this.groundSatTexture.dispose();
+    this.rodRenderer.dispose();
+    this.tornadoRenderer.dispose();
     this.sceneRT.dispose();
     this.outputRT.dispose();
     this.bloomPass.dispose();
