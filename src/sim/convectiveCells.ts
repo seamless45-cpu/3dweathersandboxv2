@@ -1,3 +1,4 @@
+import { MesoscaleEnvironment } from './mesoscaleEnvironment';
 import { stepCellMicrophysics } from './microphysics';
 import { getSurfaceThermalPotential, getTerrainHeight } from './terrainField';
 import { AtmosphericSounding } from './thermodynamics';
@@ -23,7 +24,7 @@ const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > 
  * keeps showing what the user chose, and night genuinely stops thermals from forming instead of
  * just dimming the lighting.
  */
-function effectiveSolarInsolation(cfg: AtmosphereConfig): number {
+export function effectiveSolarInsolation(cfg: AtmosphereConfig): number {
   const scale = cfg.solarInsolationScale === undefined ? 1 : cfg.solarInsolationScale;
   return cfg.solarHeatingFactor * scale;
 }
@@ -40,6 +41,11 @@ export class ConvectiveCellManager {
   private capErosionFrac = 0;
   /** Transient mixing from active cold-pool fronts, fed by stepColdPools. */
   private gustFrontMixing = 0;
+  /** Resolved mesoscale boundary-layer field, supplied by the coordinator. */
+  private env: MesoscaleEnvironment | null = null;
+  private sfcTempK = 302.65;
+  private sfcDewK = 297.0;
+  private sfcQvGKg = 14.0;
   /**
    * Cumulative water budgets of cells that have already retired. Kept separately so the
    * domain water balance stays closed even after the cell objects are gone.
@@ -80,9 +86,18 @@ export class ConvectiveCellManager {
     dt: number,
     simTimeSec: number,
     sounding: AtmosphericSounding,
-    cfg: AtmosphereConfig
+    cfg: AtmosphereConfig,
+    env: MesoscaleEnvironment | null = null
   ): void {
-    const inst = sounding.instability;
+    this.env = env;
+    // The domain-scale profile. Each cell below shadows `inst` with its own localised version, so
+    // a cell growing 20 km from another sees its own CAPE, CIN and cloud base rather than a value
+    // averaged over the whole domain.
+    const baseInst = sounding.instability;
+    const sfc = sounding.levels[0];
+    this.sfcTempK = sfc ? sfc.tempK : cfg.surfaceTempC + 273.15;
+    this.sfcDewK = sfc ? sfc.dewpointK : this.sfcTempK - 4.0;
+    this.sfcQvGKg = sfc ? sfc.qvEnv * 1000.0 : 14.0;
     const solar = effectiveSolarInsolation(cfg);
 
     // 1. Progressive boundary-layer solar warming from t=0 clear sky
@@ -121,6 +136,13 @@ export class ConvectiveCellManager {
     for (let i = this.cells.length - 1; i >= 0; i--) {
       const cell = this.cells[i];
       cell.ageSec += dt;
+
+      // Localised environment at this cell's position. Shadows the domain-scale `inst` so every
+      // growth law, threshold and stage classification below uses the air this cell is actually
+      // sitting in -- including whatever its own outflow and rainfall did to it earlier.
+      const inst = this.env
+        ? this.env.localizeInstability(cell.x, cell.z, baseInst, this.sfcTempK, this.sfcDewK, this.sfcQvGKg)
+        : baseInst;
 
       // Sample steering flow across cloud depth + Bunkers propagation if rotating/mature
       const steerZ = Math.min(6500, 0.55 * cell.cloudBaseM + 0.45 * Math.max(cell.cloudBaseM + 500, cell.cloudTopM));
@@ -558,10 +580,19 @@ export class ConvectiveCellManager {
       }
 
       // Mechanical gust-front lifting w ~ 0.6 c overcomes far more CIN than solar thermals alone.
+      // Tested against the LOCAL environment: the same gust front can trigger new deep convection
+      // where it runs into a moist, weakly capped boundary layer and fizzle completely a few km
+      // away where outflow has already stabilised the air. That spatial selectivity is the whole
+      // point of resolving the mesoscale field.
+      const localFront = this.env
+        ? this.env.localInstability(candX, candZ, this.baseSnapshot(sounding, cfg))
+        : null;
+      const frontCin = localFront ? localFront.cin : inst.cin;
+      const frontRh = localFront ? localFront.relHumidity : rh0;
       const gustKineticEnergy = 0.5 * Math.pow(p1.expansionSpeedMS * (1.0 + collisionBoost * 0.5), 2);
       if (
-        gustKineticEnergy + 28.0 * solar > inst.cin * 0.75 &&
-        rh0 > 38 &&
+        gustKineticEnergy + 28.0 * solar > frontCin * 0.75 &&
+        frontRh > 38 &&
         !this.isNearExistingUpdraft(candX, candZ, 3400)
       ) {
         const triggerProb = Math.min(0.65, (0.08 + 0.16 * collisionBoost) * checkDt);
@@ -601,14 +632,33 @@ export class ConvectiveCellManager {
       const thermalSpot = getSurfaceThermalPotential(candX, candZ);
       const orographicBonus = Math.min(0.45, terrainElev / 340.0);
 
+      // Local environment at this candidate site. Where the mesoscale field has been cooled and
+      // soaked by earlier rainfall the local CIN is higher and the local RH different, so the
+      // trigger probability genuinely varies across the domain instead of being uniform.
+      const local = this.env
+        ? this.env.localInstability(candX, candZ, this.baseSnapshot(sounding, cfg))
+        : null;
+      const localCin = local ? local.cin : inst.cin;
+      const localRh = local ? local.relHumidity : rh0;
+      const localCape = local ? local.cape : inst.cape;
+      // A cold, rain-soaked patch is stabilised: suppress nucleation there explicitly so storms do
+      // not regenerate on top of their own outflow indefinitely.
+      const localPenalty = local
+        ? 1.0 / (1.0 + Math.max(0, -this.env!.sampleAt(candX, candZ).thetaPert) * 0.22)
+        : 1.0;
+
       if (thermalSpot + orographicBonus > 0.03 && !this.isNearExistingUpdraft(candX, candZ, 3900)) {
         const prob =
           0.11 *
           solar *
           Math.min(1.5, this.boundaryLayerThermalEnergy) *
-          (rh0 / 62.0) *
+          (localRh / 62.0) *
+          localPenalty *
+          (1.0 + Math.min(0.6, localCape / 4200.0)) *
           checkDt;
-        if (this.rand() < prob) {
+        // The CIN gate also has to be local, otherwise a site inside a stabilised outflow could
+        // still pass using the domain-average cap.
+        if (this.rand() < prob && thermalEnergyJPerKg > localCin * 0.5) {
           const initialRadius = 700 + this.rand() * 440;
           const initialW = 2.2 + solar * 1.5;
           this.spawnNucleatingThermal(candX, candZ, sounding, initialRadius, initialW);
@@ -950,6 +1000,28 @@ export class ConvectiveCellManager {
         this.coldPools.splice(i, 1);
       }
     }
+  }
+
+  /**
+   * The domain-scale surface state the mesoscale field perturbs. Pulled from the sounding's lowest
+   * level so the local derivation starts from the actual profile rather than from the config
+   * scalars, which the sounding may have adjusted.
+   */
+  private baseSnapshot(sounding: AtmosphericSounding, cfg: AtmosphereConfig) {
+    const sfc = sounding.levels[0];
+    const inst = sounding.instability;
+    return {
+      cape: inst.cape,
+      cin: inst.cin,
+      lcl: inst.lcl,
+      el: inst.el,
+      surfaceTempK: sfc ? sfc.tempK : cfg.surfaceTempC + 273.15,
+      surfaceDewpointK: sfc ? sfc.dewpointK : cfg.surfaceTempC + 269.15,
+      surfaceQvGKg: sfc ? sfc.qvEnv * 1000.0 : 14.0,
+      pressureHPa: cfg.surfacePressureHPa,
+      windU: sfc ? sfc.windU : sounding.windUAt(10),
+      windW: sfc ? sfc.windW : sounding.windWAt(10),
+    };
   }
 
   private isNearExistingUpdraft(x: number, z: number, minDistM: number): boolean {

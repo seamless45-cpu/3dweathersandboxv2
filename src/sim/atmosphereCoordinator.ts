@@ -1,4 +1,4 @@
-import { ConvectiveCellManager } from './convectiveCells';
+import { ConvectiveCellManager, effectiveSolarInsolation } from './convectiveCells';
 import {
   AtmosphericElectrificationEngine,
   BreakdownCandidate,
@@ -7,6 +7,7 @@ import {
 import { AtmosphericFluidGrid, GRID_NX, GRID_NY, GRID_NZ } from './fluidGrid';
 import { AutonomousLightningEngine } from './lightningEngine';
 import { LightningRod } from './lightningRod';
+import { MesoscaleEnvironment } from './mesoscaleEnvironment';
 import { TornadoEngine } from './tornado';
 import { AtmosphericSounding, DEFAULT_ATMOSPHERE_CONFIG } from './thermodynamics';
 import {
@@ -72,6 +73,12 @@ export class AtmosphereSimulationCoordinator {
   public readonly lightningRod: LightningRod;
   /** Tornadic vortices spun up by supercell mesocyclones, coupled into the resolved flow. */
   public readonly tornadoes: TornadoEngine;
+  /**
+   * Horizontally resolved, time-evolving boundary-layer field. This is what makes the weather
+   * local rather than domain-uniform: every position has its own temperature, moisture, cloud
+   * base, instability and surface pressure, and storms modify the field they are moving into.
+   */
+  public readonly mesoscale: MesoscaleEnvironment;
 
   public simTimeSec = 0;
   public surfaceWetness = 0; // 0..1 ground wetness & puddle state around observer
@@ -85,6 +92,15 @@ export class AtmosphereSimulationCoordinator {
   public observerFrozenFraction = 0;
   /** 0..1 gustiness of the local wind, driven by nearby gust fronts and downdrafts. */
   public observerGustFactor = 0;
+  /** Local surface weather at the observer, resolved from the mesoscale field. */
+  public observerTempC = 0;
+  public observerDewpointC = 0;
+  public observerRelHumidity = 0;
+  public observerPressureHPa = 0;
+  public observerLocalCape = 0;
+  public observerLocalCin = 0;
+  public observerLocalLcl = 0;
+  public observerSoilSaturation = 0;
 
   public cadence: PhysicsCadence = { ...CADENCE_BY_TIER.high };
 
@@ -115,6 +131,7 @@ export class AtmosphereSimulationCoordinator {
     // and so the strikes the observer actually sees are the ones within its capture radius.
     this.lightningRod = new LightningRod(-320, 4880, 168);
     this.tornadoes = new TornadoEngine();
+    this.mesoscale = new MesoscaleEnvironment();
     this.computeBaselineVaporMass();
   }
 
@@ -143,6 +160,22 @@ export class AtmosphereSimulationCoordinator {
     this.observerPrecipFallSpeedMS = 0;
     this.observerFrozenFraction = 0;
     this.observerGustFactor = 0;
+    // Seed the local surface weather from the base sounding so the HUD reads correctly at t=0
+    // instead of smoothing up from zero, which would show a spurious 0 C for the first minutes.
+    {
+      const sfc = this.sounding.levels[0];
+      const base = this.sounding.instability;
+      if (sfc) {
+        this.observerTempC = sfc.tempK - 273.15;
+        this.observerDewpointC = sfc.dewpointK - 273.15;
+        this.observerRelHumidity = this.config.surfaceRelHumidity;
+        this.observerPressureHPa = this.config.surfacePressureHPa;
+        this.observerLocalCape = base.cape;
+        this.observerLocalCin = base.cin;
+        this.observerLocalLcl = base.lcl;
+      }
+      this.observerSoilSaturation = 0;
+    }
     this.cumulativeCondensedGKg = 0;
     this.cumulativeFalloutGKg = 0;
     this.cumulativeEvaporatedGKg = 0;
@@ -162,6 +195,7 @@ export class AtmosphereSimulationCoordinator {
     this.lightning.reset();
     this.lightningRod.reset();
     this.tornadoes.reset();
+    this.mesoscale.reset();
     this.computeBaselineVaporMass();
   }
 
@@ -189,6 +223,25 @@ export class AtmosphereSimulationCoordinator {
     const clampedRealDt = Math.min(0.05, Math.max(0.001, realDtSec));
     const totalSimDt = clampedRealDt * simSpeedMultiplier;
 
+    // --- Mesoscale boundary-layer field -------------------------------------------------
+    // Stepped once per frame ahead of the cells, so nucleation and growth this frame respond to
+    // the environment as it has been advected and modified up to now. Advected by the
+    // boundary-layer wind from the sounding; insolation comes from the same diurnal multiplier
+    // that drives everything else, so the field builds through the afternoon and decays at night.
+    {
+      const bl = this.sounding.sampleAtAltitude(600);
+      const sfc = this.sounding.levels[0];
+      this.mesoscale.step(
+        totalSimDt,
+        effectiveSolarInsolation(this.config),
+        bl.windU,
+        bl.windW,
+        sfc ? sfc.tempK : this.config.surfaceTempC + 273.15,
+        sfc ? sfc.qvEnv * 1000.0 : 16.0,
+        this.config.surfacePressureHPa
+      );
+    }
+
     // --- Lagrangian convective cells: sub-stepped for strict numerical stability ---
     const maxSubDt = 2.5;
     const subSteps = Math.max(1, Math.min(12, Math.ceil(totalSimDt / maxSubDt)));
@@ -196,7 +249,35 @@ export class AtmosphereSimulationCoordinator {
 
     for (let s = 0; s < subSteps; s++) {
       this.simTimeSec += subDt;
-      this.cellManager.step(subDt, this.simTimeSec, this.sounding, this.config);
+      this.cellManager.step(subDt, this.simTimeSec, this.sounding, this.config, this.mesoscale);
+    }
+
+    // --- Two-way coupling: storms rewrite the environment they are moving into -------------
+    // Cold pools deposit dense cool air and their surface pressure signature; falling rain wets
+    // the soil and cools/moistens the boundary layer beneath the shaft. Because the field then
+    // advects with the wind and feeds back into nucleation and cell growth, a storm's own outflow
+    // decides where the next storm can form -- self-organisation rather than fixed spawn rules.
+    for (const pool of this.cellManager.coldPools) {
+      this.mesoscale.injectColdPool(
+        pool.x,
+        pool.z,
+        pool.radiusM,
+        pool.strength,
+        pool.tempDeficitK,
+        pool.depthM,
+        totalSimDt
+      );
+    }
+    for (const cell of this.cellManager.cells) {
+      if (cell.surfaceRainRateMMHr > 0.05 && cell.radiusM > 150) {
+        this.mesoscale.injectPrecipitation(
+          cell.x + cell.precipCoreOffsetX * 0.6,
+          cell.z + cell.precipCoreOffsetZ * 0.6,
+          cell.radiusM * 0.85,
+          cell.surfaceRainRateMMHr,
+          totalSimDt
+        );
+      }
     }
 
     this.accumulateWaterBudget();
@@ -339,6 +420,41 @@ export class AtmosphereSimulationCoordinator {
     const id0 = this.grid.idx(gx, 0, gz);
     this.observerWindU = this.grid.u[id0];
     this.observerWindW = this.grid.w[id0];
+
+    // --- Local surface weather at the observer ---------------------------------------------
+    // Resolved from the mesoscale boundary-layer field rather than read off the domain sounding,
+    // so the observer stands in *their* weather: the cold pool that just moved over them reads
+    // colder, damper and denser than the sunlit dry slot ten km away, and the pressure rises as
+    // the gust front arrives. Smoothed on a short time constant so the HUD does not flicker at
+    // the field's own update rate.
+    {
+      const sfc = this.sounding.levels[0];
+      const base = this.sounding.instability;
+      if (sfc) {
+        const local = this.mesoscale.localInstability(obsX, obsZ, {
+          cape: base.cape,
+          cin: base.cin,
+          lcl: base.lcl,
+          el: base.el,
+          surfaceTempK: sfc.tempK,
+          surfaceDewpointK: sfc.dewpointK,
+          surfaceQvGKg: sfc.qvEnv * 1000.0,
+          pressureHPa: this.config.surfacePressureHPa,
+          windU: sfc.windU,
+          windW: sfc.windW,
+        });
+        const k = 1.0 - Math.exp(-simDt / 45.0);
+        this.observerTempC += (local.tempK - 273.15 - this.observerTempC) * k;
+        this.observerDewpointC += (local.dewpointK - 273.15 - this.observerDewpointC) * k;
+        this.observerRelHumidity += (local.relHumidity - this.observerRelHumidity) * k;
+        this.observerPressureHPa += (local.pressureHPa - this.observerPressureHPa) * k;
+        this.observerLocalCape += (local.cape - this.observerLocalCape) * k;
+        this.observerLocalCin += (local.cin - this.observerLocalCin) * k;
+        this.observerLocalLcl += (local.lcl - this.observerLocalLcl) * k;
+        this.observerSoilSaturation +=
+          (this.mesoscale.sampleAt(obsX, obsZ).soilSat - this.observerSoilSaturation) * k;
+      }
+    }
 
     // Precipitation at the observer: sum the shafts that actually cover this location,
     // weighted by distance into the core, and keep the hydrometeor mix of the dominant
@@ -483,6 +599,14 @@ export class AtmosphereSimulationCoordinator {
       meanGraupelHailGKg: cells.length > 0 ? sumGH / denom : 0,
       maxSurfaceRainMMHr: maxRain,
       observerRainMMHr: this.observerRainMMHr,
+      observerTempC: this.observerTempC,
+      observerDewpointC: this.observerDewpointC,
+      observerRelHumidity: this.observerRelHumidity,
+      observerPressureHPa: this.observerPressureHPa,
+      observerLocalCape: this.observerLocalCape,
+      observerLocalCin: this.observerLocalCin,
+      observerLocalLcl: this.observerLocalLcl,
+      observerSoilSaturation: this.observerSoilSaturation,
       observerPrecipType: this.observerPrecipType,
       surfaceWetness: this.surfaceWetness,
       maxElectricFieldKVm: this.electrification.maxElectricFieldKVm,

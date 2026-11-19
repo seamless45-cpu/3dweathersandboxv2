@@ -20,6 +20,9 @@ const TERRAIN_FRAG = /* glsl */ `
 
   uniform sampler3D uVolTex;
   uniform sampler2D uGroundSatTex;
+  // Mesoscale boundary-layer field mirrored from the simulation: R = local relative humidity,
+  // G = local cloud base normalised over 0..4 km.
+  uniform sampler2D uLocalWeatherTex;
   uniform vec3 uSunDir;
   uniform vec3 uMoonDir;
   uniform float uDaylight;
@@ -84,6 +87,19 @@ const TERRAIN_FRAG = /* glsl */ `
     );
     if (gUv.x < 0.0 || gUv.x > 1.0 || gUv.y < 0.0 || gUv.y > 1.0) return 0.0;
     return texture(uGroundSatTex, gUv).r;
+  }
+
+  // Local relative humidity and cloud base from the resolved mesoscale field. Both are sampled
+  // per fragment, so visibility genuinely varies across the landscape with the air that is there.
+  vec2 sampleLocalWeather(vec3 worldPos) {
+    vec2 gUv = vec2(
+      (worldPos.x + uDomainSize * 0.5) / uDomainSize,
+      (worldPos.z + uDomainSize * 0.5) / uDomainSize
+    );
+    if (gUv.x < 0.0 || gUv.x > 1.0 || gUv.y < 0.0 || gUv.y > 1.0) {
+      return vec2(0.5, 0.5);
+    }
+    return texture(uLocalWeatherTex, gUv).rg;
   }
 
   // Precipitation landing in this column right now. Two low-level taps only: virga has
@@ -196,13 +212,37 @@ const TERRAIN_FRAG = /* glsl */ `
                    vec3(0.82, 0.88, 1.0) * boltAtten * 0.95;
     col = mix(col, reflSky, clamp(fresnel * reflectivity + puddleMask * 0.32, 0.0, 0.85));
 
-    // Atmospheric Rayleigh/Mie distance haze + rain curtain visibility reduction
-    float hazeDensity = 0.000052 + uRainHaze * 0.00022;
+    // Atmospheric Rayleigh/Mie distance haze + rain curtain visibility reduction.
+    //
+    // Haze is now driven by the resolved local humidity rather than one domain-wide rain scalar.
+    // Humid air scatters far more than dry air, and the dependence is strongly non-linear as
+    // saturation is approached because haze particles take up water and grow -- visibility can
+    // halve between 60% and 90% RH at the same aerosol loading. The quadratic term below stands in
+    // for that hygroscopic growth. The practical effect is that you can see the murk sitting under
+    // a rain shaft and through an outflow boundary, while a dry slot between storms reads crisp
+    // all the way to the horizon.
+    vec2 localWx = sampleLocalWeather(vWorldPos);
+    float localRH = localWx.r;
+    float rhExcess = clamp((localRH - 0.52) / 0.48, 0.0, 1.0);
+    float humidityHaze = rhExcess * rhExcess * 0.00034;
+
+    // Ground mist where the local cloud base descends toward the surface. The channel stores LCL
+    // normalised over 0..4 km; below roughly 500 m the air is close enough to saturation at ground
+    // level that mist forms in the shallow layer. This is why rain-cooled outflow and sheltered
+    // damp ground read as hazy near the surface while a dry slot stays clear to the horizon.
+    float localLclM = localWx.g * 4000.0;
+    float mistBase = 1.0 - smoothstep(180.0, 620.0, localLclM);
+    // Cold air drains downhill, so mist pools in low ground and thins on rises. vWorldPos.y is the
+    // terrain elevation of this fragment, which is exactly the right quantity for that.
+    float lowGround = 1.0 - smoothstep(11.0, 130.0, vWorldPos.y);
+    float groundMist = mistBase * mix(0.34, 1.0, lowGround) * 0.00062;
+
+    float hazeDensity = 0.000052 + uRainHaze * 0.00022 + humidityHaze + groundMist;
     float fogFactor = 1.0 - exp(-dist * hazeDensity);
     vec3 dayHaze = mix(
       vec3(0.62, 0.74, 0.88),
       vec3(0.30, 0.35, 0.42),
-      clamp(uRainHaze * 1.1 + (1.0 - cloudShadow) * 0.5, 0.0, 1.0)
+      clamp(uRainHaze * 1.1 + (1.0 - cloudShadow) * 0.5 + rhExcess * 0.35 + mistBase * 0.22, 0.0, 1.0)
     );
     // A flash still lights the fog at night, so the bolt term stays outside the daylight mix.
     vec3 horizonHazeColor = mix(
@@ -295,7 +335,11 @@ export class GroundEnvironmentRenderer {
   private terrainMat: THREE.ShaderMaterial;
   private grassMat: THREE.ShaderMaterial;
 
-  constructor(volTexture: THREE.Data3DTexture, groundSatTexture: THREE.DataTexture) {
+  constructor(
+    volTexture: THREE.Data3DTexture,
+    groundSatTexture: THREE.DataTexture,
+    localWeatherTexture: THREE.DataTexture
+  ) {
     const geom = this.buildTerrainGeometry();
 
     this.terrainMat = new THREE.ShaderMaterial({
@@ -305,6 +349,7 @@ export class GroundEnvironmentRenderer {
       uniforms: {
         uVolTex: { value: volTexture },
         uGroundSatTex: { value: groundSatTexture },
+        uLocalWeatherTex: { value: localWeatherTexture },
         uSunDir: { value: new THREE.Vector3(0.4, 0.55, -0.72).normalize() },
         uMoonDir: { value: new THREE.Vector3(-0.4, 0.55, 0.72).normalize() },
         uDaylight: { value: 1.0 },

@@ -427,6 +427,20 @@ export interface SimulationTelemetrySnapshot {
   observerRainMMHr: number;
   observerPrecipType: PrecipitationType;
   surfaceWetness: number; // 0..1 at observer
+  /**
+   * Local surface weather resolved from the mesoscale boundary-layer field at the observer's
+   * exact position. These differ from the domain-scale sounding values by design: standing under
+   * a rain-cooled outflow reads several degrees colder, near saturation, and a rising pressure
+   * tendency, while 10 km away in a sunlit dry slot reads warm, dry and capped.
+   */
+  observerTempC: number;
+  observerDewpointC: number;
+  observerRelHumidity: number;
+  observerPressureHPa: number;
+  observerLocalCape: number;
+  observerLocalCin: number;
+  observerLocalLcl: number;
+  observerSoilSaturation: number;
   maxElectricFieldKVm: number;
   maxBreakdownRatio: number;
   maxPosChargeNCm3: number;
