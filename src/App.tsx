@@ -431,12 +431,32 @@ export function App() {
           <footer className="px-2.5 pb-2 flex items-end justify-between gap-2">
             {/* Compact Observer & Instability Strip */}
             <div className="pointer-events-auto flex flex-wrap items-center gap-2 px-2.5 py-1 rounded bg-slate-950/60 backdrop-blur-md border border-white/10 text-[10px] text-slate-300">
-              <span className="font-mono text-sky-300">
-                CAPE {Math.round(telemetry.instability.cape)} J/kg
+              {/* Local surface weather, resolved from the mesoscale field at the observer's
+                  position -- not the domain-average sounding value. */}
+              <span className="font-mono text-emerald-300" title="Local temperature / dewpoint at your position">
+                {telemetry.observerTempC.toFixed(1)}°/{telemetry.observerDewpointC.toFixed(1)}°C
               </span>
               <span className="text-slate-600">·</span>
-              <span className="font-mono">
-                LCL {Math.round(telemetry.instability.lcl)}m
+              <span className="font-mono" title="Local relative humidity">
+                RH {telemetry.observerRelHumidity.toFixed(0)}%
+              </span>
+              <span className="text-slate-600">·</span>
+              <span className="font-mono" title="Local surface pressure">
+                {telemetry.observerPressureHPa.toFixed(1)} hPa
+              </span>
+              <span className="text-slate-600">·</span>
+              <span
+                className="font-mono text-sky-300"
+                title={`Local CAPE. Domain-average is ${Math.round(telemetry.instability.cape)} J/kg`}
+              >
+                CAPE {Math.round(telemetry.observerLocalCape)} J/kg
+              </span>
+              <span className="text-slate-600">·</span>
+              <span
+                className="font-mono"
+                title={`Local lifted condensation level (cloud base). Domain-average ${Math.round(telemetry.instability.lcl)} m`}
+              >
+                LCL {Math.round(telemetry.observerLocalLcl)}m
               </span>
               <span className="text-slate-600 hidden sm:inline">·</span>
               <span className="font-mono hidden sm:inline">

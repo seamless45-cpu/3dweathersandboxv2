@@ -70,6 +70,8 @@ export class AtmosphericSceneEngine {
    * the same Uint8Array the simulation writes, so uploading is a straight buffer copy.
    */
   private groundSatTexture: THREE.DataTexture;
+  /** Mesoscale boundary-layer mirror: R = local relative humidity, G = local cloud base. */
+  private localWeatherTexture: THREE.DataTexture;
 
   private sceneRT!: THREE.WebGLRenderTarget;
   private outputRT!: THREE.WebGLRenderTarget;
@@ -179,6 +181,23 @@ export class AtmosphericSceneEngine {
     this.groundSatTexture.unpackAlignment = 1;
     this.groundSatTexture.needsUpdate = true;
 
+    // Resolved mesoscale boundary-layer field, so haze and visibility vary across the landscape
+    // with the air that is actually there instead of one domain-wide scalar. Two channels per
+    // texel, hence RGFormat and an unpack alignment of 2.
+    this.localWeatherTexture = new THREE.DataTexture(
+      coordinator.mesoscale.localWeatherTex,
+      coordinator.mesoscale.nx,
+      coordinator.mesoscale.nz,
+      THREE.RGFormat,
+      THREE.UnsignedByteType
+    );
+    this.localWeatherTexture.minFilter = THREE.LinearFilter;
+    this.localWeatherTexture.magFilter = THREE.LinearFilter;
+    this.localWeatherTexture.wrapS = THREE.ClampToEdgeWrapping;
+    this.localWeatherTexture.wrapT = THREE.ClampToEdgeWrapping;
+    this.localWeatherTexture.unpackAlignment = 2;
+    this.localWeatherTexture.needsUpdate = true;
+
     // Build 3D World Scene
     this.mainScene = new THREE.Scene();
 
@@ -209,7 +228,11 @@ export class AtmosphericSceneEngine {
     this.mainScene.add(this.skyDomeMesh);
 
     // 2. Ground Terrain & Wind-Driven Grass
-    this.groundRenderer = new GroundEnvironmentRenderer(this.volTexture3D, this.groundSatTexture);
+    this.groundRenderer = new GroundEnvironmentRenderer(
+      this.volTexture3D,
+      this.groundSatTexture,
+      this.localWeatherTexture
+    );
     this.mainScene.add(this.groundRenderer.terrainMesh);
     this.mainScene.add(this.groundRenderer.grassMesh);
 
@@ -437,6 +460,10 @@ export class AtmosphericSceneEngine {
     if (coordinator.grid.groundSatDirty) {
       this.groundSatTexture.needsUpdate = true;
       coordinator.grid.groundSatDirty = false;
+    }
+    if (coordinator.mesoscale.localWeatherDirty) {
+      this.localWeatherTexture.needsUpdate = true;
+      coordinator.mesoscale.localWeatherDirty = false;
     }
 
     // ---- Diurnal solar geometry ---------------------------------------------------------
@@ -699,6 +726,7 @@ export class AtmosphericSceneEngine {
     this.copyMat.dispose();
     this.volTexture3D.dispose();
     this.groundSatTexture.dispose();
+    this.localWeatherTexture.dispose();
     this.rodRenderer.dispose();
     this.tornadoRenderer.dispose();
     this.sceneRT.dispose();
