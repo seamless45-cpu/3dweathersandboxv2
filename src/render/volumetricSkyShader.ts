@@ -49,6 +49,16 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
   uniform float uDaylight;
   uniform float uTime;
   uniform vec3 uWindOffset;
+  /**
+   * Wind vector the precipitation curtains drift with (m/s, world units per second after the
+   * shader's scaling). Set from the sounding's low/mid-level flow so shafts lean with the
+   * actual wind and not with the cloud-turbulence advection offset.
+   */
+  uniform vec3 uPrecipDrift;
+  /** Mass-weighted fall speed of the surface precipitation, m/s (positive down). */
+  uniform float uPrecipFallSpeed;
+  /** 0..1 frozen share, which changes how the shaft scatters and how fast it falls. */
+  uniform float uFrozenShare;
   uniform float uDomainSize;
   uniform float uMaxAlt;
   uniform int uMaxSteps;
@@ -283,19 +293,32 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       cloudDensity *= cloudDensity * (3.0 - 2.0 * cloudDensity);
     }
 
-    // Rain shafts & virga curtains: vertically elongated, wind-slanted streaks that descend
-    // at the bulk hydrometeor fall speed (~8 m/s) instead of boiling in place.
+    // ---- Rain shafts & virga curtains ------------------------------------------------------
+    // A shaft is not a static grey column: it is a stream of hydrometeors falling at their
+    // terminal speed while being advected by the wind. Two separate time terms do that:
+    //
+    //   · the vertical phase advances at the *actual* fall speed (so hail streaks visibly
+    //     faster than drizzle, and a snow shaft barely moves), and
+    //   · the horizontal phase advances at the actual wind, which tilts the streak structure
+    //     downshear and makes the curtain lean.
+    //
+    // The previous version used one hard-coded 8 m/s drift plus the cloud-turbulence offset,
+    // so every shaft moved identically regardless of what was falling out of it.
     float precipDensity = 0.0;
     if (basePrecip > 0.008) {
+      float fallPhase = uTime * (uPrecipFallSpeed * 0.00042 + 0.0004);
       vec3 shaftCoord = vec3(
-        wp.x * 0.0022 - uWindOffset.x * 0.00075,
-        wp.y * 0.00042 + uTime * 0.0034,
-        wp.z * 0.0022 - uWindOffset.z * 0.00075
+        wp.x * 0.0022 - (uPrecipDrift.x + uWindOffset.x) * 0.00075,
+        wp.y * 0.00042 + fallPhase,
+        wp.z * 0.0022 - (uPrecipDrift.z + uWindOffset.z) * 0.00075
       );
       float streak = noise3D(shaftCoord * 2.6);
       // Sharpen into curtains rather than a uniform grey veil.
       float curtain = 0.46 + 0.54 * (streak * streak * (3.0 - 2.0 * streak));
-      precipDensity = basePrecip * curtain * 0.34;
+      // Frozen shafts are less dense-looking per unit mass: snow scatters in every direction
+      // and reads as a bright diffuse veil, whereas rain reads as a dark refractive curtain.
+      float frozenGain = mix(1.0, 0.72, uFrozenShare);
+      precipDensity = basePrecip * curtain * 0.34 * frozenGain;
     }
 
     return vec4(cloudDensity, precipDensity, iceFrac, raw.a);
@@ -491,10 +514,13 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       float localFlash = vol.a;
 
       // Extinction coefficients are calibrated against the RGBA8 packing references
-      // (1.4 g/kg cloud, 7.0 g/kg precip). A saturated core is optically thick within a single
-      // 500 m voxel; a rain shaft is a dark translucent curtain you can still see terrain
-      // through, because the precipitating mass is spread over a far wider density range.
-      float totalExtinction = cloudD * 0.0026 + precipD * 0.0026;
+      // (1.4 g/kg cloud, 7.0 g/kg precip). Cloud droplets are ~10 µm and scatter almost
+      // conservatively, so a saturated core is optically thick within a single 500 m voxel.
+      // Rain is two orders of magnitude coarser (0.5-5 mm): its cross-section per unit mass is
+      // far smaller and it absorbs as well as scatters, so a shaft stays a translucent dark
+      // curtain you can still see terrain through. Using one coefficient for both was what made
+      // heavy shafts render as solid grey walls.
+      float totalExtinction = cloudD * 0.0026 + precipD * 0.0016;
       if (totalExtinction > 0.00004) {
         // Step length follows the local density: thin wisps take longer strides, opaque
         // cores take shorter ones, so the same budget resolves far more of the cloud.
@@ -519,9 +545,10 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
         vec3 lightningGlow = evaluateBoltIllumination(pos, localFlash);
 
         // Blend crisp white-slate cloud scattering with misty gray-blue rain shaft scattering
+        vec3 rainAlbedo = mix(vec3(0.40, 0.45, 0.53), vec3(0.80, 0.85, 0.92), uFrozenShare);
         vec3 mediumAlbedo = mix(
           vec3(0.98, 0.98, 1.0),
-          vec3(0.40, 0.45, 0.53),
+          rainAlbedo,
           clamp(precipD / max(0.01, cloudD * 0.55 + precipD), 0.0, 0.9)
         );
         vec3 voxelScattering = mediumAlbedo * (ambient + direct + lightningGlow);

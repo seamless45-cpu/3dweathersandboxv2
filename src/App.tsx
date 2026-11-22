@@ -17,6 +17,7 @@ import {
   SimulationTelemetrySnapshot,
 } from './sim/types';
 import { EventMonitor } from './ui/EventMonitor';
+import { RadarPanel } from './ui/RadarPanel';
 import { SettingsDrawer, SunReadout } from './ui/SettingsDrawer';
 import { TopToolbar } from './ui/TopToolbar';
 import { VirtualJoystick } from './ui/VirtualJoystick';
@@ -42,6 +43,7 @@ export function App() {
   const [fov, setFov] = useState(64);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [monitorOpen, setMonitorOpen] = useState(false);
+  const [radarOpen, setRadarOpen] = useState(false);
   const [uiHidden, setUiHidden] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
@@ -389,6 +391,8 @@ export function App() {
             onToggleSettings={() => setSettingsOpen((o) => !o)}
             monitorOpen={monitorOpen}
             onToggleMonitor={() => setMonitorOpen((o) => !o)}
+            radarOpen={radarOpen}
+            onToggleRadar={() => setRadarOpen((o) => !o)}
             isFullscreen={isFullscreen}
             onToggleFullscreen={handleToggleFullscreen}
             onHideUI={() => setUiHidden(true)}
@@ -416,7 +420,16 @@ export function App() {
               )}
             </div>
 
-            <div>
+            <div className="flex gap-2 items-start">
+              {radarOpen && (
+                <RadarPanel
+                  grid={coordinatorRef.current!.grid}
+                  sounding={coordinatorRef.current!.sounding}
+                  observerX={engineRef.current?.cameraCtrl.posX ?? 0}
+                  observerZ={engineRef.current?.cameraCtrl.posZ ?? 0}
+                  onClose={() => setRadarOpen(false)}
+                />
+              )}
               {monitorOpen && (
                 <EventMonitor
                   events={telemetry.events}

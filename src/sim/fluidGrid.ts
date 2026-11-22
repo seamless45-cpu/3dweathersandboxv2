@@ -1176,7 +1176,11 @@ export class AtmosphericFluidGrid {
             const radWeight = q * q;
             if (radWeight <= 0.01) continue;
             const id = zOff + ix;
-            const value = localPeak * radWeight;
+            // The shaft is a rendering proxy for a whole cell's precipitation, so it is capped
+            // at a physical rain-water content (a heavy convective core carries ~5 g/kg).
+            // Letting several overlapping cells each write their own total is what drove grid
+            // qr to 10-16 g/kg and overflowed the 7 g/kg precipitation LUT.
+            const value = Math.min(5.2, localPeak * radWeight);
             if (value > this.qr[id]) this.qr[id] = value;
             if (downdraftHere < -0.05) {
               this.vy[id] += (downdraftHere * radWeight - this.vy[id]) * forcingBlend;

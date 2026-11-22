@@ -764,7 +764,12 @@ export class MesoscaleEnvironment {
     // evaporative cooling conserves theta_e.
     const cin = clamp(base.cin - 6.2 * dThetaE + Math.max(0, -s.thetaPert) * 11.5, 0, 1400);
     // LCL from the local temperature-dewpoint spread; a moister boundary layer lowers cloud base.
-    const lcl = clamp(base.lcl + 125.0 * ((tempK - dewpointK) - (base.surfaceTempK - td0)), 220, 5200);
+    // The anomaly is bounded to what a *mesoscale* moisture field can do to cloud base: a 1 km
+    // domain LCL can drop to ~700 m over a wet patch or rise to ~1.6 km over dry ground, not to
+    // 200 m or 4 km. Without the bound, outflow pools that are a few g/kg moister than the mean
+    // dragged cloud bases down to 200 m and produced rainfall from 400 m deep clouds.
+    const lclShift = 125.0 * ((tempK - dewpointK) - (base.surfaceTempK - td0));
+    const lcl = clamp(base.lcl + lclShift, Math.max(220, base.lcl * 0.62), Math.min(5200, base.lcl * 1.75));
     // The equilibrium level barely moves for a boundary-layer anomaly: it is set by the deep
     // profile, not the surface. A modest lift for a much more buoyant parcel.
     const el = clamp(base.el + 22.0 * dThetaE, base.lcl + 400, 18500);

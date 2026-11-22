@@ -1,5 +1,6 @@
 import { MesoscaleEnvironment } from './mesoscaleEnvironment';
 import { stepCellMicrophysics } from './microphysics';
+import { buildPlumeProfile, plumeVelocityAt, samplePlume } from './updraftModel';
 import { getSurfaceThermalPotential, getTerrainHeight } from './terrainField';
 import { AtmosphericSounding } from './thermodynamics';
 import {
@@ -130,8 +131,6 @@ export class ConvectiveCellManager {
 
     // 4. Step each individual Convective Cell's dynamics, vertical growth, shear, microphysics
     const newSplitCells: ConvectiveCell[] = [];
-    // Fraction of the capping inversion mixed away so far (0 = pristine cap, 1 = fully eroded).
-    const capErosionProgress = this.capErosionFrac;
 
     for (let i = this.cells.length - 1; i >= 0; i--) {
       const cell = this.cells[i];
@@ -184,6 +183,14 @@ export class ConvectiveCellManager {
       }
       coldPoolBuoyancyPenalty = Math.min(coldPoolBuoyancyPenalty, 0.22);
 
+      // ---- Sub-cloud inflow kinetic energy -----------------------------------------------
+      // What the plume starts with at cloud base. Solar thermals carry a few m/s; a gust front
+      // forces 6-12 m/s up the leading edge, and that forced ascent is what lets a cell initiate
+      // through a cap the free-convection parcel cannot break. Cyclic here so the value used for
+      // momentum this step is the one the plume solve sees.
+      const thermalInflow = 1.6 + 2.6 * solar * Math.min(1.4, this.boundaryLayerThermalEnergy);
+      cell.baseInflowMS = clamp(thermalInflow + 4.5 * gustFrontLiftBoost, 0.5, 24.0);
+
       // Microphysics update (condensation ceiling, ice, riming, hail, rain, latent heat, drag).
       // Also sets cell.entrainmentRate (km^-1) from the updraft radius.
       const mpOut = stepCellMicrophysics(cell, dt, sounding, cfg);
@@ -193,153 +200,93 @@ export class ConvectiveCellManager {
       // shallow cumulus and a stratiform deck all evolve from the same physics but end up as
       // visibly different clouds rather than four copies of one shape.
       const morph = ConvectiveCellManager.MORPH_FACTORS[cell.morphology];
-      // Wider cores entrain less per unit depth (eps ~ 1/R), so the entrain factor scales the
-      // dilution exponent: stratiform decks mix out fast, narrow towers stay intact.
-      const dilutionFactor = Math.exp(
-        -cell.entrainmentRate * morph.entrain * (cloudDepth / 1000.0)
-      );
-      const updraftRadiusEff = Math.min(4200, Math.max(320, cell.radiusM));
 
       // ---- Vertical momentum balance -------------------------------------------------
-      // The parcel buoyancy profile B(z) comes straight from the sounding ascent that CAPE
-      // and CIN are integrated from, so the updraft feels the real vertical structure:
-      // negative under the cap, strongly positive between LFC and EL, negative aloft. That
-      // replaces four hand-tuned regime constants with one measured profile.
+      // The updraft is a *plume*, not a single parcel. Its speed at any level comes from the
+      // entraining ascent in updraftModel.ts, which already integrates
       //
-      //     dw/dt = B(z) * eta_ent * f_shape  -  loading  -  w|w| / R_eff
+      //     d(w²)/dz = 2·B·η − 2·ε·w² − 2·a_d·w²/R
       //
-      // whose steady state for B > 0 is the classical plume result w = sqrt(B * R).
-      const zEval = Math.max(60, 0.5 * (cell.cloudBaseM + cell.cloudTopM));
+      // along the sounding. Here that steady-state speed is relaxed toward on the plume's own
+      // overturning timescale, with the extra sources a real storm has on top of it: the
+      // perturbation-pressure deficit of a rotating updraft, the dynamic-pressure suction of a
+      // turbulent core, the drag of the hydrometeor load, and the loss of buoyancy to the cold
+      // pool undercutting the inflow.
+      //
+      // The previous formulation instead multiplied a depth-mean parcel buoyancy by four
+      // hand-tuned coefficients, so the updraft speed never actually reflected the sounding's
+      // structure: every cell, shallow or deep, ended up near the same equilibrium.
+      // Stratiform decks mix out fast, narrow towers stay intact: the archetype scales the
+      // plume's effective core radius (eps ~ 1/R), not the visible tower width.
+      this.refreshPlume(cell, sounding, inst, solar, mpOut.condensateEfficiency, morph.entrain);
 
-      // Depth-mean parcel buoyancy over the layer the plume is *currently* working through.
-      // The integral window trails the cloud top by one convective depth: an updraft's speed
-      // reflects the buoyancy it has accumulated over roughly the layer it occupies, not the
-      // whole column from the ground (which would permanently charge an established storm for
-      // the sub-cloud CIN it already paid to escape) and not the single midpoint level either
-      // (which badly underestimates growth just above the LFC, where B(z) rises steeply).
-      const windowDepth = Math.max(900, Math.min(cloudDepth, 6500));
-      const integBase = Math.max(60, cell.cloudTopM - windowDepth);
-      const envB =
-        sounding.parcelBuoyancyIntegral(integBase, cell.cloudTopM) / (cell.cloudTopM - integBase);
+      const plume = cell.plumeProfile!;
+      // The updraft's kinetic energy is set by the plume at the *cloud top* — that is the air
+      // doing the growing and it is where the plume's own momentum equation has drained most of
+      // its energy. But a cell's top and its plume's top are two different things: the top lags
+      // the plume and can sit well above its top after a strong pulse. Sampling only at the top
+      // then reads the terminated (zero-velocity) end of the profile and the updraft collapses
+      // to zero, recovers, and oscillates. Take the maximum over the upper half of the tower
+      // instead, which is stable and physically the part of the column driving the growth.
+      const zEval = clamp(cell.cloudTopM, 200, Math.max(400, plume.topM));
+      const zUpper = Math.max(600, cell.cloudTopM * 0.62);
+      const plumeSpeed = Math.max(
+        plumeVelocityAt(plume, zEval, cell.baseInflowMS),
+        plumeVelocityAt(plume, zUpper, cell.baseInflowMS) * 0.92
+      );
 
-      // A shallow cloud still inside the capped layer pays for the negative area above it:
-      // integrate from the LCL when the top has not yet reached the LFC.
-      const cappedEnvB =
-        cell.cloudTopM < inst.lfc
-          ? sounding.parcelBuoyancyIntegral(Math.min(cell.cloudBaseM, inst.lcl), inst.lfc) /
-            Math.max(300, inst.lfc - Math.min(cell.cloudBaseM, inst.lcl))
-          : envB;
-
-      // Entrainment dilution: a plume mixes environmental air in proportion to the depth it
-      // has travelled, scaled by how narrow it is (eta -> 1 for a wide, undiluted core).
-      const entrainmentEfficiency = clamp(Math.pow(dilutionFactor, 0.45), 0.14, 1.0);
-
-      // Perturbation-pressure drag. Narrow thermals lose most of their buoyancy to the
-      // dynamic pressure gradient; a deep, wide tower keeps nearly all of it.
-      const depthFrac = clamp(cloudDepth / Math.max(2000, inst.el - inst.lcl), 0.05, 1.0);
-      const shapeFactor = clamp(0.40 + 0.62 * depthFrac, 0.34, 1.0);
-
-      // A thermal warmer than the CAPE parcel (solar heating, gust-front forcing) starts with
-      // extra buoyancy in the sub-cloud and capped layers, which is what lets convection
-      // initiate at all when the mixed-layer parcel is still slightly stable.
-      // A thermal warmer than the CAPE parcel (solar heating, gust-front convergence) carries
-      // extra buoyancy of its own. This is the perturbation that lets convection initiate when
-      // the mixed-layer parcel profile is still marginally stable.
-      const thermalExcessK =
-        (0.85 + 1.15 * solar * Math.min(1.35, this.boundaryLayerThermalEnergy)) *
-        (1.0 + 0.5 * gustFrontLiftBoost);
-      const excessBuoyancy =
-        (PHYS.G * thermalExcessK) / Math.max(240, sounding.tempKAt(zEval));
-
-      // Cap erosion: surface heating and gust-front mixing gradually remove the inversion, so
-      // the negative buoyancy between LCL and LFC weakens through the run. Applied only to the
-      // negative part of B(z) — CAPE above the LFC is untouched.
-      // Surface heating and gust-front mixing erode the inversion, so only the *negative*
-      // part of the profile weakens with time; CAPE above the LFC is untouched.
-      const cappedB = cappedEnvB < 0 ? cappedEnvB * (1.0 - capErosionProgress) : cappedEnvB;
-
+      // Cold-pool undercutting removes buoyancy from the inflow, which shows up as a direct
+      // momentum sink rather than a buoyancy term.
+      const coldPoolDrag = coldPoolBuoyancyPenalty * 6.0;
+      // Hydrometeor loading: precipitation that has not yet fallen out weighs on the column.
+      // Shear tilts the shaft downshear out of the updraft, which is why a sheared storm carries
+      // its load without collapsing the way a vertical one does.
       const shearSeparation = Math.min(1.0, inst.bulkShear06km / 18.0);
-      const loadingDrag =
-        mpOut.precipLoadingDragMS2 * (1.0 - 0.72 * shearSeparation);
+      const loadingDrag = mpOut.precipLoadingDragMS2 * (1.0 - 0.72 * shearSeparation) * 9.0;
 
-      // The thermal excess is a near-surface perturbation: it decays with height as the plume
-      // entrains, so it matters below the LFC and fades through the deep convective layer.
-      const excessDecay = clamp(1.0 - cloudDepth / Math.max(1200, inst.el - inst.lcl), 0.0, 1.0);
-
-      let buoyancyMS2 =
-        cappedB * entrainmentEfficiency * shapeFactor +
-        excessBuoyancy * shapeFactor * excessDecay * excessDecay -
-        loadingDrag -
-        coldPoolBuoyancyPenalty;
-
-      // Above the equilibrium level the profile already turns negative, but an overshooting
-      // dome also feels the extra static stability of the lower stratosphere.
-      if (cell.cloudTopM > inst.el) {
-        buoyancyMS2 -= 0.00035 * (cell.cloudTopM - inst.el);
-      }
-
-      // Mesocyclone rotational dynamics when vertical shear & SRH tilt horizontal vorticity
-      // into the updraft.
-      if (cell.cloudTopM > inst.lfc + 1200 && cell.updraftMaxMS > 6.0 && inst.bulkShear06km > 12.0) {
-        const tiltingSource =
-          (inst.bulkShear06km / 6000.0) *
-          (cell.updraftMaxMS / Math.max(1200, cell.radiusM)) *
-          (1.0 + inst.srh03km / 220.0) *
-          (cell.rightMoverBias >= 0 ? 1.0 : -0.65);
-        // The damping coefficient sets the mesocyclone's spin-down e-folding time, and 0.018/s
-        // was 55 seconds: real mesocyclones persist for tens of minutes, so the tilt source never
-        // got to accumulate. With bulkShear ~19 m/s the old equilibrium was |zeta| ~ 7e-4, which
-        // measured 23x below the 0.011 supercell-stage threshold -- the supercell stage, Bunkers
-        // right-deviant steering, hook-echo RFD wrapping and cell splitting were all dead code.
-        // 0.0010/s gives a ~17 minute e-folding and an equilibrium of ~0.013 for a typical cell,
-        // rising above 0.02 for a vigorous narrow updraft, so supercells now occur selectively
-        // rather than never.
-        // Vortex stretching is the term that actually grows a mesocyclone: tilting supplies a
-        // fixed source and on its own saturates near |zeta| ~ 7e-4 s^-1, an order of magnitude
-        // below the 1.1e-2 supercell threshold. Stretching by the updraft's vertical velocity
-        // gradient supplies positive feedback on the spin already present. The efficiency tapers
-        // as zeta nears a strong observed mesocyclone value (0.045 s^-1), which makes the
-        // feedback saturate instead of running away, and puts the equilibrium for a vigorous
-        // deep updraft at ~0.015 -- just above the supercell threshold, so only the strongest
-        // cells reach that stage rather than all of them or none.
-        const spinDepth = Math.max(1200, cell.cloudTopM - cell.cloudBaseM);
-        const stretchRate = (cell.updraftMaxMS / spinDepth) *
-          0.55 * Math.max(0, 1.0 - Math.abs(cell.mesocycloneVorticity) / 0.045);
-        cell.mesocycloneVorticity +=
-          (tiltingSource * 0.45 +
-            cell.mesocycloneVorticity * stretchRate -
-            cell.mesocycloneVorticity * 0.0010) * dt;
-      } else {
-        // Spin-down once tilting stops: still far slower than the 33 s of the old coefficient,
-        // because a mesocyclone does not vanish the instant the updraft dips below threshold.
-        cell.mesocycloneVorticity *= Math.max(0, 1.0 - 0.008 * dt);
-      }
-      cell.rotationPhase += cell.mesocycloneVorticity * dt * 8.0;
-
-      // Non-hydrostatic perturbation pressure deficit in a rotating updraft adds buoyancy.
+      // Rotating updrafts are dynamically supported: the same low-pressure core that makes a
+      // mesocyclone also sucks air upward through it.
       const dynamicPressureBoost =
         Math.abs(cell.mesocycloneVorticity) > 0.006
-          ? Math.min(0.085, Math.abs(cell.mesocycloneVorticity) * 3.4)
+          ? Math.min(6.5, Math.abs(cell.mesocycloneVorticity) * 240.0)
           : 0;
 
-      // Mature-storm ageing: non-rotating cells are eventually choked by their own cold pool.
+      // A congested tower's own turbulence is a drag: the updraft decelerates into the anvil
+      // once it has topped out. This is separate from the plume's internal drag because it acts
+      // on the *cell* once the cloud has depth above its equilibrium level.
+      const overshootBrake = cell.cloudTopM > inst.el ? 0.00042 * (cell.cloudTopM - inst.el) * 40.0 : 0;
+
+      const targetW = clamp(
+        plumeSpeed + dynamicPressureBoost - loadingDrag - coldPoolDrag - overshootBrake,
+        0,
+        62
+      );
+
+      // Relaxation time: an updraft's momentum equilibrates over roughly one overturning time,
+      // (cloud depth)/w. For a 6 km tower at 15 m/s that is ~400 s, but the response is faster
+      // than that on the way up (accelerating) and slower on the way down (inertia), so use a
+      // 120 s rise and 400 s decay time constant.
+      const wNow = cell.updraftMaxMS;
+      const tau = targetW > wNow ? 90 : 420;
+      const relaxMs = 1.0 - Math.exp(-dt / tau);
+
+      // Non-hydrostatic perturbation pressure deficit of the rotating core, reported to the HUD.
+      cell.buoyancyAccel = (targetW - wNow) / Math.max(1, tau) + samplePlume(plume, zEval).buoyancy;
+
+      // Mature-storm ageing: a non-rotating cell is eventually choked by its own cold pool. The
+      // plume already produces that through entrainment and loading; this term adds the
+      // mesoscale outflow component that the single-column model cannot see.
       const lifecycleExhaustion =
         cell.ageSec > 1500 && Math.abs(cell.mesocycloneVorticity) < 0.01
           ? 0.000075 * (cell.ageSec - 1500)
           : 0;
 
-      cell.buoyancyAccel =
-        buoyancyMS2 + dynamicPressureBoost - lifecycleExhaustion;
+      cell.updraftMaxMS = clamp(
+        wNow + (targetW - wNow) * relaxMs - lifecycleExhaustion * dt,
+        -3.0,
+        62.0
+      );
 
-      // Integrate rather than relax to the equilibrium speed: a thermal that arrives at the
-      // capping inversion with kinetic energy keeps rising while it decelerates, which is how
-      // real convection punches through a modest cap.
-      const w = cell.updraftMaxMS;
-      const dragMS2 = (w * Math.abs(w)) / updraftRadiusEff;
-      let dw = (cell.buoyancyAccel - dragMS2) * dt;
-      // The explicit drag term must never reverse the velocity inside one step.
-      if (dragMS2 > 0 && dw < -0.6 * w) dw = -0.6 * w;
-      cell.updraftMaxMS = clamp(w + dw, -3.0, 58.0);
 
       // ---- Downdraft: sub-cloud evaporative/melt cooling plus precipitation loading ----
       const subCloudDepth = Math.max(350, cell.cloudBaseM);
@@ -363,26 +310,36 @@ export class ConvectiveCellManager {
       // The visible cloud base sits at the LCL once the tower is established; a shallow
       // thermal still has its condensate deck forming, so the base relaxes in only after the
       // top has cleared the LCL. This keeps the sub-LCL dry-thermal branch meaningful.
-      const targetBaseM = cell.cloudTopM > inst.lcl + 250 ? inst.lcl : Math.min(inst.lcl, cell.cloudTopM);
+      // A cell cannot have a base below the lifting condensation level: condensate does not
+      // exist in unsaturated air, so the visible cloud starts at the LCL and the sub-cloud
+      // tower below it is invisible (it still exists in the plume). The old code let the base
+      // relax to `min(lcl, cloudTop)` and simultaneously allowed the top to be driven by a
+      // morphology factor, which occasionally put a "cloud" 300 m above ground on a day with a
+      // 1 km LCL.
+      const lclFloor = Math.max(180, inst.lcl);
+      const targetBaseM = cell.cloudTopM > lclFloor + 250 ? lclFloor : Math.min(lclFloor, cell.cloudTopM);
       cell.cloudBaseM += (targetBaseM - cell.cloudBaseM) * (1.0 - Math.exp(-dt / 70.0));
       if (cell.cloudTopM < cell.cloudBaseM) cell.cloudBaseM = cell.cloudTopM;
+      if (cell.cloudTopM > lclFloor + 200) cell.cloudBaseM = Math.max(cell.cloudBaseM, lclFloor * 0.94);
 
       if (cell.updraftMaxMS > 0.25) {
-        // The cloud top rises at the updraft speed *at the top of the cloud*, not at w_max.
-        // In a shallow cumulus the peak updraft sits right below the cap, so the top climbs at
-        // ~0.88 w; in a deep mature tower w_max is mid-cloud and the top spreads into an anvil,
-        // so it climbs at ~0.44 w. Blending on depth reproduces both growth regimes.
+        // The cloud top rises at the *plume*'s cap-rise speed, not at w_max, and it is bounded
+        // by the height where the plume itself stops rising. That bound is what makes the
+        // sounding control storm depth: a sounding with a strong cap or a dry layer aloft caps
+        // the tower, while a deep moist profile lets it reach the tropopause. The old growth law
+        // pushed every cell toward `inst.el * morph.top` regardless of the environment.
         const capRiseFactor = clamp(0.88 - 0.44 * (cloudDepth / 9000.0), 0.4, 0.88);
-        const capRise = cell.updraftMaxMS * capRiseFactor;
-        const maxPhysicalTop =
-          (inst.cape > 80
-            ? inst.el + Math.min(2400, cell.updraftMaxMS * 42.0)
-            : inst.lcl + 900 + cell.updraftMaxMS * 180.0) *
-          morph.top;
+        const capRise = cell.updraftMaxMS * capRiseFactor * 0.62;
+        // Physical ceiling: the plume top (plus a bounded overshoot the kinetic energy supports).
+        const plumeCeiling = plume.topM + Math.min(2600, 0.5 * (cell.updraftMaxMS * cell.updraftMaxMS) / 9.8);
+        const morphologyCeiling = inst.cape > 80
+          ? inst.el * morph.top + 1800
+          : inst.lcl + 900 + cell.updraftMaxMS * 150.0;
+        const maxPhysicalTop = Math.min(plumeCeiling, morphologyCeiling);
         if (cell.cloudTopM < maxPhysicalTop) {
           cell.cloudTopM += capRise * dt;
         } else {
-          cell.cloudTopM += (maxPhysicalTop - cell.cloudTopM) * (1.0 - Math.exp(-dt / 26.0));
+          cell.cloudTopM += (maxPhysicalTop - cell.cloudTopM) * (1.0 - Math.exp(-dt / 40.0));
         }
       } else {
         // Subsidence & cloud top collapse during dissipation
@@ -731,10 +688,13 @@ export class ConvectiveCellManager {
     const dz = sounding.windWAt(9500) - lowW;
     const dMag = Math.max(0.1, Math.hypot(dx, dz));
 
-    const lcl = sounding.instability.lcl;
-    // Start the parcel as a shallow surface thermal: it must climb to the LCL under its own
-    // buoyancy, so the dry-adiabatic stage is simulated rather than skipped.
-    const startTop = Math.max(280, Math.min(lcl * 0.55, 620));
+    const lcl = Math.max(200, sounding.instability.lcl);
+    // A cell object represents *cloud*, so it is born at the lifting condensation level: the
+    // dry-rise stage below it belongs to the boundary-layer thermals (the mesoscale thermal
+    // energy field), not to a cloud with sub-LCL condensate. Spawning the tower partway up the
+    // sub-cloud layer used to put a visible cloud base 200-800 m above ground on a day whose
+    // LCL was at 1 km, which is physically impossible and showed up on every radar cross-section.
+    const startTop = lcl + 40;
 
     this.cells.push({
       id,
@@ -749,12 +709,17 @@ export class ConvectiveCellManager {
       // archetypes and the run stays reproducible.
       morphology: this.pickMorphology(sounding.instability),
       radiusM,
-      cloudBaseM: startTop * 0.42,
+      cloudBaseM: lcl,
       cloudTopM: startTop,
       anvilRadiusM: 0,
       anvilAxisX: dx / dMag,
       anvilAxisZ: dz / dMag,
       overshootingTopM: 0,
+      plumeProfile: null,
+      plumeRadiusM: 0,
+      plumeInflowMS: 0,
+      plumeAgeSec: 0,
+      baseInflowMS: 2.0,
       updraftMaxMS: initUpdraftMS,
       downdraftMaxMS: 0,
       buoyancyAccel: 0.02,
@@ -1029,6 +994,56 @@ export class ConvectiveCellManager {
       if (Math.hypot(c.x - x, c.z - z) < minDistM) return true;
     }
     return false;
+  }
+
+  /**
+   * Rebuilds the cell's 1-D entraining-plume profile, reusing the cached one while nothing that
+   * sets it has changed. The profile is a function of the environmental sounding, the cell's
+   * core radius, the inflow kinetic energy and the source thermodynamics, all of which evolve
+   * on minute timescales — rebuilding it every 2.5 s sub-step for a dozen cells is measurable but
+   * not free, so the cache keys on the radius and the inflow instead of the wall clock.
+   */
+  private refreshPlume(
+    cell: ConvectiveCell,
+    sounding: AtmosphericSounding,
+    inst: { lcl: number; lfc: number },
+    solar: number,
+    condensateEfficiency: number,
+    entrainFactor: number
+  ): void {
+    cell.plumeAgeSec += 1;
+    const stale =
+      !cell.plumeProfile ||
+      Math.abs(cell.plumeRadiusM - cell.radiusM) > Math.max(60, cell.radiusM * 0.08) ||
+      Math.abs(cell.plumeInflowMS - cell.baseInflowMS) > 0.8 ||
+      cell.plumeAgeSec > 40;
+    if (!stale) return;
+    cell.plumeAgeSec = 0;
+    cell.plumeRadiusM = cell.radiusM;
+    cell.plumeInflowMS = cell.baseInflowMS;
+
+    // Localize the source: a cell sitting in rain-cooled outflow has a colder, moister mixed
+    // layer than one over sunlit ground, and that shows up directly in its plume.
+    let theta0 = sounding.mlThetaK;
+    let qv0 = sounding.mlQvGKg;
+    if (this.env) {
+      const local = this.env.sampleAt(cell.x, cell.z);
+      theta0 += local.thetaPert * 0.55;
+      qv0 += local.qvPert * 0.75;
+    }
+    // Solar heating lowers the effective source temperature the plume must beat.
+    const excess = 0.35 * Math.max(0.3, solar) * (1.0 + 0.25 * condensateEfficiency);
+    cell.plumeProfile = buildPlumeProfile(
+      sounding,
+      {
+        theta0,
+        qv0GKg: Math.max(1, qv0),
+        radiusM: Math.max(240, cell.radiusM / Math.max(0.5, entrainFactor)),
+        thermalExcessK: excess,
+      },
+      cell.baseInflowMS
+    );
+    void inst;
   }
 
   private classifyCellStage(

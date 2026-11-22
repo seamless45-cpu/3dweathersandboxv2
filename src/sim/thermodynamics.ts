@@ -6,6 +6,14 @@ import {
   SoundingProfileLevel,
 } from './types';
 
+/**
+ * Convective mixed-layer depth (m) and its potential-temperature offset over the free
+ * troposphere. A well-developed daytime boundary layer is 800-1200 m deep and sits 0.5-1.5 K
+ * above the air it is entraining from aloft, which is what makes the capping inversion a
+ * *stable jump* rather than an absence of one.
+ */
+const MIXED_LAYER_NOMINAL_TOP = 800;
+
 export interface SoundingPreset {
   id: string;
   label: string;
@@ -149,7 +157,11 @@ export function saturationMixingRatioIce(tempK: number, pressurePa: number): num
 /** Moist adiabatic lapse rate Gamma_m (K/m) */
 export function moistAdiabaticLapseRateKPerM(tempK: number, pressurePa: number): number {
   const qvs = saturationMixingRatioLiquid(tempK, pressurePa);
-  const lv = tempK < PHYS.T_FREEZE ? PHYS.L_S : PHYS.L_V;
+  // Latent heat blends linearly across the mixed-phase zone (−20..0 °C) instead of switching
+  // abruptly at 0 °C: a hard L_V → L_S switch puts a jump in the moist lapse rate, which makes
+  // the lifted parcel kink at the freezing level and the buoyancy profile non-monotone there.
+  const iceFrac = Math.max(0, Math.min(1, (PHYS.T_FREEZE - tempK) / 20.0));
+  const lv = PHYS.L_V * (1.0 - iceFrac) + PHYS.L_S * iceFrac;
   const numerator =
     PHYS.G * (1.0 + (lv * qvs) / (PHYS.R_D * tempK));
   const denominator =
@@ -199,6 +211,17 @@ export class AtmosphericSounding {
   /** Running integral of parcelBuoyArr (J/kg), so layer-mean buoyancy is a two-lookup difference. */
   public parcelBuoyIntegralArr!: Float32Array;
 
+  /**
+   * Mixed-layer source state of the CAPE parcel. The plume model lifts exactly this parcel, so
+   * the updraft the cell dynamics integrate and the CAPE the HUD reports describe the same air.
+   * Without this the two disagreed by thousands of J/kg, which is how a "4200 J/kg" sounding
+   * could produce a 55 m/s updraft one frame and a 4 m/s one the next.
+   */
+  public mlThetaK = 300;
+  public mlQvGKg = 12;
+  public mlThermalExcessK = 0.4;
+  public surfacePressurePa = 101000;
+
   public instability: InstabilityTelemetry = {
     cape: 0,
     cin: 0,
@@ -206,11 +229,18 @@ export class AtmosphericSounding {
     lfc: 1800,
     el: 11000,
     freezingLevel: 4100,
+    wetBulbZeroLevel: 2800,
     homogeneousFreezeLevel: 9400,
     lapseRate03km: 7.0,
+    lapseRate700500: 7.0,
     bulkShear06km: 15,
+    shear01km: 6,
     srh03km: 120,
+    liftedIndex: 0,
+    dcape: 0,
+    stp: 0,
     precipitableWaterMM: 35,
+    convectiveTempC: 25,
     bunkersStormU: 6,
     bunkersStormW: -4,
   };
@@ -253,7 +283,117 @@ export class AtmosphericSounding {
       Math.min(15200, 12800 + (cfg.surfaceTempC - 26.0) * 180)
     );
 
+    // -------------------------------------------------------------------------------------
+    // Vertical structure, built in POTENTIAL TEMPERATURE and transformed afterwards.
+    //
+    // Constructing a sounding in temperature and then pasting a "well-mixed boundary layer" on
+    // top is a trap: the mixed layer is defined by uniform theta, so the two constructions only
+    // agree if a jump is placed exactly at the mixed-layer top, and any misplacement either
+    // produces a superadiabatic layer (no parcel is buoyant) or warms the whole troposphere
+    // (CAPE inflated two- to threefold). Building theta(z) directly makes the structure exact:
+    //
+    //   theta(z) = theta_ml                                   z <= h_ml      well-mixed BL
+    //            = theta_ml + dCap·exp(-((z-h_ml)/w)²)        capping inversion
+    //            = theta_free(z)                              free troposphere
+    //   T(z)     = theta(z)·(p/p0)^(R/cp)
+    //
+    // and continuity is automatic because theta_free(h_ml) = theta_ml by construction.
+    // -------------------------------------------------------------------------------------
+    const thetaSfc = t0 * Math.pow(100000.0 / p0, PHYS.R_D / PHYS.CP);
+    // The mixed layer is a well-mixed layer with a small superadiabatic excess at the ground
+    // (0.3 K at full sun), so theta_ml sits just above the surface potential temperature.
+    const blSuperadiabaticK = 0.3 * Math.max(0.4, cfg.solarHeatingFactor);
+    const thetaMl = thetaSfc + blSuperadiabaticK;
+    const mixedLayerTopM = MIXED_LAYER_NOMINAL_TOP;
+    // ---- Free-tropospheric temperature profile -----------------------------------------
+    // A constant θ-gradient is the wrong way to specify a lapse rate: with dθ/dz fixed the
+    // *temperature* lapse (γ = γ_d − dθ/dz) gradually steepens as the air thins, so a preset
+    // "6.55 K/km" is really 6.55 at the ground, ~6.8 at 700 hPa and ~7.0 at 500 hPa. That
+    // systematically inflates CAPE by a factor of two or more (measured: 9768 J/kg on a
+    // sounding whose surface lapse rate implies ~3000).
+    //
+    // Instead T(z) is specified directly and the pressure follows from the constant-lapse-rate
+    // hydrostatic solution, which is closed form:
+    //
+    //     mixed layer (γ = g/cp):  T = T_s − γ·z,        p = p0·(T/T_s)^(cp/R)
+    //     free trop.  (γ = const): T = T_h − γ·(z−h),    p = p_h·(T/T_h)^(g/(R·γ))
+    //
+    // Both are exact, continuous at the mixed-layer top h, and independent of the vertical
+    // discretisation — so the profile does not change when the grid does.
+    const dryLapseKPerM = PHYS.G / PHYS.CP;
     const gammaEnv = cfg.envLapseRateKPerKm / 1000.0; // K/m
+    const envGamma = Math.max(0.0015, Math.min(dryLapseKPerM - 1.0e-4, gammaEnv));
+
+    // ---- Layered temperature/pressure profile -------------------------------------------
+    // Three constant-lapse segments, each with its own closed-form hydrostatic pressure:
+    //
+    //   1. 0 → h_ml        γ = g/cp   (well-mixed convective boundary layer, dry adiabat)
+    //   2. h_ml → 7 km     γ = preset (conditionally unstable; feeding the deep updraft)
+    //   3. 7 km → tropo    γ = 0.78·preset (upper-tropospheric stabilization)
+    //
+    // The third segment matters more than it looks. With a single lapse rate all the way to the
+    // tropopause the parcel stays buoyant to 14 km and CAPE comes out at 6-7 kJ/kg with the EL
+    // on the tropopause itself — no sounding supports that. Real mid-latitude tropospheres
+    // steepen, then flatten, so the EL lands near 11-12 km and CAPE lands in the 1.5-4 kJ/kg
+    // range where the presets are supposed to live.
+    const upperTropZ = 7000;
+    const upperLapseScale = 0.78;
+    interface Layer {
+      z0: number;
+      z1: number;
+      t0: number;
+      p0: number;
+      gamma: number;
+    }
+    const layers: Layer[] = [];
+    const tSfcLayer = thetaMl * Math.pow(p0 / 100000.0, PHYS.R_D / PHYS.CP);
+    const mlTopTemp = tSfcLayer - dryLapseKPerM * mixedLayerTopM;
+    const mlTopPress = p0 * Math.pow(Math.max(0.05, mlTopTemp / tSfcLayer), PHYS.CP / PHYS.R_D);
+    layers.push({ z0: 0, z1: mixedLayerTopM, t0: tSfcLayer, p0, gamma: dryLapseKPerM });
+    // Free troposphere, split at 7 km.
+    const t7 = mlTopTemp - envGamma * (upperTropZ - mixedLayerTopM);
+    const p7 = mlTopPress * Math.pow(t7 / mlTopTemp, PHYS.G / (PHYS.R_D * envGamma));
+    layers.push({
+      z0: mixedLayerTopM,
+      z1: upperTropZ,
+      t0: mlTopTemp,
+      p0: mlTopPress,
+      gamma: envGamma,
+    });
+    const gammaUpper = Math.max(0.002, envGamma * upperLapseScale);
+    const tTrop = Math.max(190, t7 - gammaUpper * (tropopauseZ - upperTropZ));
+    layers.push({ z0: upperTropZ, z1: 1e9, t0: t7, p0: p7, gamma: gammaUpper });
+
+    /** Temperature of the (cap-free) environment at height z. */
+    const tProfile = (z: number): number => {
+      if (z <= tropopauseZ) {
+        for (let k = 0; k < layers.length; k++) {
+          const L = layers[k];
+          if (z <= L.z1) return L.t0 - L.gamma * (z - L.z0);
+        }
+        return tTrop;
+      }
+      // Lower stratosphere: isothermal just above the tropopause, warming slowly above.
+      return tTrop + 0.0016 * Math.max(0, z - tropopauseZ);
+    };
+    /** Hydrostatic pressure of the environment profile at height z. */
+    const pressureAtM = (z: number): number => {
+      let p = p0;
+      for (let k = 0; k < layers.length; k++) {
+        const L = layers[k];
+        if (z <= L.z0) break;
+        const zTop = Math.min(z, L.z1);
+        const tTop = Math.max(60, L.t0 - L.gamma * (zTop - L.z0));
+        p = L.p0 * Math.pow(tTop / L.t0, PHYS.G / (PHYS.R_D * L.gamma));
+        if (z <= L.z1) return p;
+      }
+      // Stratosphere is isothermal, so pressure continues exponentially.
+      return p * Math.exp((-PHYS.G * Math.max(0, z - tropopauseZ)) / (PHYS.R_D * Math.max(180, tTrop)));
+    };
+
+    // Capping inversion strength in kelvin of theta, spread over ~450 m near 1.65 km.
+    const capJumpTheta = cfg.cappingInversionStrengthK;
+
     const baseDirRad = ((cfg.surfaceWindDirDeg + 180) * Math.PI) / 180.0;
     const dirTurnRad = (cfg.directionalShearDeg * Math.PI) / 180.0;
 
@@ -267,28 +407,26 @@ export class AtmosphericSounding {
     for (let i = 0; i < numLevels; i++) {
       const z = i * this.dz;
 
-      // Environmental temperature profile with boundary-layer mixing, optional capping inversion around 1.65 km, and stratospheric inversion above tropopause
+      // ---- Temperature and pressure from the analytic profile ----------------------------
+      // Temperature: the dry-adiabatic mixed layer, then the constant-lapse free troposphere,
+      // then an isothermal-to-slightly-warming stratosphere that stops an overshooting updraft.
       let tempK: number;
       if (z <= tropopauseZ) {
-        // Slight super-adiabatic / well-mixed lowest 600 m during solar heating
-        const blBoost =
-          cfg.solarHeatingFactor * 1.15 * Math.exp(-z / 450.0);
-        // Capping inversion Gaussian bump centered at z = 1650 m (830 hPa lid)
-        const capBump =
-          cfg.cappingInversionStrengthK *
-          Math.exp(-Math.pow((z - 1650.0) / 420.0, 2));
-        tempK = t0 - gammaEnv * z + blBoost + capBump;
+        tempK = tProfile(z);
       } else {
-        const tempAtTrop =
-          t0 -
-          gammaEnv * tropopauseZ +
-          cfg.cappingInversionStrengthK *
-            Math.exp(-Math.pow((tropopauseZ - 1650.0) / 420.0, 2));
-        // Lower stratosphere warms at ~2.4 K/km, strongly braking convective updrafts
-        tempK = tempAtTrop + 0.0024 * (z - tropopauseZ);
+        // Lower stratosphere: T stops falling, then warms slowly with height.
+        tempK = tProfile(z);
       }
-
+      // Capping inversion: a θ (equivalently T, at fixed pressure) bump centred just above the
+      // mixed-layer top. This is the lid that a plume has to punch through with its stored
+      // kinetic energy, and the reason the sounding runs from suppressed to explosive as the
+      // cap erodes through the morning.
+      if (z > mixedLayerTopM - 500 && z < mixedLayerTopM + 2600) {
+        const capShape = Math.exp(-Math.pow((z - (mixedLayerTopM + 750.0)) / 430.0, 2));
+        tempK += capJumpTheta * capShape;
+      }
       tempK = Math.max(192.0, tempK);
+      currentP = pressureAtM(z);
 
       if (!foundFreeze && tempK <= PHYS.T_FREEZE) {
         freezeZ = z;
@@ -299,21 +437,29 @@ export class AtmosphericSounding {
         foundHomo = true;
       }
 
-      // Hydrostatic pressure step using virtual temperature
-      if (i > 0) {
-        const prev = this.levels[i - 1];
-        const tMean = 0.5 * (prev.tempK + tempK);
-        const tvMean = tMean * (1.0 + 0.608 * prev.qvEnv);
-        currentP = prev.p * Math.exp((-PHYS.G * this.dz) / (PHYS.R_D * tvMean));
-      }
-
-      // Moisture vertical profile: well-mixed boundary layer decaying exponentially above 1.5 km
-      const rhProfile =
-        z < 1200
-          ? rh0 * (1.0 - 0.06 * (z / 1200))
-          : rh0 * 0.94 * Math.exp(-(z - 1200) / 3600.0);
+      // Moisture: the convective boundary layer is well mixed in *mixing ratio* up to ~800 m, then
+      // the relative humidity falls off through the free troposphere. The mid-level dry layer this
+      // creates is what gives real soundings their entrainment-driven updraft decay and their
+      // evaporatively driven downdrafts; a profile with no dry layer above cloud base produces
+      // anvils that fill the whole column.
       const qvs = saturationMixingRatioLiquid(tempK, currentP);
-      const qvEnv = Math.max(1e-6, Math.min(qvs * 0.98, z < 900 ? qv0 * (1.0 - 0.08 * (z / 900)) : rhProfile * qvs));
+      // Free-tropospheric RH profile with the characteristic dry slot at 600-500 hPa: the
+      // entrained air at those levels is what stops a deep updraft, and what makes the
+      // evaporative downdraft cold. Soundings without it (a smooth exponential decay) hold
+      // near-saturation to 8 km, so every parcel stays on the moist adiabat and CAPE reads
+      // two to three times what the lapse rate can actually support.
+      const midLevelDry =
+        z > 1800 && z < 6000
+          ? 1.0 - 0.62 * Math.exp(-Math.pow((z - 4200.0) / 1500.0, 2))
+          : 1.0;
+      const rhFree =
+        z <= 800
+          ? rh0
+          : Math.max(
+              0.045,
+              rh0 * Math.exp(-(z - 800) / 2600.0) * midLevelDry
+            );
+      const qvEnv = Math.max(1e-6, Math.min(qvs * 0.98, z <= 800 ? qv0 * (1.0 - 0.04 * (z / 800)) : rhFree * qvs));
 
       // Dewpoint from vapor pressure
       const ePa = Math.max(1.0, (qvEnv * currentP) / (0.62198 + qvEnv));
@@ -390,10 +536,29 @@ export class AtmosphericSounding {
       this.adiabaticCondIntegralGKg[i] = condIntegral;
     }
 
-    // Compute Parcel Ascent (Mixed-layer + solar surface warm perturbation parcel)
-    const parcelT0 = t0 + 0.8 * cfg.solarHeatingFactor;
-    const parcelQv = qv0;
-    const dryLapse = PHYS.G / PHYS.CP; // 0.00976 K/m
+    // ------------------------------------------------------------------------------------
+    // Mixed-layer parcel ascent.
+    //
+    // The profile was previously lifted from the surface value + a solar perturbation, which
+    // systematically inflates CAPE: a superadiabatic skin 30 m deep can add over a thousand
+    // J/kg of buoyancy a real 100-hPa mixed-layer parcel would never see. The parcel is now the
+    // mean potential temperature and mixing ratio of the lowest 100 hPa (~900 m), which is the
+    // quantity forecast soundings report as MLCAPE, then lifted dry-adiabatically to its LCL
+    // and moist-adiabatically beyond it. Entrainment is not included; that happens in the plume
+    // model downstream, which is where dilution physically belongs.
+    // ------------------------------------------------------------------------------------
+    // The parcel source is the *mixed layer as the environment actually is*: mean potential
+    // temperature through 950 m and the surface-layer mixing ratio. Keeping it consistent with
+    // the profile is what makes CAPE, LI and the plume model agree with each other. The only
+    // superadiabatic excess is the small thermal perturbation a sunny surface gives a rising
+    // parcel (0.4 K at full sun), applied as a potential-temperature offset.
+    this.mlThetaK = thetaMl;
+    this.mlQvGKg = qv0 * 1000.0;
+    this.surfacePressurePa = p0;
+    this.mlThermalExcessK = 0.4 * Math.max(0.2, cfg.solarHeatingFactor);
+    const thetaParcel = this.mlThetaK;
+    const qvParcel = this.mlQvGKg * 1e-3;
+    const parcelT0 = thetaParcel * Math.pow(p0 / 100000.0, PHYS.R_D / PHYS.CP) + this.mlThermalExcessK;
 
     let tp = parcelT0;
     let lcl = DOMAIN_MAX_ALT;
@@ -403,64 +568,166 @@ export class AtmosphericSounding {
     let foundLFC = false;
     let cape = 0;
     let cin = 0;
+    let lastPositiveZ = 0;
+
+    // Moist-adiabat integration helper: one 200 m step of the parcel state.
+    const stepParcel = (tK: number, pPa: number): number => {
+      const gamma = moistAdiabaticLapseRateKPerM(tK, pPa);
+      return tK - gamma * this.dz;
+    };
 
     for (let i = 1; i < numLevels; i++) {
       const lvl = this.levels[i];
       const prev = this.levels[i - 1];
-      const qvsParcel = saturationMixingRatioLiquid(tp, prev.p);
 
-      if (!foundLCL && parcelQv < qvsParcel) {
-        tp -= dryLapse * this.dz;
-        const qvsNext = saturationMixingRatioLiquid(tp, lvl.p);
-        if (parcelQv >= qvsNext) {
-          foundLCL = true;
-          lcl = lvl.z;
-        }
-      } else {
-        if (!foundLCL) {
+      if (!foundLCL) {
+        // Dry adiabat: conserve potential temperature (not a fixed lapse), then locate the
+        // saturation level explicitly.
+        const thetaP = parcelT0 * Math.pow(100000.0 / p0, -PHYS.R_D / PHYS.CP);
+        tp = thetaP * Math.pow(lvl.p / 100000.0, PHYS.R_D / PHYS.CP);
+        if (qvParcel >= saturationMixingRatioLiquid(tp, lvl.p)) {
           foundLCL = true;
           lcl = prev.z;
         }
-        const gammaM = moistAdiabaticLapseRateKPerM(tp, prev.p);
-        tp -= gammaM * this.dz;
+      } else {
+        tp = stepParcel(tp, prev.p);
       }
+      if (!foundLCL) continue;
 
-      const qvCurrent = foundLCL
-        ? Math.min(parcelQv, saturationMixingRatioLiquid(tp, lvl.p))
-        : parcelQv;
+      const qvCurrent = Math.min(qvParcel, saturationMixingRatioLiquid(tp, lvl.p));
       const tvParcel = tp * (1.0 + 0.608 * qvCurrent);
       const tvEnv = lvl.tempK * (1.0 + 0.608 * lvl.qvEnv);
       const buoy = PHYS.G * ((tvParcel - tvEnv) / tvEnv);
 
       this.parcelBuoyArr[i] = buoy;
-      // Trapezoidal running integral of B(z) in J/kg.
       this.parcelBuoyIntegralArr[i] =
         this.parcelBuoyIntegralArr[i - 1] + 0.5 * (buoy + this.parcelBuoyArr[i - 1]) * this.dz;
-      // Condensate the parcel has produced so far (0 while it is still sub-saturated).
-      this.parcelCondArr[i] = foundLCL ? Math.max(0, (parcelQv - qvCurrent) * 1000.0) : 0;
+      this.parcelCondArr[i] = Math.max(0, (qvParcel - qvCurrent) * 1000.0);
 
+      // CAPE is positive area between the LFC and the EL, not any buoyant patch: a parcel that
+      // is briefly buoyant below a cap, then suppressed again, does not contribute. Pockets of
+      // positive buoyancy above the EL (a second unstable layer, e.g. above an inversion aloft)
+      // are excluded as well.
       if (buoy > 0 && lvl.z >= lcl) {
         if (!foundLFC) {
           foundLFC = true;
           lfc = lvl.z;
         }
-        cape += buoy * this.dz;
+        if (!el) {
+          cape += buoy * this.dz;
+          lastPositiveZ = lvl.z;
+        }
+      } else if (foundLFC && buoy <= 0 && !el && lvl.z >= lcl) {
+        // The first non-buoyant level above the LFC defines the equilibrium level.
         el = lvl.z;
-      } else if (!foundLFC && buoy < 0 && lvl.z < 5000) {
+      }
+      if (!foundLFC && buoy < 0 && lvl.z < 5500) {
+        // Inhibition is only the negative area a parcel must overcome on its way *to* the LFC.
+        // Above the tropopause negative buoyancy is the stratosphere doing its job, not a cap.
         cin += Math.abs(buoy) * this.dz;
       }
     }
+    if (foundLFC) el = lastPositiveZ;
+
+    // Parcel condensate is only meaningful once the parcel is above its LCL; zero below.
+    for (let i = 0; i < numLevels && this.levels[i].z < lcl; i++) this.parcelCondArr[i] = 0;
 
     if (!foundLCL) {
       lcl = Math.max(800, 125.0 * (cfg.surfaceTempC - (this.levels[0].dewpointK - 273.15)));
+      // No LCL found means the column never saturates: keep a dry-adiabatic buoyancy profile so
+      // the plume model still has something physically meaningful to integrate.
+      for (let i = 1; i < numLevels; i++) {
+        const lvl = this.levels[i];
+        const thetaP = parcelT0 * Math.pow(100000.0 / p0, -PHYS.R_D / PHYS.CP);
+        const tDry = thetaP * Math.pow(lvl.p / 100000.0, PHYS.R_D / PHYS.CP);
+        const buoy = PHYS.G * ((tDry - lvl.tempK) / lvl.tempK);
+        this.parcelBuoyArr[i] = buoy;
+        this.parcelBuoyIntegralArr[i] =
+          this.parcelBuoyIntegralArr[i - 1] + 0.5 * (buoy + this.parcelBuoyArr[i - 1]) * this.dz;
+      }
     }
     if (!foundLFC) {
       lfc = lcl + 600;
       el = lcl + 1200;
     }
 
-    // Compute 0-6 km Bulk Shear, Bunkers Storm Motion, and 0-3 km SRH
+    // ---- Lifted Index (500 hPa) -----------------------------------------------------------
+    // LI = T500(env) - T500(parcel), where the parcel is the mixed-layer parcel lifted along
+    // the same dry/moist path used above. Negative values indicate instability.
+    let liftedIndex = 0;
+    {
+      const z500 = 5500; // ~500 hPa in a standard atmosphere
+      let tParcel = parcelT0;
+      let saturated = false;
+      for (let z = 0; z < z500; z += this.dz) {
+        if (!saturated && foundLCL && z >= lcl) saturated = true;
+        if (saturated) {
+          tParcel = stepParcel(tParcel, this.pressurePaAt(z));
+        } else {
+          const thetaP = parcelT0 * Math.pow(100000.0 / p0, -PHYS.R_D / PHYS.CP);
+          tParcel = thetaP * Math.pow(this.pressurePaAt(z + this.dz) / 100000.0, PHYS.R_D / PHYS.CP);
+        }
+      }
+      liftedIndex = this.tempKAt(z500) - tParcel;
+    }
+
+    // ---- Downdraft CAPE -------------------------------------------------------------------
+    // A saturated downdraft descends moist-adiabatically from ~700 hPa; DCAPE is the negative
+    // buoyancy it accumulates relative to the environment, and sets how cold a storm's outflow
+    // can become. Deep dry layers under cloud base are what make strong gust fronts.
+    let dcape = 0;
+    {
+      const zStart = Math.min(3200, this.levels[numLevels - 1].z * 0.35);
+      let tD = this.tempKAt(zStart);
+      let z = zStart;
+      while (z > 200) {
+        const pHere = this.pressurePaAt(z);
+        const gamma = moistAdiabaticLapseRateKPerM(tD, pHere);
+        tD += gamma * this.dz;
+        z -= this.dz;
+        const tEnv = this.tempKAt(Math.max(200, z));
+        const tvD = tD * (1.0 + 0.608 * saturationMixingRatioLiquid(tD, this.pressurePaAt(z)));
+        if (tvD < tEnv) dcape += PHYS.G * ((tEnv - tvD) / tEnv) * this.dz;
+      }
+    }
+
     const lvl0 = this.levels[0];
+
+    // ---- 0-1 km shear (supercell / tornado ingredient) ------------------------------------
+    const lvl1km = this.sampleAtAltitude(1000);
+    const shear01km = Math.hypot(lvl1km.windU - lvl0.windU, lvl1km.windW - lvl0.windW);
+
+    // ---- Wet-bulb zero ------------------------------------------------------------------
+    // Hailstone survival is governed by the depth of the layer between the freezing level and
+    // the wet-bulb zero, not the dry-bulb 0 °C isotherm alone.
+    let wetBulbZero = 0;
+    {
+      for (let i = 0; i < numLevels; i++) {
+        const tw = wetBulbTemperatureK(this.tArr[i], this.tdArr[i], this.pArr[i]);
+        if (tw <= PHYS.T_FREEZE) {
+          wetBulbZero = this.levels[i].z;
+          break;
+        }
+      }
+      if (wetBulbZero <= 0) wetBulbZero = Math.max(0, (foundFreeze ? freezeZ : 4000) - 700);
+    }
+
+    // ---- Convective temperature ---------------------------------------------------------
+    // Surface temperature needed to warm the mixed layer enough to break the cap. A forecaster
+    // reads this straight off the skew-T; here it is estimated from the ML parcel deficit: the
+    // CIN has to be made up by ~105 J/kg per K of boundary-layer warming.
+    const convectiveTempC = foundLCL && lfc > lcl
+      ? cfg.surfaceTempC + Math.min(14, Math.max(0, cin / 105.0))
+      : cfg.surfaceTempC;
+
+
+    // Mid-level lapse rate between 700 and 500 hPa, evaluated between 4.0 and 6.5 km.
+    const lapse700500 = Math.max(
+      0,
+      ((this.tempKAt(4000) - this.tempKAt(6500)) / 2500.0) * 1000.0
+    );
+
+    // Compute 0-6 km Bulk Shear, Bunkers Storm Motion, and 0-3 km SRH
     const lvl3km = this.sampleAtAltitude(3000);
     const lvl6km = this.sampleAtAltitude(6000);
 
@@ -499,6 +766,19 @@ export class AtmosphericSounding {
       srh += srw * du - sru * dw;
     }
 
+    // ---- Significant Tornado Parameter --------------------------------------------------
+    // Thompson et al. (2003) form: MLCAPE/1500 x (2000-MLLCL)/1000 x SRH/150 x shear01/25 x
+    // (200+CIN)/150. Values above ~1 indicate environments that support tornadic supercells.
+    let stp = 0;
+    {
+      const capeTerm = Math.max(0, cape) / 1500;
+      const lclTerm = Math.max(0, 2000 - lcl) / 1000;
+      const srhTerm = Math.max(0, Math.abs(srh)) / 150;
+      const shearTerm = Math.max(0, shear01km) / 25;
+      const cinTerm = Math.max(0, 200 - cin) / 150;
+      stp = Math.max(0, Math.min(10, capeTerm * lclTerm * srhTerm * shearTerm * cinTerm));
+    }
+
     const lapse03 = ((lvl0.tempK - lvl3km.tempK) / 3000.0) * 1000.0;
 
     this.instability = {
@@ -508,11 +788,18 @@ export class AtmosphericSounding {
       lfc,
       el,
       freezingLevel: foundFreeze ? freezeZ : 4000,
+      wetBulbZeroLevel: wetBulbZero,
       homogeneousFreezeLevel: foundHomo ? homoFreezeZ : 9500,
       lapseRate03km: lapse03,
+      lapseRate700500: lapse700500,
       bulkShear06km,
+      shear01km,
       srh03km: Math.max(0, Math.abs(srh)),
+      liftedIndex,
+      dcape,
+      stp,
       precipitableWaterMM: pwIntegral, // 1 kg/m^2 = 1 mm
+      convectiveTempC,
       bunkersStormU: bunkersU,
       bunkersStormW: bunkersW,
     };
@@ -580,6 +867,14 @@ export class AtmosphericSounding {
   /** Environmental saturation mixing ratio (g/kg) — the vapor actually available to a cloud. */
   public qSatGKgAt(z: number): number {
     return this.interp(this.qSatGKg, z);
+  }
+  /** Environmental potential temperature at altitude z, K. */
+  public thetaEnvAt(z: number): number {
+    return this.interp(this.thetaArr, z);
+  }
+  /** Environmental mixing ratio at altitude z, kg/kg. */
+  public qvEnvAtScalar(z: number): number {
+    return this.interp(this.qvArr, z);
   }
   public windUAt(z: number): number {
     return this.interp(this.uArr, z);
@@ -653,4 +948,27 @@ export class AtmosphericSounding {
   public condGKgPerKmAt(z: number): number {
     return this.interp(this.adiabaticCondGKgPerKm, z);
   }
+}
+
+/**
+ * Wet-bulb temperature (K) from dry-bulb and dewpoint by the Stull (2011) approximation,
+ * inverted from the vapour-pressure form and clamped to the saturated branches. Accurate to
+ * ~0.3 K over the ranges this simulation spans, which is far inside the uncertainty of the
+ * hail-melting parameterisation that consumes it.
+ */
+export function wetBulbTemperatureK(tempK: number, dewpointK: number, pressurePa: number): number {
+  const tc = tempK - 273.15;
+  const rh = Math.max(0.02, Math.min(1, Math.exp((17.625 * (dewpointK - tempK)) / (243.04 + (dewpointK - 273.15)))));
+  const p = Math.max(30000, pressurePa) / 100.0; // hPa
+  // Stull (2011), eq. 3: Tw = T atan(0.151977 sqrt(RH+8.313659)) + atan(T+RH) - atan(RH-1.676331)
+  //     + 0.00391838 RH^1.5 atan(0.023101 RH) - 4.686035, with RH in %.
+  const rhPct = rh * 100.0;
+  const twC =
+    tc * Math.atan(0.151977 * Math.sqrt(rhPct + 8.313659)) +
+    Math.atan(tc + rhPct) -
+    Math.atan(rhPct - 1.676331) +
+    0.00391838 * Math.pow(rhPct, 1.5) * Math.atan(0.023101 * rhPct) -
+    4.686035;
+  void p;
+  return Math.min(tempK, twC + 273.15);
 }
