@@ -335,13 +335,27 @@ export function stepCellMicrophysics(
   }
   // Kessler accretion in g/kg units: 2.2 (Qr Qc)^(7/8) with Q in kg/kg == 0.0124 (qr qc)^0.875,
   // with a modest convective-collection enhancement.
-  const dAccrete =
+  let dAccrete =
     cell.rainGKg > 1e-4 && cell.cloudWaterGKg > 1e-4
       ? Math.min(
           cell.cloudWaterGKg - dAuto,
           0.021 * Math.pow(cell.rainGKg * cell.cloudWaterGKg, 0.875) * stepDt
         )
       : 0;
+  // ---- Rain-water carrying capacity ------------------------------------------------------
+  // A rain shaft has a finite capacity: beyond ~5 g/kg the drops are big enough that
+  // collection outruns supply. The ceiling is applied by *throttling production*, not by
+  // clamping the reservoir — a clamp has to dump the excess somewhere, and dumping it into
+  // the fallout term produced a single-step surface rate of 300,000 mm/h. Throttling keeps the
+  // water budget exact (the surplus simply stays as cloud water until it can be collected)
+  // and keeps the reservoir inside the renderer's 7 g/kg precipitation LUT.
+  const RAIN_MAX_GKG = 5.2;
+  const headroom = Math.max(0, RAIN_MAX_GKG - cell.rainGKg);
+  const produced = dAuto + dAccrete;
+  const accepted = Math.min(produced, headroom);
+  const throttle = produced > 1e-9 ? accepted / produced : 1;
+  dAuto *= throttle;
+  dAccrete *= throttle;
   cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg - dAuto - dAccrete);
   cell.rainGKg += dAuto + dAccrete;
 

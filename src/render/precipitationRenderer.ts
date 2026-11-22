@@ -7,6 +7,12 @@ const RAIN_STREAK_VERT = /* glsl */ `
   attribute float aCornerY; // 0 = top of streak, 1 = bottom of streak
   attribute float aCornerX; // -1 or +1 width
   attribute float aDropScale;
+  // Particle diameter in metres, drawn from a log-normal drop-size distribution, so the
+  // population contains the real mixture of drizzle droplets, raindrops and (when frozen) snow
+  // flakes rather than one size with random jitter.
+  attribute float aDiameterM;
+  // 0 = small/fast-decaying population, 1 = large. Drives which shader lobe the drop uses.
+  attribute float aPopulation;
 
   uniform float uTime;
   uniform vec3 uCameraPos;
@@ -15,6 +21,10 @@ const RAIN_STREAK_VERT = /* glsl */ `
   uniform float uStreakWidth;
   uniform float uStreakLength;
   uniform float uPixelWorldAt1m;
+  /** Horizontal wind at the top and bottom of the near-field box, for streak shear. */
+  uniform vec3 uShearTop;
+  uniform vec3 uShearBottom;
+  uniform float uFrozenMix;
 
   varying float vAlpha;
   varying vec2 vLocalUv;
@@ -24,6 +34,9 @@ const RAIN_STREAK_VERT = /* glsl */ `
   varying vec3 vViewDir;
   varying float vDist;
   varying float vScale;
+  varying float vDiameter;
+  varying float vPopulation;
+  varying float vShear;
 
   void main() {
     // Cull excess instances smoothly based on rain rate
@@ -36,7 +49,17 @@ const RAIN_STREAK_VERT = /* glsl */ `
 
     float boxSpan = 56.0;
     float boxHeight = 36.0;
-    vec3 animated = aSeedPos + uFallVel * uTime * (0.85 + 0.3 * aDropScale);
+    // Fall speed is per-particle and follows the drag law for that drop's diameter, so small
+    // drizzle droplets hang in the air while a 5 mm drop slams down at 9 m/s. Two drops in the
+    // same frame therefore move at visibly different rates, which is the single strongest cue
+    // that a rain curtain has a *size distribution* rather than one speed.
+    float d = max(aDiameterM, 0.0002);
+    float vt = 9.65 * (1.0 - exp(-pow(d / 0.00177, 1.147)));
+    // Frozen particles fall much slower for their size: snow ~1 m/s, graupel ~3-5 m/s.
+    float frozenVt = mix(0.9 + 1.1 * aPopulation, 3.4 + 3.2 * aPopulation, aPopulation);
+    float fallSpeed = mix(mix(vt, uFallVel.y * -1.0, 0.55), frozenVt, uFrozenMix);
+    vec3 localFall = vec3(uFallVel.x, -fallSpeed, uFallVel.z);
+    vec3 animated = aSeedPos + localFall * uTime * (0.85 + 0.3 * aDropScale);
     vec3 rel = mod(animated - uCameraPos + vec3(boxSpan * 0.5, boxHeight * 0.5, boxSpan * 0.5), vec3(boxSpan, boxHeight, boxSpan))
                - vec3(boxSpan * 0.5, boxHeight * 0.5, boxSpan * 0.5);
 
@@ -63,11 +86,21 @@ const RAIN_STREAK_VERT = /* glsl */ `
     // and keeping them at least ~1.7 px wide is what makes them read as droplets rather than as
     // a faint grey haze.
     float minWorld = uPixelWorldAt1m * dist * 1.7;
-    float halfWidth = max(uStreakWidth * aDropScale, minWorld) * 0.5;
+    // Physical width of the streak is the drop's own diameter plus the width smeared out by
+    // its motion during the exposure; below one pixel it is lifted to the pixel floor.
+    float physical = max(aDiameterM, 0.004) * 2.4 + uStreakWidth * aDropScale * 0.35;
+    float halfWidth = max(physical, minWorld) * 0.5;
+
+    // The streak is not a rigid stick: the wind changes across the exposure (shear), so the
+    // top of the streak is displaced relative to the bottom. This is what makes wind-blown
+    // rain read as slanted smears rather than as a field of parallel rods.
+    float shearAmount = mix(uShearBottom.x, uShearTop.x, aCornerY);
+    float shearAmountZ = mix(uShearBottom.z, uShearTop.z, aCornerY);
 
     vec3 worldPt = dropCenter
       + velDir * (aCornerY - 0.5) * uStreakLength * aDropScale
-      + side * (aCornerX * halfWidth * 2.0);
+      + side * (aCornerX * halfWidth * 2.0)
+      + vec3(uShearTop.x - shearAmount, 0.0, uShearTop.z - shearAmountZ) * 0.004;
 
     vAlpha = 1.0 - smoothstep(boxSpan * 0.32, boxSpan * 0.49, dist);
     vLocalUv = vec2(aCornerX * 0.5 + 0.5, aCornerY);
@@ -75,6 +108,9 @@ const RAIN_STREAK_VERT = /* glsl */ `
     vViewDir = viewDir;
     vDist = dist;
     vScale = aDropScale;
+    vDiameter = d;
+    vPopulation = aPopulation;
+    vShear = length(vec2(uShearTop.x - shearAmount, uShearTop.z - shearAmountZ));
 
     gl_Position = projectionMatrix * viewMatrix * vec4(worldPt, 1.0);
   }
@@ -96,6 +132,9 @@ const RAIN_STREAK_FRAG = /* glsl */ `
   varying vec3 vViewDir;
   varying float vDist;
   varying float vScale;
+  varying float vDiameter;
+  varying float vPopulation;
+  varying float vShear;
 
   void main() {
     if (vAlpha <= 0.004) discard;
@@ -137,9 +176,21 @@ const RAIN_STREAK_FRAG = /* glsl */ `
     // separates a curtain of rain from a wall of identical quads.
     float haze = smoothstep(9.0, 46.0, vDist);
     vec3 body = uTint * (0.42 + 0.58 * ndl);
-    vec3 col = body + uLightColor * spec * (0.85 + uFrozenShare * 1.5);
+    // Refracted background: the drop samples the (haze-coloured) scene behind it, tinted by the
+    // body colour. Large drops show a big, sharp inverted image of the world; small droplets
+    // are effectively clear.
+    float lens = smoothstep(0.0008, 0.0055, vDiameter) * (1.0 - uFrozenShare * 0.7);
+    vec3 refracted = mix(body, uHazeColor * 0.72 + uTint * 0.28, lens * 0.55);
+    vec3 col = refracted + uLightColor * spec * (0.85 + uFrozenShare * 1.5);
+    // Fresnel rim: grazing-angle reflections of the sky brighten the drop's silhouette, which
+    // is the cue that makes a curtain of rain visible against a bright sky.
+    col += uHazeColor * fres * (0.35 + 0.55 * uFrozenShare) * caustic * 0.5;
     col = mix(col, uHazeColor, haze * 0.74);
     a *= 1.0 - haze * 0.52;
+    // Small drizzle drops are optically thin: they neither darken nor brighten much, they just
+    // soften the scene behind them. Keeping their alpha low is what makes drizzle read as mist
+    // rather than as a light rain shower.
+    a *= mix(0.55, 1.0, smoothstep(0.0006, 0.0032, vDiameter));
 
     // Ice pellets are brighter and whiter than rain: they scatter rather than refract.
     col = mix(col, vec3(0.93, 0.96, 1.0) * (0.5 + 0.5 * ndl), uFrozenShare * 0.45);
@@ -296,6 +347,9 @@ export class NearFieldPrecipitationRenderer {
         uLightColor: { value: new THREE.Color(1.0, 0.97, 0.92) },
         uHazeColor: { value: new THREE.Color(0.42, 0.47, 0.53) },
         uFrozenShare: { value: 0 },
+        uShearTop: { value: new THREE.Vector3() },
+        uShearBottom: { value: new THREE.Vector3() },
+        uFrozenMix: { value: 0 },
         // World size of one pixel at 1 m distance, used to keep far drops above a pixel wide.
         uPixelWorldAt1m: { value: 0.001 },
       },
@@ -335,6 +389,8 @@ export class NearFieldPrecipitationRenderer {
 
     const seeds = new Float32Array(count * 3);
     const scales = new Float32Array(count);
+    const diameters = new Float32Array(count);
+    const populations = new Float32Array(count);
     let s = 918273;
     const rnd = () => {
       s = (s * 16807) % 2147483647;
@@ -346,10 +402,25 @@ export class NearFieldPrecipitationRenderer {
       seeds[i * 3 + 1] = (rnd() - 0.5) * 36.0;
       seeds[i * 3 + 2] = (rnd() - 0.5) * 56.0;
       scales[i] = 0.65 + rnd() * 0.75;
+      // Log-normal drop-size draw. Real rain spectra are dominated in *number* by 0.3-0.8 mm
+      // droplets but in *water* by 1-3 mm drops, and a hail shaft contains a tail out to 2 cm.
+      // Drawing the diameter rather than the "scale" is what lets one instance field contain
+      // both the fine mist and the fat splashing drops.
+      const u1 = Math.max(1e-6, rnd());
+      const u2 = rnd();
+      const gauss = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(Math.PI * 2.0 * u2);
+      const medianMm = 0.45 + 0.55 * rnd();
+      const sigma = 0.6 + 0.5 * rnd();
+      const diameterMm = Math.max(0.15, Math.min(26.0, medianMm * Math.exp(sigma * gauss)));
+      diameters[i] = diameterMm * 1e-3;
+      // Population weight: 0 = droplet, 1 = large drop / hailstone.
+      populations[i] = Math.min(1, Math.max(0, (diameterMm - 0.35) / 2.4));
     }
 
     geom.setAttribute('aSeedPos', new THREE.InstancedBufferAttribute(seeds, 3));
     geom.setAttribute('aDropScale', new THREE.InstancedBufferAttribute(scales, 1));
+    geom.setAttribute('aDiameterM', new THREE.InstancedBufferAttribute(diameters, 1));
+    geom.setAttribute('aPopulation', new THREE.InstancedBufferAttribute(populations, 1));
     geom.instanceCount = count;
 
     return new THREE.Mesh(geom, this.streakMat);
@@ -459,6 +530,16 @@ export class NearFieldPrecipitationRenderer {
         -fall,
         params.windW * windCoupling * (1.0 + gust * 0.55)
       );
+      // Shear across the near-field box: the difference between the wind at the top of a
+      // streak and at its bottom, which is what slants rain in a strong low-level jet.
+      const shearGain = (1.0 + gust * 1.6) * 0.32;
+      u.uShearTop.value.set(
+        params.windU * windCoupling * shearGain,
+        0,
+        params.windW * windCoupling * shearGain
+      );
+      u.uShearBottom.value.set(0, 0, 0);
+      u.uFrozenMix.value = frozen;
 
       // Streak length is a motion-blur exposure: length = fallSpeed * exposureTime. That makes
       // hail (fast) streak long and snow (slow) read as short dabs, which is the opposite of

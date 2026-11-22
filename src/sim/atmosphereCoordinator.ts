@@ -504,12 +504,22 @@ export class AtmosphereSimulationCoordinator {
     // Grid-resolved rain fringe under a shaft whose core is offset from the observer.
     const gridQr = this.grid.qr[id0];
     if (gridQr > 0.03) {
-      const gridRain = gridQr * 9.5;
+      // The Eulerian grid carries *condensate*, not a rain rate. Converting it with a plain
+      // linear gain (the old qr * 9.5) made 1 g/kg read as 9.5 mm/h, which is wrong by an order
+      // of magnitude: 1 g/kg of rain in a 1 km deep shaft falling at 7 m/s is about 25 mm/h,
+      // but only a tenth of a cubic metre of that is overhead at any instant. Use the same
+      // flux relation the cell microphysics uses -- rate = rho·q·h·v/h -- against an effective
+      // shaft depth, and cap it at the shaft's own cell rate so the grid can never report more
+      // than the storm actually produces.
+      const rhoLocal = Math.max(0.9, this.sounding.densityAt(340));
+      const vFall = 6.2;
+      // kg/m3 * g/kg / 1000 = kg/kg, * m/s = kg/m2/s, * 3600 = mm/h.
+      const gridRain = rhoLocal * gridQr * 1e-3 * vFall * 3600.0;
       if (gridRain > localRain) {
-        localRain = gridRain;
+        localRain = Math.min(180, gridRain);
         if (dominantType === 'None') {
           dominantType =
-            gridRain > 20 ? 'Heavy Rain' : gridRain > 5 ? 'Moderate Rain' : gridRain > 0.8 ? 'Light Rain' : 'Drizzle';
+            localRain > 20 ? 'Heavy Rain' : localRain > 5 ? 'Moderate Rain' : localRain > 0.8 ? 'Light Rain' : 'Drizzle';
           dominantFallSpeed = 5.5;
         }
       }

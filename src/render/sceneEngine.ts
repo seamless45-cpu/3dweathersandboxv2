@@ -99,6 +99,7 @@ export class AtmosphericSceneEngine {
   private frameIndex = 0;
   private realTimeElapsed = 0;
   private windOffset = new THREE.Vector3();
+  private precipDrift = new THREE.Vector3();
   private sunDir = new THREE.Vector3();
   /** Reused camera-shake temporaries: the render hot path must not allocate per frame. */
   private shakeAxis = new THREE.Vector3();
@@ -279,6 +280,9 @@ export class AtmosphericSceneEngine {
         uTime: { value: 0 },
         uSubPixelJitter: { value: new THREE.Vector2() },
         uWindOffset: { value: new THREE.Vector3() },
+        uPrecipDrift: { value: new THREE.Vector3() },
+        uPrecipFallSpeed: { value: 7.0 },
+        uFrozenShare: { value: 0 },
         uDomainSize: { value: DOMAIN_SIZE },
         uMaxAlt: { value: DOMAIN_MAX_ALT },
         uMaxSteps: { value: perfMgr.settings.raymarchSteps },
@@ -626,6 +630,16 @@ export class AtmosphericSceneEngine {
     vu.uDaylight.value = daylight;
     vu.uTime.value = this.realTimeElapsed;
     vu.uWindOffset.value.copy(this.windOffset);
+    // The precipitation curtains drift with the actual low/mid-level flow and fall at the
+    // mass-weighted speed the microphysics reports, so the height field's shafts lean and
+    // streak consistently with the near-field particles.
+    const driftU = coordinator.sounding.windUAt(1800);
+    const driftW = coordinator.sounding.windWAt(1800);
+    this.precipDrift.x -= driftU * realDtSec * 4.5;
+    this.precipDrift.z -= driftW * realDtSec * 4.5;
+    vu.uPrecipDrift.value.copy(this.precipDrift);
+    vu.uPrecipFallSpeed.value = Math.max(0.5, coordinator.observerPrecipFallSpeedMS ?? 7.0);
+    vu.uFrozenShare.value = coordinator.observerFrozenFraction ?? 0;
     vu.uMaxSteps.value = perfMgr.settings.raymarchSteps;
     vu.uCloudDetail.value = coordinator.config.cloudDetailScale;
     vu.uTurbulence.value = coordinator.config.turbulenceIntensity;

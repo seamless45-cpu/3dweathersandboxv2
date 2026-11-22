@@ -52,8 +52,13 @@ export function mixedPhaseChargeReversalFraction(lwcGKg: number, temperatureK: n
   // content. This smooth reversal curve is an empirical bulk parameterization,
   // not a claim to resolve individual ice-graupel collisions.
   const temperatureC = temperatureK - PHYS.T_FREEZE;
+  // Charge reversal (positive graupel) is a warm-cloud effect: it needs a liquid-water fraction
+  // high enough that the graupel surface stays wet. Below about -25 °C the liquid water is gone
+  // and collisions always leave the graupel negative, which is the polarity that builds the
+  // main negative charge region of a thunderstorm.
+  const temperatureGate = Math.max(0, Math.min(1, (temperatureC + 32) / 14));
   const reversalLwc = Math.max(0.45, Math.min(1.8, 1.15 + (temperatureC + 15) * 0.022));
-  return 1 / (1 + Math.exp(-(lwcGKg - reversalLwc) * 2.4));
+  return (1 / (1 + Math.exp(-(lwcGKg - reversalLwc) * 2.4))) * temperatureGate;
 }
 
 export class AtmosphericElectrificationEngine {

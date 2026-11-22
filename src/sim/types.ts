@@ -156,17 +156,30 @@ export interface SoundingProfileLevel {
 }
 
 export interface InstabilityTelemetry {
-  cape: number; // J/kg (SIM)
-  cin: number; // J/kg (SIM, reported as negative or magnitude)
-  lcl: number; // m AGL (SIM)
-  lfc: number; // m AGL (SIM)
-  el: number; // m AGL (SIM)
+  /** Mixed-layer CAPE over the lowest 100 hPa, the standard forecast quantity. */
+  cape: number; // J/kg (MLCAPE)
+  /** Mixed-layer convective inhibition, magnitude. */
+  cin: number; // J/kg
+  lcl: number; // m AGL (mixed-layer LCL)
+  lfc: number; // m AGL (ML LFC)
+  el: number; // m AGL (ML EL)
   freezingLevel: number; // m AGL (0°C isotherm)
+  wetBulbZeroLevel: number; // m AGL (wet-bulb 0°C, the hail-growth level)
   homogeneousFreezeLevel: number; // m AGL (-38°C isotherm)
   lapseRate03km: number; // K/km
+  lapseRate700500: number; // K/km mid-level lapse rate (CAPE aloft)
   bulkShear06km: number; // m/s
-  srh03km: number; // m^2/s^2 Storm-Relative Helicity
+  shear01km: number; // m/s lowest-km shear (supercell / tornado ingredient)
+  srh03km: number; // m^2/s^2 Storm-Relative Helicity 0-3 km
+  /** Showalter/Lifted Index at 500 hPa: < -2 unstable, < -6 strongly unstable. */
+  liftedIndex: number;
+  /** Downdraft CAPE — the cold-pool / gust-front energy. */
+  dcape: number; // J/kg
+  /** Significant Tornado Parameter (0-10 scale forecast index). */
+  stp: number;
   precipitableWaterMM: number; // mm
+  /** Surface temperature that lifts a mixed-layer parcel to the LFC, °C. */
+  convectiveTempC: number;
   bunkersStormU: number; // m/s right-mover motion X
   bunkersStormW: number; // m/s right-mover motion Z
 }
@@ -197,6 +210,14 @@ export interface ConvectiveCell {
   anvilAxisX: number; // normalized upper wind shear vector X
   anvilAxisZ: number; // normalized upper wind shear vector Z
   overshootingTopM: number; // m height above EL when strong updraft overshoots
+
+  // 1-D entraining-plume cache. Rebuilt when the radius or inflow changes; see updraftModel.ts.
+  plumeProfile: import('./updraftModel').PlumeProfile | null;
+  plumeRadiusM: number;
+  plumeInflowMS: number;
+  plumeAgeSec: number;
+  /** Sub-cloud inflow kinetic energy the plume starts from, m/s. */
+  baseInflowMS: number;
 
   // Dynamics
   updraftMaxMS: number; // m/s peak vertical velocity

@@ -7,6 +7,7 @@ import {
   Minimize2,
   Pause,
   Play,
+  Radar,
   RotateCcw,
   Sliders,
   Volume2,
@@ -31,6 +32,8 @@ interface TopToolbarProps {
   onToggleSettings: () => void;
   monitorOpen: boolean;
   onToggleMonitor: () => void;
+  radarOpen: boolean;
+  onToggleRadar: () => void;
   isFullscreen: boolean;
   onToggleFullscreen: () => void;
   onHideUI: () => void;
@@ -68,6 +71,8 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   onToggleSettings,
   monitorOpen,
   onToggleMonitor,
+  radarOpen,
+  onToggleRadar,
   isFullscreen,
   onToggleFullscreen,
   onHideUI,
@@ -230,6 +235,20 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
         >
           <Sliders className="w-3 h-3" />
           <span>Settings</span>
+        </button>
+
+        <button
+          onClick={onToggleRadar}
+          title="Toggle composite reflectivity radar"
+          aria-pressed={radarOpen}
+          className={`flex items-center gap-1 px-2 py-1 rounded border text-[10px] transition cursor-pointer ${
+            radarOpen
+              ? 'bg-sky-500/25 border-sky-400/40 text-sky-100'
+              : 'bg-slate-900/80 border-white/10 text-slate-300 hover:bg-slate-800'
+          }`}
+        >
+          <Radar className="w-3 h-3 text-sky-300" />
+          <span className="hidden sm:inline">Radar</span>
         </button>
 
         <button
