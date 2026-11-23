@@ -99,7 +99,14 @@ export function stepCellMicrophysics(
   cell: ConvectiveCell,
   dt: number,
   sounding: AtmosphericSounding,
-  cfg: AtmosphereConfig
+  cfg: AtmosphereConfig,
+  /**
+   * Height over which the condensation supply is evaluated. Defaults to the visible cloud top;
+   * the cell manager passes the plume's top instead, because the air rising through the cell
+   * has already been processed over the plume's depth even when the visible tower has not yet
+   * grown into it.
+   */
+  supplyTopM?: number
 ): CellMicrophysicsStepOutput {
   const inst = sounding.instability;
   const freezeZ = inst.freezingLevel;
@@ -164,7 +171,11 @@ export function stepCellMicrophysics(
   const epsKmInv = clamp(0.075 + 0.34 / radiusKm, 0.09, 1.6);
   cell.entrainmentRate = epsKmInv;
 
-  const tauResidence = clamp(depth / Math.max(1.2, w), 90, 2400); // s, base -> top transit
+  const supplyTopZ = Math.max(topZ, Math.min(supplyTopM ?? topZ, sounding.levels[sounding.levels.length - 1].z));
+  // Transit time through the *supplying* depth, which is what sets how fast the condensate
+  // reservoirs fill. Bounded so a stalled cell still relaxes and a fast one does not overshoot.
+  const supplyDepth = Math.max(300, supplyTopZ - baseZ);
+  const tauResidence = clamp(supplyDepth / Math.max(1.2, w), 90, 2400); // s, base -> top transit
   const relax = 1.0 - Math.exp(-stepDt / tauResidence);
 
   // Strict physical ceiling: the adiabatic condensate a saturated parcel produces over the
@@ -176,9 +187,9 @@ export function stepCellMicrophysics(
   // The physically consistent form weights each layer's production by the dilution it has
   // suffered on the way up:
   //     q_eff = INT_base^top  (dq_c/dz) * exp(-eps * (z - base)) dz
-  const qCeilingGKg = dilutedAdiabaticCondensate(sounding, baseZ, topZ, epsKmInv);
+  const qCeilingGKg = dilutedAdiabaticCondensate(sounding, baseZ, supplyTopZ, epsKmInv);
   // Undiluted column condensate, kept for diagnostics (condensation efficiency).
-  const qAdiabaticGKg = sounding.adiabaticCondensateGKg(baseZ, topZ);
+  const qAdiabaticGKg = sounding.adiabaticCondensateGKg(baseZ, supplyTopZ);
   const condensateEfficiency = qAdiabaticGKg > 1e-6 ? clamp(qCeilingGKg / qAdiabaticGKg, 0.02, 1.0) : 1.0;
 
   // ---------------- 2. Phase partition, weighted by where condensate is actually produced ----

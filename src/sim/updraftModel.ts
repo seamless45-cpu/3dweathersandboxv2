@@ -173,13 +173,47 @@ export function buildPlumeProfile(
       lclM = Math.max(200, z - DZ * 0.5);
     }
 
+    // ---- Condensate removal (pseudoadiabatic ascent) --------------------------------------
+    // An undilute parcel lifted from 17.5 g/kg carries ~10 g/kg of condensate up to 9 km, and
+    // that water loading alone is 0.1 m/s² — enough to cancel the buoyancy. Real convective
+    // cores are *precipitating*: autoconversion and collection strip condensate out as it forms,
+    // so a core carries only 1-3 g/kg of cloud water at any level. Removing the excess makes the
+    // ascent pseudoadiabatic, which is the standard approximation for a deep convective column.
+    const qcRetain = adj.qc;
+    let qcCarried = qcRetain;
+    if (saturated) {
+      // Export efficiency rises as the parcel cools: warm drizzle can hold a lot of liquid, but
+      // above the freezing level the Bergeron process scavenges it within a few hundred metres.
+      // `coldFrac` drives the retained-condensate ceiling from 2.6 g/kg at cloud base down to a
+      // near-zero 0.25 g/kg in the deep mixed-phase zone — which is exactly where an undilute
+      // parcel's 9-10 g/kg of water loading was extinguishing the plume.
+      const tempKNow = adj.tempK;
+      const coldFrac = Math.max(0, Math.min(1, (PHYS.T_FREEZE + 8.0 - tempKNow) / 22.0));
+      const carryCeil = 2.6 * (1.0 - coldFrac) + 0.25 * coldFrac;
+      const exportFrac = Math.min(0.94, Math.max(0.0, (qcRetain - carryCeil) / Math.max(0.3, qcRetain)));
+      const exported = qcRetain * exportFrac;
+      qcCarried = qcRetain - exported;
+      // Take the exported water out of the total water *and* raise θ_l by the latent heat that
+      // water holds.
+      //
+      // This is the subtle part, and getting it wrong is catastrophic rather than cosmetic.
+      // θ_l = θ − (L/cp)·q_c is conserved through condensation. Physically removing q_c from the
+      // parcel leaves θ unchanged, so θ_l must RISE by (L/cp)·q_removed — the parcel keeps the
+      // heat that condensate released. Dropping q_t without the θ_l correction instead leaves the
+      // parcel subsaturated at the next level, the saturation adjustment then returns a dry
+      // adiabat, and the plume cools at 11 K/km and dies at 4 km. That is not a small numerical
+      // error; it is the difference between a cumulus congestus and a thunderstorm.
+      qt = Math.max(0, qt - exported);
+      thetaL += (LV / CP) * exported * 1e-3;
+    }
+
     const tUp = adj.tempK;
     // Virtual temperatures include only the vapour: condensate contributes mass but no
     // buoyancy, which is precisely the water-loading term added separately below.
     const tvUp = tUp * (1.0 + 0.608 * adj.qv * 1e-3);
     const tvEnv = tEnv * (1.0 + 0.608 * qvEnvGKg * 1e-3);
     const thermalBuoyancy = G * ((tvUp - tvEnv) / tvEnv);
-    const waterLoading = G * adj.qc * 1e-3;
+    const waterLoading = G * qcCarried * 1e-3;
     const buoyancy = thermalBuoyancy - waterLoading;
 
     if (z > 0) {
@@ -194,13 +228,19 @@ export function buildPlumeProfile(
       // reaches 12-15 m/s, a 3.5 km core reaches the tropopause near 20 m/s — instead of a
       // top-hat parcel that runs to sqrt(2·CAPE) (~140 m/s) regardless of its width.
       const radiusKm = Math.max(0.2, radius * 1e-3);
-      const eps = Math.min(0.004, 0.2 / radiusKm / 1000.0) + 1.0e-4;
-      const aDrag = 0.42;
-      const eta = 0.55;
-      const dw2 =
-        2.0 * buoyancy * eta -
-        2.0 * eps * w2 -
-        2.0 * (aDrag * w2) / Math.max(300, radius);
+      const entrainCoef = foundLcl ? 0.055 : 0.2;
+      const eps = Math.min(0.004, entrainCoef / (radiusKm * 1000.0)) + 4.0e-5;
+      // Form drag on the rising core, with the radius as the reference length: a 1 km core has a
+      // drag length of ~3 km, so an updraft loses most of its momentum over a deep troposphere.
+      // That is what brings a buoyant column down from the sqrt(2·CAPE) ideal (~90 m/s) to the
+      // 15-30 m/s that real storms reach.
+      const aDrag = 0.55;
+      const dragLen = Math.max(700, Math.max(300, radius) / aDrag);
+      // Buoyancy efficiency: the share of the local buoyancy that goes into the core's own
+      // vertical kinetic energy rather than into the compensating subsidence it drags around
+      // itself. Dry thermals give up much more of theirs.
+      const eta = foundLcl ? 0.8 : 0.55;
+      const dw2 = 2.0 * buoyancy * eta - 2.0 * eps * w2 - (2.0 * w2) / dragLen;
       w2 = Math.max(0, w2 + dw2 * DZ);
     }
 
@@ -210,19 +250,24 @@ export function buildPlumeProfile(
       w,
       theta: adj.tempK * Math.pow(100000.0 / p, RD / CP),
       qv: adj.qv,
-      qc: adj.qc,
+      qc: qcCarried,
       buoyancy,
       saturated,
     });
-    if (adj.qc > peakCondensate) peakCondensate = adj.qc;
+    if (qcCarried > peakCondensate) peakCondensate = qcCarried;
 
     if (w > peakW) {
       peakW = w;
       wMaxZ = z;
     }
     // The plume terminates where it has stopped rising: after the LFC and after the peak, the
-    // momentum equation runs out of buoyancy to support it.
-    if (z > 600 && w < 0.8) {
+    // momentum equation runs out of buoyancy to support it. The 3 m/s floor is the convective
+    // "top": below that the column is spreading into anvil rather than building height, and a
+    // real cloud top is reported at that level, not at the last level with any motion at all.
+    // Threshold is 3 m/s once in cloud, but a dry thermal below its LCL is legitimately slow —
+    // it must not be terminated for being under the in-cloud criterion.
+    const topThreshold = foundLcl ? 3.0 : 0.8;
+    if (z > 600 && w < topThreshold) {
       topM = z;
       break;
     }
@@ -231,8 +276,15 @@ export function buildPlumeProfile(
     // ---- Entrainment mixing ----------------------------------------------------------
     // Replace a fraction ε·dz of the plume mass with environmental air. This is done on the
     // *conserved* variables, so no latent heat is created or destroyed by the mixing operation.
+    // ---- Lateral entrainment ------------------------------------------------------------
+    // ε = a/R. The classical a = 0.2 is the value for *dry* thermals, which entrain vigorously.
+    // Once the plume is saturated and carrying its own precipitation it is shielded from its
+    // environment, and in shear it tilts so the flow through its flanks drops further. Using the
+    // dry value in-cloud capped every simulated tower at 8 km under a 13 km equilibrium level;
+    // the in-cloud coefficient is what actually sets how deep convection gets.
     const radiusKmNow = Math.max(0.2, radius * 1e-3);
-    const epsNow = Math.min(0.004, 0.2 / radiusKmNow / 1000.0) + 1.0e-4;
+    const entrainCoefNow = foundLcl ? 0.055 : 0.2;
+    const epsNow = Math.min(0.004, entrainCoefNow / (radiusKmNow * 1000.0)) + 4.0e-5;
     const mix = Math.min(0.5, epsNow * DZ);
     const thetaEnv = sounding.thetaEnvAt(Math.max(60, z));
     thetaL += (thetaEnv - thetaL) * mix;
@@ -281,8 +333,12 @@ export function samplePlume(profile: PlumeProfile, zM: number): PlumeLevel {
  */
 export function plumeVelocityAt(profile: PlumeProfile, zM: number, wBaseMS: number): number {
   const lvl = samplePlume(profile, zM);
-  // Buoyancy below the sample adds to the kinetic energy; the profile's own w already includes
-  // that for its reference source, so scale the residual by the stored energy at the base.
-  const storedKE = Math.max(0, wBaseMS * wBaseMS - 4.0);
+  // The extra kinetic energy the cell carries in from its sub-cloud inflow is *not* conserved as
+  // it rises. It is spent on the work of displacing environmental air, and it drains fastest
+  // where the plume is most turbulent, so it decays with an e-folding height of ~1.5 km. Adding
+  // it undiminished at every level (the previous form) let a 24 m/s gust-front inflow report
+  // 24 m/s of updraft inside an 800 m deep cloud, with a cloud top that never grew because the
+  // plume itself had already stalled there.
+  const storedKE = Math.max(0, wBaseMS * wBaseMS - 4.0) * Math.exp(-Math.max(0, zM) / 1500.0);
   return Math.min(72, Math.sqrt(lvl.w * lvl.w + storedKE) + Math.max(0, lvl.buoyancy) * 1.5);
 }

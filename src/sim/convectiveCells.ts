@@ -189,11 +189,23 @@ export class ConvectiveCellManager {
       // through a cap the free-convection parcel cannot break. Cyclic here so the value used for
       // momentum this step is the one the plume solve sees.
       const thermalInflow = 1.6 + 2.6 * solar * Math.min(1.4, this.boundaryLayerThermalEnergy);
-      cell.baseInflowMS = clamp(thermalInflow + 4.5 * gustFrontLiftBoost, 0.5, 24.0);
+      cell.baseInflowMS = clamp(thermalInflow + 4.5 * gustFrontLiftBoost, 0.5, 12.0);
 
       // Microphysics update (condensation ceiling, ice, riming, hail, rain, latent heat, drag).
       // Also sets cell.entrainmentRate (km^-1) from the updraft radius.
-      const mpOut = stepCellMicrophysics(cell, dt, sounding, cfg);
+      //
+      // The microphysical ceiling is evaluated over the *plume's* depth, not the tower's current
+      // height. A cloud cannot bootstrap itself otherwise: the ceiling is the condensate produced
+      // by the air rising through the cell, and the depth of rising air is the plume's, not the
+      // visible tower's. Using the visible depth made a 2 km cumulus hold 0.3 g/kg, which is far
+      // too little to rain, and then the absence of rain kept the updraft weak, which kept the
+      // tower short. Handing the microphysics the plume's depth breaks that feedback at the
+      // physical place: the condensate supply is what it actually is, and the tower catches up
+      // to it in a few minutes.
+      const ceilingTopM = cell.plumeProfile
+        ? Math.max(cell.cloudTopM, cell.plumeProfile.topM * 0.92)
+        : cell.cloudTopM;
+      const mpOut = stepCellMicrophysics(cell, dt, sounding, cfg, ceilingTopM);
 
       const cloudDepth = Math.max(300, cell.cloudTopM - cell.cloudBaseM);
       // Structural archetype: biases every growth law below, so a tower, a multicell cluster, a
@@ -256,8 +268,16 @@ export class ConvectiveCellManager {
       // on the *cell* once the cloud has depth above its equilibrium level.
       const overshootBrake = cell.cloudTopM > inst.el ? 0.00042 * (cell.cloudTopM - inst.el) * 40.0 : 0;
 
+      // ---- Senescence ---------------------------------------------------------------------
+      // A dissipating cell has no buoyant inflow left: its cold pool has cut it off, or its
+      // moisture supply is exhausted. Physically its updraft decays on the overturning timescale,
+      // so the target is scaled down rather than left at whatever the plume still supports.
+      // Without this the updraft stayed at 20 m/s inside an 800 m cloud for the whole run, which
+      // then fed the "24-minute-old cumulus humilis with a violent updraft" pathology.
+      const senescence = cell.stage === 'dissipating' ? 0.18 : 1.0;
+
       const targetW = clamp(
-        plumeSpeed + dynamicPressureBoost - loadingDrag - coldPoolDrag - overshootBrake,
+        (plumeSpeed + dynamicPressureBoost) * senescence - loadingDrag - coldPoolDrag - overshootBrake,
         0,
         62
       );
@@ -323,29 +343,36 @@ export class ConvectiveCellManager {
       if (cell.cloudTopM > lclFloor + 200) cell.cloudBaseM = Math.max(cell.cloudBaseM, lclFloor * 0.94);
 
       if (cell.updraftMaxMS > 0.25) {
-        // The cloud top rises at the *plume*'s cap-rise speed, not at w_max, and it is bounded
-        // by the height where the plume itself stops rising. That bound is what makes the
-        // sounding control storm depth: a sounding with a strong cap or a dry layer aloft caps
-        // the tower, while a deep moist profile lets it reach the tropopause. The old growth law
-        // pushed every cell toward `inst.el * morph.top` regardless of the environment.
+        // ---- Cloud-top growth ------------------------------------------------------------
+        // The plume already resolved where this cell's updraft stops rising, so the top is not
+        // an independent thing that has to be nursed along: the tower grows at a rate set by how
+        // much buoyant depth the plume has below the top, which for a saturated column is
+        //     dz/dt ≈ w(z) · (B(z)/B_max)   — fast through the buoyant core, stalling at the top.
+        // Using the cell's own w (which lags) made the cloud take 20 minutes to reach a level
+        // the plume solves in one call, and because the microphysical ceiling is diluted with
+        // cloud *depth*, that lag starved the cloud of condensate and kept it permanently shallow.
+        const plumeW = plumeVelocityAt(plume, Math.min(cell.cloudTopM, plume.topM), cell.baseInflowMS);
         const capRiseFactor = clamp(0.88 - 0.44 * (cloudDepth / 9000.0), 0.4, 0.88);
-        const capRise = cell.updraftMaxMS * capRiseFactor * 0.62;
-        // Physical ceiling: the plume top (plus a bounded overshoot the kinetic energy supports).
-        const plumeCeiling = plume.topM + Math.min(2600, 0.5 * (cell.updraftMaxMS * cell.updraftMaxMS) / 9.8);
+        const capRise = Math.max(plumeW * 0.55, cell.updraftMaxMS * capRiseFactor * 0.62);
+        // Kinetic-energy ceiling for the overshoot: the plume's own top plus however far the
+        // updraft's momentum can carry it past the equilibrium level (w²/2g, capped).
+        const overshoot = Math.min(2600, (plumeW * plumeW) / (2.0 * 9.81));
+        const plumeCeiling = plume.topM + overshoot;
         const morphologyCeiling = inst.cape > 80
           ? inst.el * morph.top + 1800
           : inst.lcl + 900 + cell.updraftMaxMS * 150.0;
         const maxPhysicalTop = Math.min(plumeCeiling, morphologyCeiling);
         if (cell.cloudTopM < maxPhysicalTop) {
-          cell.cloudTopM += capRise * dt;
+          cell.cloudTopM = Math.min(maxPhysicalTop, cell.cloudTopM + capRise * dt);
         } else {
           cell.cloudTopM += (maxPhysicalTop - cell.cloudTopM) * (1.0 - Math.exp(-dt / 40.0));
         }
       } else {
-        // Subsidence & cloud top collapse during dissipation
+        // Subsidence & cloud top collapse during dissipation. An orphaned anvil evaporates from
+        // below as its ice falls out, so the top sinks at a few m/s, not instantaneously.
         cell.cloudTopM = Math.max(
           cell.cloudBaseM,
-          cell.cloudTopM - (1.6 + Math.max(0, -cell.updraftMaxMS) * 0.9) * dt
+          cell.cloudTopM - (2.4 + Math.max(0, -cell.updraftMaxMS) * 0.9) * dt
         );
       }
 
@@ -364,7 +391,7 @@ export class ConvectiveCellManager {
       const depthRadius = cloudDepth * (0.19 + 0.011 * Math.sqrt(Math.max(0, cell.updraftMaxMS)));
       const targetRadius =
         cell.stage === 'dissipating'
-          ? cell.radiusM * (1.0 - 0.0016 * dt)
+          ? cell.radiusM * (1.0 - 0.0045 * dt)
           : clamp(
               Math.max(continuityRadius, depthRadius) *
                 morph.radius *
@@ -1064,13 +1091,35 @@ export class ConvectiveCellManager {
     ) {
       return 'dissipating';
     }
+    // A cell whose top has collapsed back to its base has no cloud left: it is rained out or
+    // undercut by its own outflow. Leaving it classified as cumulus_humilis while it still has
+    // a 20 m/s "updraft" reported produced 24-minute-old humilis cells, which is not a thing.
+    if (cell.ageSec > 240 && depth < 320 && cell.surfaceRainRateMMHr > 0.5) {
+      return 'dissipating';
+    }
+    // Short-lived cumulus: a tower that has not reached at least 2.5 km within 11 minutes is a
+    // failed thermal. Real shallow cumulus lives 5-15 minutes; letting it persist indefinitely
+    // because its plume still resolves 9 km is not a storm, it is a stuck state.
+    if (cell.ageSec > 660 && cell.cloudTopM < lcl + 2500) {
+      return 'dissipating';
+    }
+    // Hard lifetime cap for non-rotating cloud. A single cell that is not a supercell is
+    // consumed by its own outflow within roughly half an hour.
+    if (cell.ageSec > 2100 && Math.abs(cell.mesocycloneVorticity) < 0.011) {
+      return 'dissipating';
+    }
     if (Math.abs(cell.mesocycloneVorticity) > 0.011 && cell.cloudTopM > freezeZ + 2200) {
       return 'supercell';
     }
-    if (cell.anvilRadiusM > cell.radiusM * 1.35 || cell.cloudTopM > el * 0.86) {
+    // A cell is mature when it has reached its equilibrium level *and* is actually precipitating
+    // from a deep column. Height alone is not enough: a vigorously growing tower that has just
+    // passed the freezing level is still a calvus, and a shallow cloud with a strong updraft is
+    // still humilis. Depth is what separates them.
+    const deepEnough = depth > 4200;
+    if (deepEnough && (cell.anvilRadiusM > cell.radiusM * 1.35 || cell.cloudTopM > el * 0.78)) {
       return 'mature';
     }
-    if (cell.cloudTopM > freezeZ + 1400 && (cell.cloudIceGKg + cell.graupelGKg) > 0.12) {
+    if (cell.cloudTopM > freezeZ + 900 && depth > 2600 && (cell.cloudIceGKg + cell.graupelGKg) > 0.06) {
       return 'calvus';
     }
     if (depth > 2200) {
