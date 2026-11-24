@@ -40,6 +40,10 @@ let firstCloudFrame = -1;
 let firstPrecipFrame = -1;
 let firstFlashFrame = -1;
 let peakObserverRain = 0;
+// Closest approach of any precipitating cell's shaft to the observer, and the run length in
+// simulated seconds. Observer rain of 0 is a legitimate result for a 30-minute run (the storm
+// has not arrived yet) but is a bug if the shaft passed overhead, so the bench reports *why*.
+let minShaftDistanceM = Number.POSITIVE_INFINITY;
 const stageCounts = new Map<string, number>();
 const typeCounts = new Map<string, number>();
 
@@ -60,6 +64,10 @@ for (let f = 0; f < frames; f++) {
   if (firstFlashFrame < 0 && snap.totalFlashes > 0) firstFlashFrame = f;
 
   for (const c of snap.cells) {
+    if (c.surfaceRainRateMMHr > 5) {
+      const d = Math.hypot(c.x + c.precipCoreOffsetX, c.z + c.precipCoreOffsetZ);
+      if (d < minShaftDistanceM) minShaftDistanceM = d;
+    }
     stageCounts.set(c.stage, (stageCounts.get(c.stage) ?? 0) + 1);
     if (c.precipType !== 'None') typeCounts.set(c.precipType, (typeCounts.get(c.precipType) ?? 0) + 1);
   }
@@ -84,6 +92,9 @@ console.log(
 
 console.log('\n--- peak state ---');
 console.log(`maxUpdraft=${peakUpdraft.toFixed(1)} m/s  maxSurfaceRain=${peakRain.toFixed(1)} mm/h  observerRain=${peakObserverRain.toFixed(1)} mm/h`);
+console.log(
+  `simSeconds=${((frames * FRAME_DT) * simSpeed).toFixed(0)}s  closestShaft=${Number.isFinite(minShaftDistanceM) ? minShaftDistanceM.toFixed(0) + 'm' : 'none'}`
+);
 console.log(`maxCFL=${peakCFL.toFixed(3)}  maxDivResidual=${peakDiv.toExponential(2)} s^-1  waterDrift=${finalSnap.validation.waterConservationDriftPct.toFixed(3)}%`);
 console.log(`flashes=${finalSnap.totalFlashes} tles=${finalSnap.totalTLEs} cloudCover=${finalSnap.domainCloudCoverPct.toFixed(1)}% organization=${finalSnap.organization}`);
 console.log(`meanCloudWater=${finalSnap.meanCloudWaterGKg.toFixed(2)} g/kg meanIce=${finalSnap.meanIceGKg.toFixed(2)} meanGraupelHail=${finalSnap.meanGraupelHailGKg.toFixed(2)}`);

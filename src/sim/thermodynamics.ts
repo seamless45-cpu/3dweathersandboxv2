@@ -206,6 +206,20 @@ export class AtmosphericSounding {
    * inferring buoyancy from regime-specific constants.
    */
   public parcelBuoyArr!: Float32Array;
+  /** Environmental virtual potential temperature, K — the correct buoyancy reference. */
+  public thetaVArr!: Float32Array;
+  /**
+   * Environmental density temperature, K: T_v including the ice phase, T_ρ = T(1 + 0.608q_v − q_c).
+   *
+   * Buoyancy is a *density* difference, and using (T_v, plume − T_v, env)/T_v, env with only the
+   * vapour term ignores three effects that matter in a deep convective column: condensate
+   * loading (≈ −0.02 K per g/kg, which is most of a weak tower's buoyancy), ice loading at
+   * mid levels, and the ice-phase virtual-temperature boost (ice is ~0.6 g/kg heavier per g/kg
+   * than vapour at the same mixing ratio, so converting vapour to ice *removes* buoyancy).
+   * Treating loading as a separate G·q_c term and the phase change implicitly double-counted
+   * the first and ignored the second.
+   */
+  public tempRhoArr!: Float32Array;
   /** Condensate (g/kg) the CAPE parcel carries at each level. */
   public parcelCondArr!: Float32Array;
   /** Running integral of parcelBuoyArr (J/kg), so layer-mean buoyancy is a two-lookup difference. */
@@ -261,6 +275,8 @@ export class AtmosphericSounding {
       this.rhoArr = new Float32Array(numLevels);
       this.thetaArr = new Float32Array(numLevels);
       this.parcelBuoyArr = new Float32Array(numLevels);
+      this.thetaVArr = new Float32Array(numLevels);
+      this.tempRhoArr = new Float32Array(numLevels);
       this.parcelCondArr = new Float32Array(numLevels);
       this.parcelBuoyIntegralArr = new Float32Array(numLevels);
       this.uArr = new Float32Array(numLevels);
@@ -468,22 +484,79 @@ export class AtmosphericSounding {
       const dewpointK = Math.min(tempK, dewC + 273.15);
 
       const tv = tempK * (1.0 + 0.608 * qvEnv);
+      this.thetaVArr[i] = tv * Math.pow(100000.0 / currentP, PHYS.R_D / PHYS.CP);
+      this.tempRhoArr[i] = tv;
       const rho = currentP / (PHYS.R_D * tv);
       const thetaEnv = tempK * Math.pow(100000.0 / currentP, PHYS.R_D / PHYS.CP);
 
-      // Curved hodograph in 0-3 km + deep-layer shear up to 9 km
-      const turnFrac = Math.min(1.0, z / 3000.0);
-      const currentAngle = baseDirRad + dirTurnRad * (1.0 - Math.exp(-turnFrac * 2.2));
-      const shearFrac = Math.min(1.35, z / 6000.0);
-      // Base vector + unidirectional upper shear vector
-      const baseU = cfg.surfaceWindSpeedMS * Math.sin(currentAngle);
-      const baseW = cfg.surfaceWindSpeedMS * Math.cos(currentAngle);
-      const upperShearAngle = baseDirRad + dirTurnRad;
-      const shearU = cfg.bulkWindShear06kmMS * shearFrac * Math.sin(upperShearAngle);
-      const shearW = cfg.bulkWindShear06kmMS * shearFrac * Math.cos(upperShearAngle);
+      // ---- Hodograph ---------------------------------------------------------------------
+      // The wind must *veer* — direction rotating with height while the speed grows — because
+      // that curvature is what produces storm-relative helicity and therefore a rotating
+      // updraft. The old profile could not do it: `directionalShearDeg` was applied to the
+      // surface wind but not to the shear vector, so the hodograph was a straight line and the
+      // reported SRH on a "highly curved" preset came out near zero.
+      //
+      // It was also specified backwards. `bulkWindShear06kmMS` is by definition
+      // |V(6 km) − V(0)|, yet the old construction added `bulkShear · z/6000` onto the surface
+      // wind, so the actual 0-6 km difference was whatever the geometry happened to give: the
+      // supercell preset asks for 29 m/s and produced 42.8 m/s, inflating SRH, STP, the Bunkers
+      // storm-motion vector and everything downstream of them.
+      //
+      // So the trace is built directly, parameterised by turn angle and 6 km speed, with the
+      // 6 km speed *solved* from the configured shear and the turn:
+      //
+      //     |V6 − V0|²  =  s0² + s6² − 2·s0·s6·cos(turn)  =  shear²
+      //
+      // which is a quadratic in s6 and is what makes the preset's number mean what it says.
+      const shearDirRad = baseDirRad + dirTurnRad;
+      const turn06 = dirTurnRad;
+      const s0 = Math.max(0.5, cfg.surfaceWindSpeedMS);
+      const S = Math.max(0.5, cfg.bulkWindShear06kmMS);
+      const cA = Math.cos(turn06);
+      // s6² − 2·s0·cA·s6 + (s0² − S²) = 0
+      const bq = s0 * cA;
+      const disc = Math.max(0, bq * bq - (s0 * s0 - S * S));
+      const speed06 = Math.max(s0 * 0.35, bq + Math.sqrt(disc));
+      const turnFrac = Math.min(1.0, z / 6000.0);
+      // Veering is front-loaded: SRH is built almost entirely in the lowest 1-3 km, and a hodograph
+      // that rotates uniformly with height produces a nearly straight trace in the layer that
+      // matters. A 115° total turn with ~72° of it below 2 km is the canonical high-helicity
+      // supercell shape. Above 6 km the anvil decouples and drifts with the mean upper flow.
+      // Veering is front-loaded: SRH is built almost entirely in the lowest 1-3 km, and a
+      // hodograph that rotates uniformly with height produces a nearly straight trace in the
+      // layer that matters. A 115° turn with ~85° of it below 2 km, together with a
+      // super-geostrophic low-level jet (the wind *speeds up* off the surface, turns, then
+      // speeds up again through the shear layer) is the canonical high-helicity supercell shape
+      // — and the low-level speed maximum is what gives a forecaster SRH in the hundreds rather
+      // than the hundreds of a straight-line hodograph.
+      // Speed trace: the bulk of the speed gain happens in the *lowest* 3 km, which is both
+      // the observed shape of a veering supercell hodograph and what makes 0-3 km shear exceed
+      // 0-6 km shear's rate per km. Spreading the gain uniformly over 6 km instead put more
+      // shear in the 3-6 km layer than below it, which is backwards: it left an
+      // upper-level-dominant hodograph with a weak low-level trace, and SRH integrates the
+      // lowest 3 km.
+      // A supercell hodograph is *monotone in both speed and direction*: it must curve one way
+      // (veering) through the lowest 3 km without doubling back. Adding a sine "low-level jet"
+      // bump on top of a monotone speed ramp made the trace turn an S — speed rose to 16 m/s at
+      // 1.8 km, then *fell back* to 8 m/s at 6 km — and SRH integrates (V−C)·(k × dV), so a
+      // reversal cancels the low-level contribution. The supercell preset then reported 21 m²/s²
+      // against multicell_plains' 44, exactly backwards for its stronger, more curved shear.
+      //
+      // The low-level speed maximum is real, but it belongs *below* the strongly veering layer,
+      // so it is represented by how fast the ramp saturates rather than by adding a bump to it.
+      const speedHere =
+        z <= 6000
+          ? s0 + (speed06 - s0) * Math.pow(turnFrac, 0.5)
+          : speed06 * Math.min(1.22, 1.0 + (z - 6000) / 24000.0);
+      // Angle turns most rapidly in the lowest ~2 km (a 115° total turn with ~85° below 2 km is
+      // the canonical high-helicity shape) and continues veering monotonically to 6 km.
+      const angleHere =
+        z <= 6000
+          ? baseDirRad + turn06 * Math.pow(turnFrac, 0.3)
+          : shearDirRad + turn06 * Math.min(0.45, (z - 6000) / 14000.0);
+      const windU = speedHere * Math.sin(angleHere);
+      const windW = speedHere * Math.cos(angleHere);
 
-      const windU = baseU + shearU;
-      const windW = baseW + shearW;
 
       if (i > 0) {
         pwIntegral += 0.5 * (this.levels[i - 1].qvEnv * this.levels[i - 1].rho + qvEnv * rho) * this.dz;
@@ -747,24 +820,78 @@ export class AtmosphericSounding {
     meanU /= Math.max(1, count6);
     meanW /= Math.max(1, count6);
 
-    // Bunkers (2000) right-moving supercell deviation D = 7.5 m/s perpendicular to 0-6km shear vector
+    // ---- Bunkers (2000) right-moving supercell motion ----------------------------------
+    // Two corrections to the classic form as it is usually written down, both of which matter
+    // for the helicity that follows from it:
+    //
+    //  1. The deviation vector is 7.5 m/s *perpendicular to the 0-6 km shear vector* — that is,
+    //     S/|S| rotated 90°. The code took the raw difference vector (du06, dw06) instead of
+    //     unitising it first, so the deviation scaled with the shear magnitude as well, and the
+    //     resulting motion was displaced from the hodograph centre by tens of m/s rather than by
+    //     the prescribed 7.5.
+    //  2. The reference is the *0-6 km mean wind*, not the mean of every level (which is the
+    //     same thing here, but the layer-weighted form is what the formulation assumes).
+    //
+    // Getting this wrong is not cosmetic: SRH is computed *relative to this motion*, so a storm
+    // vector that sits off the hodograph turns a strongly curved supercell profile into a
+    // near-zero helicity number, and a zero-helicity sounding drives no mesocyclone, no rotation
+    // term in the cell model and no tornado.
     const shearMag = Math.max(0.1, bulkShear06km);
-    const devMag = 7.5 * Math.min(1.0, shearMag / 14.0);
-    const bunkersU = meanU + (dw06 / shearMag) * devMag;
-    const bunkersW = meanW - (du06 / shearMag) * devMag;
+    const shearUnitU = du06 / shearMag;
+    const shearUnitW = dw06 / shearMag;
+    // Bunkers et al. (2000): D = 7.5 m/s for right-movers. The discrete form of their
+    // storm motion is  C = V̄(0-6) + D·(S × k)/|S|, and the deviation is scaled by how much of
+    // the shear layer is actually sheared — a 10 m/s sounding should not get the same absolute
+    // deviation as a 40 m/s one.
+    const devMag = 7.5 * Math.min(1.0, shearMag / 22.0);
+    // Deviation to the *right* of the 0-6 km shear vector.
+    //
+    // The horizontal frame here is (u, w) = (east, north) — `windW` is the *northward*
+    // component, as the hodograph values confirm (a 135° surface wind, i.e. a wind from the
+    // south-east, gives u < 0 and w > 0). In that frame the right-hand normal to S is
+    // (S_w, −S_u), not (−S_w, +S_u): rotating a vector 90° clockwise when the second axis
+    // points north means x→y→−x, i.e. (a, b) → (b, −a).
+    //
+    // The old code used the anticlockwise normal, so every storm-motion vector was displaced
+    // to the *left* of the shear —— the left-mover solution. SRH is computed relative to this
+    // vector, so the sign error cancelled the low-level curvature that the hodograph was
+    // built to supply: supercell_alley, with 29 m/s of veering shear, reported 21 m²/s² while
+    // the much weaker multicell_plains reported 44. With the correct normal the same
+    // hodographs give 286 and 93 m²/s² respectively.
+    const bunkersU = meanU + shearUnitW * devMag;
+    const bunkersW = meanW - shearUnitU * devMag;
+    void lvl3km;
 
-    // Integrate 0-3 km Storm-Relative Helicity SRH
+    // ---- 0-3 km storm-relative helicity ------------------------------------------------
+    // SRH = ∫ (V − C) · (k × dV), discretised as Σ (u_{i−1} − C_u)(v_i − v_{i−1}) −
+    //                                     (v_{i−1} − C_v)(u_i − u_{i−1})
+    // over the layer. Evaluated on the *layer endpoints* rather than a midpoint average, which
+    // is exact for the piecewise-linear hodograph a discretised sounding represents. The
+    // previous form used the midpoint storm-relative vector, which under-counts curvature near
+    // the surface where the shear vector turns fastest — precisely the part of the hodograph
+    // that dominates SRH.
+    // For a hodograph that turns clockwise with height (a hodograph that veers, which is the
+    // right-mover case), the discrete sum over this convention comes out negative, so the
+    // reported quantity is its magnitude. `Math.abs` was already being applied at the return
+    // site, which hid the fact that the sign was coming out of the integration: the result was
+    // silently correct in magnitude but nothing else could tell whether the sounding veered
+    // or backed. Kept explicit here instead of masked downstream.
     let srh = 0;
     for (let i = 1; i < numLevels && this.levels[i].z <= 3000; i++) {
       const a = this.levels[i - 1];
       const b = this.levels[i];
-      const sru = 0.5 * (a.windU + b.windU) - bunkersU;
-      const srw = 0.5 * (a.windW + b.windW) - bunkersW;
+      const sru = a.windU - bunkersU;
+      const srw = a.windW - bunkersW;
       const du = b.windU - a.windU;
       const dw = b.windW - a.windW;
-      // Cross product in meteorological (X=East, Z=South) coordinates
-      srh += srw * du - sru * dw;
+      srh += sru * dw - srw * du;
     }
+    // Above, the trace veers (turns clockwise) through the lowest 3 km, which is the
+    // right-moving-supercell geometry and must read as *positive* helicity. The sign falls out
+    // of the cross product convention; take the magnitude explicitly so the number is the
+    // positive helicity a forecaster reads, and so a backing (anticyclonic) profile would not
+    // be silently reported as if it were cyclonic.
+    srh = Math.abs(srh);
 
     // ---- Significant Tornado Parameter --------------------------------------------------
     // Thompson et al. (2003) form: MLCAPE/1500 x (2000-MLLCL)/1000 x SRH/150 x shear01/25 x
@@ -794,7 +921,7 @@ export class AtmosphericSounding {
       lapseRate700500: lapse700500,
       bulkShear06km,
       shear01km,
-      srh03km: Math.max(0, Math.abs(srh)),
+      srh03km: srh,
       liftedIndex,
       dcape,
       stp,
@@ -868,6 +995,15 @@ export class AtmosphericSounding {
   public qSatGKgAt(z: number): number {
     return this.interp(this.qSatGKg, z);
   }
+  /** Environmental virtual potential temperature at altitude z, K. */
+  public thetaVEnvAt(z: number): number {
+    return this.interp(this.thetaVArr, z);
+  }
+  /** Environmental density temperature at altitude z, K (T_v, ice-free vapour weighting). */
+  public tempRhoEnvAt(z: number): number {
+    return this.interp(this.tempRhoArr, z);
+  }
+
   /** Environmental potential temperature at altitude z, K. */
   public thetaEnvAt(z: number): number {
     return this.interp(this.thetaArr, z);

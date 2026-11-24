@@ -156,8 +156,15 @@ export function toDbz(z: number): number {
   return 10.0 * Math.log10(z);
 }
 
-/** Standard radar colour-map index 0..1 from dBZ, over the usual meteorological range. */
+/**
+ * Standard radar colour-map index 0..1 from dBZ, over the usual meteorological range.
+ *
+ * `dbz` is legitimately -Infinity for "no echo" (toDbz of zero reflectivity), and a guard is
+ * needed for NaN as well: `Math.max(0, Math.min(1, NaN))` is NaN, which then flows into the
+ * colour ramp as an invalid channel value and renders as a black hole rather than as clear air.
+ */
 export function dbzToNorm(dbz: number): number {
+  if (!Number.isFinite(dbz)) return 0;
   return Math.max(0, Math.min(1, (dbz + 10.0) / 85.0));
 }
 
@@ -293,6 +300,137 @@ export function renderSweep(
 }
 
 /**
+ * Vertical cross-section (an RHI) along an arbitrary ground track.
+ *
+ * This is the product that shows storm *structure*: the sloping updraft column, the
+ * precipitation shaft curving downshear, the bright band where snow melts, the anvil streaming
+ * out at the equilibrium level. A plan view cannot show any of that.
+ *
+ * The slice is sampled on a distance/height raster and interpolated from the model's 500 m grid
+ * with a 3x3x3 stencil, so the result is smooth at display resolution rather than blocky. The
+ * vertical velocity is carried alongside the reflectivity because the tower's own motion is what
+ * makes the cross-section diagnostic rather than decorative.
+ */
+export interface RadarSection {
+  /** Reflectivity in dBZ, indexed `c * rows + r` for distance column `c`, height row `r`. */
+  dbz: Float32Array;
+  /** Vertical velocity, m/s, same layout (positive up). */
+  w: Float32Array;
+  cols: number;
+  rows: number;
+  /** Ground distance covered, metres. */
+  lengthM: number;
+  /** Height covered by each row, metres. */
+  cellHeightM: number;
+  maxHeightM: number;
+  /** Ground endpoints, world coordinates. */
+  x0: number;
+  z0: number;
+  x1: number;
+  z1: number;
+}
+
+export function renderSection(
+  grid: AtmosphericFluidGrid,
+  sounding: AtmosphericSounding,
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+  cols = 220,
+  rows = 120,
+  maxHeightM = 16000
+): RadarSection {
+  const dbzArr = new Float32Array(cols * rows);
+  const wArr = new Float32Array(cols * rows);
+  const len = Math.hypot(x1 - x0, z1 - z0);
+  const dxAz = len > 1 ? (x1 - x0) / len : 1;
+  const dzAz = len > 1 ? (z1 - z0) / len : 0;
+  const cellH = maxHeightM / rows;
+  const nx = grid.nx;
+  const ny = grid.ny;
+  const slice = nx * ny;
+
+  for (let c = 0; c < cols; c++) {
+    const dist = ((c + 0.5) / cols) * len;
+    const wx = x0 + dxAz * dist;
+    const wz = z0 + dzAz * dist;
+    if (Math.abs(wx) > DOMAIN_HALF_SIZE || Math.abs(wz) > DOMAIN_HALF_SIZE) continue;
+    const ix = grid.worldToGridX(wx);
+    const iz = grid.worldToGridZ(wz);
+    for (let r = 0; r < rows; r++) {
+      const y = (r + 0.5) * cellH;
+      if (y > DOMAIN_MAX_ALT) continue;
+      const iy = grid.worldToGridY(y);
+      const rho = sounding.densityAt(Math.max(40, y));
+      const tempK = sounding.tempKAt(Math.max(40, y));
+      const brightBand = PHYS.T_FREEZE - tempK > -1.2 && PHYS.T_FREEZE - tempK < 1.6;
+      let zSum = 0;
+      let wSum = 0;
+      let weight = 0;
+      for (let dk = -1; dk <= 1; dk++) {
+        const k = iy + dk;
+        if (k < 1 || k >= ny - 1) continue;
+        const wk = dk === 0 ? 1.0 : 0.45;
+        for (let dj = -1; dj <= 1; dj++) {
+          const j = iz + dj;
+          if (j < 1 || j >= grid.nz - 1) continue;
+          const wj = dj === 0 ? 1.0 : 0.45;
+          for (let di = -1; di <= 1; di++) {
+            const i = ix + di;
+            if (i < 1 || i >= nx - 1) continue;
+            const wi = di === 0 ? 1.0 : 0.45;
+            const wt = wi * wj * wk;
+            const id = i + nx * k + slice * j;
+            const qc = grid.qc[id];
+            const qi = grid.qi[id];
+            const qr = grid.qr[id];
+            const qs = grid.qs[id];
+            const qg = grid.qg[id];
+            if (qc + qi + qr + qs + qg < 1e-3) continue;
+            let z =
+              reflectivityFromRain(rho, qr + qc * 0.25) +
+              reflectivityFromSnow(rho, qs + qi * 0.85) +
+              reflectivityFromGraupel(rho, qg);
+            if (brightBand) z *= 2.6;
+            zSum += z * wt;
+            wSum += grid.vy[id] * wt;
+            weight += wt;
+          }
+        }
+      }
+      const idx = c * rows + r;
+      // No sample inside the domain in any of the 27 stencil points. This must be the *no echo*
+      // sentinel, not NaN: it used to be left at the Float32Array's initial 0, which the
+      // colour map reads as 0 dBZ of real echo, painting a band of light rain across every
+      // section that crossed the domain edge — up to a third of the image.
+      if (weight > 0) {
+        const meanZ = zSum / weight;
+        dbzArr[idx] = meanZ > 1e-3 ? toDbz(meanZ) : -Infinity;
+        wArr[idx] = wSum / weight;
+      } else {
+        dbzArr[idx] = -Infinity;
+        wArr[idx] = 0;
+      }
+    }
+  }
+
+  return {
+    dbz: dbzArr,
+    w: wArr,
+    cols,
+    rows,
+    lengthM: len,
+    cellHeightM: cellH,
+    maxHeightM,
+    x0,
+    z0,
+    x1,
+    z1,
+  };
+}
+
+/**
  * Column-maximum composite over the whole domain, as a Cartesian raster. This is the product
  * used by the plan-view panel: the highest reflectivity anywhere in each column, which is what
  * a real "composite reflectivity" map shows and what makes the anvil visible on top of the
@@ -309,14 +447,14 @@ export function renderColumnMax(grid: AtmosphericFluidGrid, sounding: Atmospheri
         const qc = grid.qc[id];
         const qi = grid.qi[id];
         const qr = grid.qr[id];
-        if (qc + qi + qr < 2e-3) continue;
+        const qs = grid.qs[id];
+        const qg = grid.qg[id];
+        if (qc + qi + qr + qs + qg < 2e-3) continue;
         const y = grid.gridToWorldY(iy);
         const rho = sounding.densityAt(Math.max(40, y));
-        const tempK = sounding.tempKAt(Math.max(40, y));
-        const frozenFrac = Math.max(0, Math.min(1, (PHYS.T_FREEZE + 2 - tempK) / 10.0));
-        const z = reflectivityFromRain(rho, qr * (1.0 - frozenFrac) + qc * 0.25) +
-          reflectivityFromSnow(rho, qr * frozenFrac * 0.7 + qi * 0.85) +
-          reflectivityFromGraupel(rho, qr * frozenFrac * 0.3);
+        const z = reflectivityFromRain(rho, qr + qc * 0.25) +
+          reflectivityFromSnow(rho, qs + qi * 0.85) +
+          reflectivityFromGraupel(rho, qg);
         const dbz = toDbz(z);
         if (dbz > best) best = dbz;
       }
@@ -324,4 +462,115 @@ export function renderColumnMax(grid: AtmosphericFluidGrid, sounding: Atmospheri
     }
   }
   return out;
+}
+
+/**
+ * Picks the point a cross-section should be drawn through.
+ *
+ * The section has to cut through the *updraft tower*, not merely the brightest gate. Two things
+ * make the obvious choices wrong. A composite maximum is dominated by hail and by the
+ * precipitation shaft, which sit downshear of the tower and often belong to a cell that has
+ * already collapsed. And in 40 m/s of shear a tower is displaced several kilometres downshear by
+ * mid levels, so the surface cell centre is not where the visible column is either.
+ *
+ * So the focus point is the column of maximum updraft mass flux through the 2.5-7.5 km layer,
+ * with the caller's diagnosed cells as the fallback when nothing is rising and the brightest
+ * echo as the last resort.
+ */
+export function findStormCore(
+  grid: AtmosphericFluidGrid,
+  columnMax: Float32Array,
+  candidates: Array<{ x: number; z: number }> = []
+): { x: number; z: number; maxDbz: number; found: boolean } {
+  const nx = grid.nx;
+  const ny = grid.ny;
+  const nz = grid.nz;
+  const slice = nx * ny;
+  const yLo = grid.worldToGridY(2500);
+  const yHi = Math.min(ny - 2, grid.worldToGridY(7500));
+
+  const fluxAt = (ix: number, iz: number): number => {
+    let flux = 0;
+    for (let iy = yLo; iy <= yHi; iy++) {
+      const v = grid.vy[ix + nx * iy + slice * iz];
+      if (v > 0) flux += v;
+    }
+    return flux;
+  };
+
+  // Coarse sweep for the strongest rising column, then a local refinement.
+  let bestFlux = 0;
+  let bestIx = -1;
+  let bestIz = -1;
+  for (let iz = 1; iz < nz - 1; iz += 4) {
+    for (let ix = 1; ix < nx - 1; ix += 4) {
+      const f = fluxAt(ix, iz);
+      if (f > bestFlux) {
+        bestFlux = f;
+        bestIx = ix;
+        bestIz = iz;
+      }
+    }
+  }
+  if (bestIx >= 0) {
+    for (let dz = -4; dz <= 4; dz++) {
+      for (let dx = -4; dx <= 4; dx++) {
+        const i = bestIx + dx;
+        const j = bestIz + dz;
+        if (i < 1 || j < 1 || i >= nx - 1 || j >= nz - 1) continue;
+        const f = fluxAt(i, j);
+        if (f > bestFlux) {
+          bestFlux = f;
+          bestIx = i;
+          bestIz = j;
+        }
+      }
+    }
+  }
+
+  // Nothing is rising: fall back to the diagnosed cells, then to the brightest echo.
+  if (bestIx < 0) {
+    let best = -Infinity;
+    for (const c of candidates) {
+      const ix = grid.worldToGridX(c.x);
+      const iz = grid.worldToGridZ(c.z);
+      if (ix < 1 || iz < 1 || ix >= nx - 1 || iz >= nz - 1) continue;
+      let support = 0;
+      for (let dz = -2; dz <= 2; dz++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const n = columnMax[ix + dx + nx * (iz + dz)];
+          if (Number.isFinite(n) && n >= 20) support++;
+        }
+      }
+      const d = columnMax[ix + nx * iz];
+      const score = support * 40 + (Number.isFinite(d) ? d : -99);
+      if (score > best) {
+        best = score;
+        bestIx = ix;
+        bestIz = iz;
+      }
+    }
+    if (bestIx < 0) {
+      let bestDbz = -Infinity;
+      for (let iz = 1; iz < nz - 1; iz++) {
+        for (let ix = 1; ix < nx - 1; ix++) {
+          const d = columnMax[ix + nx * iz];
+          if (Number.isFinite(d) && d > bestDbz) {
+            bestDbz = d;
+            bestIx = ix;
+            bestIz = iz;
+          }
+        }
+      }
+    }
+  }
+
+  if (bestIx < 0) return { x: 0, z: 0, maxDbz: -99, found: false };
+  const peak = columnMax[bestIx + nx * bestIz];
+  return {
+    x: grid.gridToWorldX(bestIx),
+    z: grid.gridToWorldZ(bestIz),
+    maxDbz: Number.isFinite(peak) ? peak : -99,
+    found: true,
+  };
 }
