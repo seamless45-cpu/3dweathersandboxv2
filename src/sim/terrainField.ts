@@ -59,11 +59,27 @@ export function getTerrainHeight(x: number, z: number): number {
     (95.0 + 195.0 * ridgeMask) *
     Math.max(0, 0.45 + 0.55 * fbm2D(x * 0.00016 - 2.4, z * 0.00016 + 4.2, 4));
 
-  // Keep domain edges softly bounded
+  // Rim: a gentle rise around the *simulated* domain edge, so the ground does not simply stop
+  // in a straight line.
+  //
+  // This is clamped to DOMAIN_HALF_SIZE-and-a-bit on purpose. The rendered terrain mesh reaches
+  // out to TERRAIN_HALF_EXTENT (200 km), eight times further than the domain, so an unclamped
+  // ramp on `edgeR` grew quadratically with distance and produced a 148 km tall terrain wall at
+  // the horizon. That wall is the "white geometry artifacting" seen around the edges of the
+  // simulation: thousands of near-vertical white triangles standing in the sky.
+  //
+  // The rim is therefore confined to a ring just outside the domain and faded out again beyond
+  // it, so distant terrain is flat, hazed horizon rather than a skyscraper.
   const edgeR = Math.max(Math.abs(x), Math.abs(z)) / DOMAIN_HALF_SIZE;
-  const rim = edgeR > 0.82 ? Math.pow((edgeR - 0.82) / 0.18, 2) * 85.0 : 0;
+  const rimBand = Math.max(0, Math.min(1, (edgeR - 0.82) / 0.18));
+  // Fades back to zero over the next domain-width, so the mesh's outer rings sit at meadow level.
+  const rimFade = 1.0 - Math.max(0, Math.min(1, (edgeR - 1.0) / 0.55));
+  const rim = rimBand * rimBand * rimFade * 85.0;
 
-  return Math.max(0, 8.0 + meadow + hills + rim);
+  // Hard ceiling as a final safety net. Nothing in this scene is legitimately above the meadow
+  // plus foothills; if a future term ever misbehaves, this keeps a single bad sample from
+  // becoming a spike of white geometry that reaches into the cloud layer.
+  return Math.max(0, Math.min(2500, 8.0 + meadow + hills + rim));
 }
 
 /**

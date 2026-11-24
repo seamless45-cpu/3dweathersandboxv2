@@ -12,7 +12,9 @@
     "validate:pwa": "node scripts/validatePwa.mjs && node scripts/testServiceWorker.mjs && node scripts/testPwaClient.mjs",
     "validate:shaders": "node scripts/validateShaders.mjs",
     "bench": "node scripts/runSimBench.mjs",
-    "validate:pages": "node scripts/testPagesLayout.mjs"
+    "validate:pages": "node scripts/testPagesLayout.mjs",
+    "test:terrain": "node scripts/testTerrainBounds.mjs",
+    "test": "node scripts/testServiceWorker.mjs && node scripts/testPwaClient.mjs && node scripts/testPagesLayout.mjs && node scripts/testTerrainBounds.mjs"
   },
   "dependencies": {
     "@types/three": "^0.187.0",

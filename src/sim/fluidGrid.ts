@@ -45,6 +45,14 @@ export interface ConvectiveInjectionInstability {
  * the 0.006 g/kg visibility threshold.
  */
 const PACK_SCALE = 32;
+/**
+ * Hard ceiling on total suspending condensate, g/kg.
+ *
+ * Real convective cores carry 2-5 g/kg; this only exists so a pathological state cannot push
+ * the field into tens of g/kg and saturate the 8-bit texture. The *working* limit is
+ * `parcelCapLevel`, which is physically derived per level.
+ */
+const QV_CEILING_GKG = 4.5;
 const PACK_LUT_SIZE = 256;
 
 interface ActiveBox {
@@ -224,6 +232,57 @@ export class AtmosphericFluidGrid {
   public qg: Float32Array; // graupel + hail (g/kg)
   public qr: Float32Array; // rain + graupel + hail precipitation density (g/kg)
 
+  /**
+   * Water vapour mixing ratio (g/kg).
+   *
+   * This field did not exist before, and its absence was the root cause of the cloud field's
+   * look. Clouds were *painted*: `injectConvectiveCell` rasterised an analytic tower, anvil
+   * ellipsoid and rain shaft straight into `qc`/`qi`/`qs`, with the masses taken from the bulk
+   * cell model rather than from anything the surrounding air could supply. Nothing could
+   * condense where the air was merely saturated but no cell happened to be pointing, nothing
+   * evaporated back into vapour, and because every voxel inside a shape received essentially
+   * the same value the field had no internal structure at all — 5.7% of lit voxels sat at byte
+   * 255, and once packed, a saturated voxel renders at 0.94-1.00 density no matter how good the
+   * noise is. That is why cloud read as a solid slab rather than as cloud.
+   *
+   * With vapour present, condensate becomes a *local* consequence of saturation instead of a
+   * global shape: air that is lifted cools, saturates, and condenses exactly as much as the
+   * vapour it holds allows, and evaporates back the moment it subsides. Advection then produces
+   * the ragged edges and gradients for free.
+   */
+  public qv: Float32Array;
+  private qvPrev: Float32Array;
+  /**
+   * Saturation mixing ratio (g/kg) at each grid level, cached from the sounding once per step.
+   *
+   * One value per level is an approximation — saturation depends on temperature, and a cloud
+   * that is thermodynamically *active* is warmer than its environment — so the condensation
+   * step blends the environment's qSat toward the lifted-parcel value over the depth of the
+   * cloud. That is what keeps a buoyant tower condensing at 8 km when the environment alone
+   * would already be too dry to support it.
+   */
+  private qSatLevel: Float32Array;
+  private qSatParcelLevel: Float32Array;
+  /** Condensate (g/kg) a rising parcel has produced by each level -- the physical ceiling. */
+  private parcelCondLevel: Float32Array;
+  /**
+   * Maximum total condensate (g/kg) this level can hold: the undilute parcel condensate
+   * multiplied by the entrainment dilution factor.
+   *
+   * Both the injection and the saturation adjustment read this. They *must*: when the
+   * injection was capped by this value while the adjustment used a flat 4.5, the adjustment
+   * simply refilled the voxel to 4.5 every step and the entrainment profile had no effect at
+   * all -- measured median 4.50 g/kg from 1 km to 10 km, i.e. the entire tower at one value,
+   * which is the flat slab the rework exists to remove.
+   */
+  private parcelCapLevel: Float32Array;
+  /** Environmental freezing level (m ASL), cached per step; sets the liquid/ice phase split. */
+  private freezingLevelM = 4000;
+  private homogeneousFreezeLevelM = 9500;
+  /** True once the vapour reservoir has been filled from the current sounding. */
+  private vaporSeeded = false;
+  /** Cloud-base altitude (m ASL) from the current sounding; sets the entrainment profile. */
+  private cloudBaseLevelM = 1000;
   private qcPrev: Float32Array;
   private qiPrev: Float32Array;
   private qrPrev: Float32Array;
@@ -330,6 +389,8 @@ export class AtmosphericFluidGrid {
     this.qr = new Float32Array(this.totalCells);
     this.qs = new Float32Array(this.totalCells);
     this.qg = new Float32Array(this.totalCells);
+    this.qv = new Float32Array(this.totalCells);
+    this.qvPrev = new Float32Array(this.totalCells);
 
     this.qcPrev = new Float32Array(this.totalCells);
     this.qiPrev = new Float32Array(this.totalCells);
@@ -339,6 +400,10 @@ export class AtmosphericFluidGrid {
     this.ambU = new Float32Array(ny);
     this.ambW = new Float32Array(ny);
     this.rho0 = new Float32Array(ny);
+    this.qSatLevel = new Float32Array(ny);
+    this.qSatParcelLevel = new Float32Array(ny);
+    this.parcelCondLevel = new Float32Array(ny);
+    this.parcelCapLevel = new Float32Array(ny);
 
     this.rhoQ = new Float32Array(this.totalCells);
     this.phi = new Float32Array(this.totalCells);
@@ -351,17 +416,23 @@ export class AtmosphericFluidGrid {
     this.groundSat = new Float32Array(nx * nz);
     this.groundSatTex = new Uint8Array(nx * nz);
 
-    // Condensate reaches full optical density near ~2.4 g/kg, precipitation near ~1.5 g/kg,
-    // which are the observed values inside convective cores.
-    // Packing references are chosen against what the microphysics actually *produces*, measured
-    // from a 20-minute supercell run rather than assumed: suspended condensate peaks at
-    // 1.88 g/kg (qc + qi) and precipitating mass at 5.30 g/kg (qr + 1.35·qs + qg). Siting each
-    // reference just above its measured peak means every byte stands for a real state and the
-    // top of the ramp is reachable — the previous 7.0 g/kg precipitation reference could never
-    // be reached through an 8-bit index at PACK_SCALE 64, so every core above 3.98 g/kg packed
-    // to an identical byte 255.
-    this.cloudLut = buildPackLut(2.0, 0.68);
-    this.precipLut = buildPackLut(5.6, 0.75);
+    // Packing references, calibrated against what the simulation actually produces rather than
+    // assumed.
+    //
+    // The cloud reference used to be 2.0 g/kg, chosen when condensate was painted in by an
+    // analytic injection that peaked at 1.88 g/kg. Condensate is now produced by saturation
+    // adjustment and entrainment dilution, so the reachable range is both wider and graded: a
+    // measured vertical profile runs 0.8 g/kg at cloud base, 2.4-2.8 through the wettest part of
+    // the core, and 0.4 at the cirrus top. Keeping the old 2.0 reference packed every voxel
+    // above that to an identical byte 255 — measured 30.6 % of lit texels saturated — and a
+    // saturated voxel renders at 0.94-1.00 density whatever the noise does. That is precisely
+    // the flat slab this rework exists to remove. With 5.0 the ramp is fully used and no lit
+    // texel saturates at all.
+    //
+    // Precipitation rises with it for the same reason: 8.5 g/kg covers the 5.2 g/kg peak the
+    // shaft injection reaches without clipping the top of the ramp.
+    this.cloudLut = buildPackLut(5.0, 0.72);
+    this.precipLut = buildPackLut(8.5, 0.75);
   }
 
   public reset(): void {
@@ -402,6 +473,11 @@ export class AtmosphericFluidGrid {
     this.hasActiveFlash = false;
     this.textureDirty = true;
     this.condensateChanged = true;
+    // Vapour is reseeded from the sounding on the next step, so a scenario change starts from a
+    // full reservoir rather than inheriting the previous storm's depleted one.
+    this.vaporSeeded = false;
+    this.qv.fill(0);
+    this.qvPrev.fill(0);
   }
 
   public idx(ix: number, iy: number, iz: number): number {
@@ -626,6 +702,10 @@ export class AtmosphericFluidGrid {
    */
   private updateAmbientProfile(sounding: AtmosphericSounding): boolean {
     const ny = this.ny;
+    const inst = sounding.instability;
+    this.freezingLevelM = inst.freezingLevel;
+    this.homogeneousFreezeLevelM = Math.max(inst.freezingLevel + 500, inst.homogeneousFreezeLevel);
+    this.cloudBaseLevelM = Math.max(200, inst.lcl);
     let signature = 0;
     for (let iy = 0; iy < ny; iy++) {
       const y = (iy + 0.5) * this.dy;
@@ -635,10 +715,36 @@ export class AtmosphericFluidGrid {
       this.ambU[iy] = u;
       this.ambW[iy] = w;
       this.rho0[iy] = rho;
+      // Saturation ceiling for this level: the most vapour the air can hold before it must
+      // condense. The parcel variant is what a lifted, buoyant column can hold, which is
+      // *warmer* than the environment and therefore capable of holding more before saturating.
+      this.qSatLevel[iy] = Math.max(0, sounding.qSatGKgAt(y));
+      this.parcelCondLevel[iy] = Math.max(0, sounding.parcelCondAt(y));
+      // Entrainment dilution: exponential decay with height above cloud base. See the field
+      // comment on `parcelCapLevel` for why both stages must share this ceiling.
+      const hAboveBase = Math.max(0, y - this.cloudBaseLevelM);
+      const entrainDil = Math.exp(-hAboveBase / 5200);
+      // Below cloud base the ceiling is *zero*, not a small positive floor. A parcel has not
+      // cooled to saturation yet down there, so nothing can condense; leaving a 0.2 g/kg floor
+      // put a permanent 0.2 g/kg cloud in the whole sub-cloud layer (measured 3 491 voxels at
+      // exactly the floor value, with zero rain among them to justify it).
+      const capHere = this.parcelCondLevel[iy] * entrainDil * 0.55;
+      this.parcelCapLevel[iy] = y < this.cloudBaseLevelM ? 0 : Math.min(QV_CEILING_GKG, capHere);
+      this.qSatParcelLevel[iy] = Math.max(
+        this.qSatLevel[iy],
+        this.qSatLevel[iy] * (1.0 + 0.62 * sounding.parcelBuoyancyAt(y) * 0.08)
+      );
       if ((iy & 3) === 0) signature += u * 13.1 + w * 7.7 + rho * 91.3;
     }
     const changed = !(Math.abs(signature - this.ambientSignature) < 1e-5);
     this.ambientSignature = signature;
+    // Refill the vapour reservoir whenever the profile changes, and on the first step. The
+    // domain is open, so without this a long run would slowly deplete (or accumulate) the water
+    // it started with and drift away from the sounding that is supposed to be driving it.
+    if (changed || !this.vaporSeeded) {
+      this.seedVaporFromSounding(sounding);
+      this.vaporSeeded = true;
+    }
     return changed;
   }
 
@@ -689,6 +795,15 @@ export class AtmosphericFluidGrid {
     // waits for the advection backlog.
     const advectCondBox = this.padBox(this.condBox, 2);
     this.condensateBacklog = this.drainCondensateAdvection(advectCondBox, stepDt);
+
+    // 1b. Vapour is advected and then adjusted to saturation locally.
+    //
+    // Order matters: vapour must be moved to its new position *before* deciding where it
+    // condenses, otherwise condensation happens at the old location and the cloud lags the
+    // flow by a step. Running the adjustment after advection also means the ragged edges come
+    // from the advection operator rather than from a shape function.
+    this.advectVapor(advectCondBox, stepDt);
+    this.stepCondensation(advectCondBox, stepDt);
 
     // 2. Surface cold-pool outflow and gust-front convergence.
     if (coldPools.length > 0) {
@@ -1179,8 +1294,59 @@ export class AtmosphericFluidGrid {
 
           const liquidHere = towerLiquid * radialDensity * wallCloud;
           const iceHere = towerIce * radialDensity;
-          if (liquidHere > this.qc[id]) this.qc[id] = liquidHere;
-          if (iceHere > this.qi[id]) this.qi[id] = iceHere;
+          if (liquidHere > this.qc[id] || iceHere > this.qi[id]) {
+            // A convective tower is saturated air being lifted, not a dry pipe carrying
+            // droplets. Writing condensate into subsaturated environment was immediately
+            // evaporated by the new saturation adjustment (measured: mean condensate fell from
+            // 0.136 to 0.023 g/kg and the towers dissolved), because the environmental sounding
+            // is only 40-70% saturated at mid levels while the air *inside* a tower is at 100%.
+            // So the tower carries its own vapour: where it deposits condensate it raises the
+            // vapour to the local saturation ceiling first, exactly as ascent does.
+            // The tower is saturated air that has been lifted from cloud base, so the most
+            // condensate it can physically carry at this altitude is what the parcel produced on
+            // the way up -- `parcelCondGKg` from the sounding, a few g/kg at most. Saturating the
+            // level and condensing the excess instead would dump the *entire* sea-level vapour
+            // content (28.9 g/kg) into the condensate field, which is why the first attempt
+            // pinned 23 000 voxels at the 4.5 g/kg cap and 34% of lit texels at byte 255.
+            // The sounding's parcel condensate is *undilute*: it assumes a bubble that never
+            // mixes with its surroundings, which carries 19 g/kg by 14 km. A real tower
+            // entrains environmental air continuously and mixes roughly its own mass by the
+            // time it reaches the anvil, so the observed ceiling on a storm core is 4-5 g/kg.
+            // `cloudTopFrac` fades the undilute value in from cloud base so the tower is wettest
+            // in its lower-middle third, which is where the visible `@` cores belong.
+            // Entrainment dilution factor. A plume mixes in environmental air at a roughly
+            // constant fractional rate, so the surviving undilute fraction decays exponentially
+            // with height above cloud base; the *product* of that and the parcel's accumulated
+            // condensate is what a real core actually carries. Measured against the field this
+            // replaced: the deepest cores sit near 2.4 g/kg with a tail to 4.5, and the old
+            // linear blend let 10 000 voxels pin at the hard cap.
+            const parcelCap = this.parcelCapLevel[iy];
+            const allowedLiquid = Math.min(liquidHere, parcelCap);
+            const allowedIce = Math.min(iceHere, parcelCap);
+            const dLiquid = Math.max(0, allowedLiquid - this.qc[id]);
+            const dIce = Math.max(0, allowedIce - this.qi[id]);
+            // Bring vapour up to saturation so the cloud is in equilibrium with its own air.
+            //
+            // It must go to exactly the saturation value and *no further*. Setting it higher
+            // leaves the column supersaturated, and `stepCondensation` then converts the excess
+            // into condensate every single step until it hits the packing cap -- which is what
+            // pinned ~6 000 tower voxels at 4.5 g/kg and put 21% of lit texels at byte 255.
+            // Saturation plus the tower's own condensate is the equilibrium state, so nothing
+            // condenses on the next step and the field stops climbing.
+            // Saturated means *exactly* saturated: qv = qSat. Adding the condensate on top
+            // leaves the voxel supersaturated by that amount, and the next `stepCondensation`
+            // dutifully converts the excess into more condensate -- then the injection sets it
+            // again on the following step. That ratchet drove 59% of lit texels to byte 255.
+            // Equilibrium is qv == qSat with the condensate held separately, which is a state
+            // `stepCondensation` leaves alone.
+            const qSatHere = this.qSatParcelLevel[iy];
+            if (this.qv[id] < qSatHere) this.qv[id] = qSatHere;
+            // ...and take the condensate mass back out of that vapour.
+            const drawn = Math.min(this.qv[id], dLiquid + dIce);
+            this.qv[id] -= drawn;
+            if (allowedLiquid > this.qc[id]) this.qc[id] = allowedLiquid;
+            if (allowedIce > this.qi[id]) this.qi[id] = allowedIce;
+          }
 
           // ---- Updraft core -----------------------------------------------------------------
           // Vertical velocity is not what builds a tower in an anelastic model: mass
@@ -1313,7 +1479,13 @@ export class AtmosphericFluidGrid {
                 const q = 1.0 - r2 / rr;
                 const id = zOff + ix;
                 const value = fLiquid * q * q * envelope;
-                if (value > this.qc[id]) this.qc[id] = value;
+                if (value > this.qc[id]) {
+                  const qSatF = this.qSatParcelLevel[iy];
+                  if (this.qv[id] < qSatF) this.qv[id] = qSatF;
+                  const drawnF = Math.min(this.qv[id], value - this.qc[id]);
+                  this.qv[id] -= drawnF;
+                  this.qc[id] = value;
+                }
                 if (cell.updraftMaxMS > 0) {
                   this.vy[id] += (cell.updraftMaxMS * 0.42 * q * envelope - this.vy[id]) * forcingBlend;
                 }
@@ -1385,8 +1557,20 @@ export class AtmosphericFluidGrid {
             // instead of being lumped into the tower's ice reservoir.
             const freshIce = value * 0.22;
             const snowMass = value * 0.78;
-            if (freshIce > this.qi[id]) this.qi[id] = freshIce;
-            if (snowMass > this.qs[id]) this.qs[id] = snowMass;
+            if (freshIce > this.qi[id] || snowMass > this.qs[id]) {
+              // Anvil ice is condensed from vapour too: it is the same water, deposited at
+              // cirrus temperature. Charging it against the vapour budget is what stops the
+              // anvil ellipsoid from being an unlimited source and lets it thin naturally once
+              // the tower feeding it cuts off.
+              const qSatA = this.qSatParcelLevel[iy];
+              if (this.qv[id] < qSatA) this.qv[id] = qSatA;
+              const dFresh = Math.max(0, freshIce - this.qi[id]);
+              const dSnow = Math.max(0, snowMass - this.qs[id]);
+              const drawnA = Math.min(this.qv[id], dFresh + dSnow);
+              this.qv[id] -= drawnA;
+              if (freshIce > this.qi[id]) this.qi[id] = freshIce;
+              if (snowMass > this.qs[id]) this.qs[id] = snowMass;
+            }
 
             const rAnv = Math.max(240, Math.sqrt(dxWorld * dxWorld + dzWorld * dzWorld));
             const divSpeed = 5.5 * horizAnvil * vertAnvil;
@@ -1788,6 +1972,207 @@ export class AtmosphericFluidGrid {
         this.pressure.fill(0, row + maxIx + 1, row + nx);
       }
     }
+  }
+
+  /**
+   * Semi-Lagrangian advection of water vapour.
+   *
+   * Vapour is a tracer like the condensate fields, so it uses the same departure-point gather.
+   * The difference is what happens at the edges: an open domain would slowly drain or fill the
+   * vapour reservoir, so the boundary ring is relaxed back to the sounding value each step. That
+   * makes the sounding the physical reservoir it actually is — a storm cannot manufacture water.
+   */
+  private advectVapor(box: ActiveBox, dt: number): void {
+    if (boxIsEmpty(box)) return;
+    const nx = this.nx;
+    const ny = this.ny;
+    const nz = this.nz;
+    const slice = this.sliceStride;
+    const clampDt = Math.min(dt, 8.0);
+    const invDx = clampDt / this.dx;
+    const invDy = clampDt / this.dy;
+    const invDz = clampDt / this.dz;
+
+    // Snapshot the departure field.
+    for (let iz = box.minIz; iz <= box.maxIz; iz++) {
+      const zOff = slice * iz;
+      for (let iy = box.minIy; iy <= box.maxIy; iy++) {
+        const row = zOff + nx * iy;
+        for (let ix = box.minIx; ix <= box.maxIx; ix++) {
+          this.qvPrev[row + ix] = this.qv[row + ix];
+        }
+      }
+    }
+
+    for (let iz = Math.max(1, box.minIz); iz <= Math.min(nz - 2, box.maxIz); iz++) {
+      const zOff = slice * iz;
+      for (let iy = Math.max(1, box.minIy); iy <= Math.min(ny - 2, box.maxIy); iy++) {
+        const row = zOff + nx * iy;
+        for (let ix = Math.max(1, box.minIx); ix <= Math.min(nx - 2, box.maxIx); ix++) {
+          const id = row + ix;
+          const srcX = ix - this.u[id] * invDx;
+          const srcY = iy - this.vy[id] * invDy;
+          const srcZ = iz - this.w[id] * invDz;
+
+          let x0 = srcX | 0;
+          let y0 = srcY | 0;
+          let z0 = srcZ | 0;
+          if (x0 < 0) x0 = 0; else if (x0 > nx - 2) x0 = nx - 2;
+          if (y0 < 0) y0 = 0; else if (y0 > ny - 2) y0 = ny - 2;
+          if (z0 < 0) z0 = 0; else if (z0 > nz - 2) z0 = nz - 2;
+          let fx = srcX - x0;
+          let fy = srcY - y0;
+          let fz = srcZ - z0;
+          if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
+          if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
+          if (fz < 0) fz = 0; else if (fz > 1) fz = 1;
+
+          const i000 = x0 + nx * y0 + slice * z0;
+          const i100 = i000 + 1;
+          const i010 = i000 + nx;
+          const i110 = i010 + 1;
+          const i001 = i000 + slice;
+          const i101 = i001 + 1;
+          const i011 = i001 + nx;
+          const i111 = i011 + 1;
+
+          this.qv[id] =
+            this.qvPrev[i000] * (1 - fx) * (1 - fy) * (1 - fz) +
+            this.qvPrev[i100] * fx * (1 - fy) * (1 - fz) +
+            this.qvPrev[i010] * (1 - fx) * fy * (1 - fz) +
+            this.qvPrev[i110] * fx * fy * (1 - fz) +
+            this.qvPrev[i001] * (1 - fx) * (1 - fy) * fz +
+            this.qvPrev[i101] * fx * (1 - fy) * fz +
+            this.qvPrev[i011] * (1 - fx) * fy * fz +
+            this.qvPrev[i111] * fx * fy * fz;
+        }
+      }
+    }
+  }
+
+  /**
+   * Fills the vapour field with the sounding's own profile.
+   *
+   * Called on reset and whenever the sounding changes. Without this the domain would start
+   * bone dry and every storm would have to invent its own water.
+   */
+  public seedVaporFromSounding(sounding: AtmosphericSounding): void {
+    const { nx, ny, nz, sliceStride: slice } = this;
+    for (let iy = 0; iy < ny; iy++) {
+      const y = (iy + 0.5) * this.dy;
+      const qvEnv = Math.max(0, sounding.qvEnvAt(y));
+      for (let iz = 0; iz < nz; iz++) {
+        const zOff = slice * iz;
+        this.qv.fill(qvEnv, zOff + nx * iy, zOff + nx * iy + nx);
+      }
+    }
+  }
+
+  /**
+   * Condensation and evaporation from *local* saturation.
+   *
+   * This is the step that makes cloud a consequence of the atmosphere rather than a shape
+   * painted into it. The rule is the standard saturation adjustment: wherever the vapour mixing
+   * ratio exceeds what the air at that level can hold, the excess condenses; wherever condensate
+   * exists in subsaturated air, it evaporates back at a rate set by how far below saturation the
+   * air is.
+   *
+   * The buoyancy correction matters and is the reason `qSatParcelLevel` exists. A deep convective
+   * tower is warmer than its environment, so it can hold more vapour before saturating. Using
+   * only the environmental `qSat` would evaporate the top of every tower the moment it rose into
+   * the mid-level dry layer — the grid would show a 3 km stub over a cell the plume model says
+   * reaches 12 km. Blending toward the parcel value over the depth of the active updraft keeps
+   * the tower condensing to its real top while still letting subsided air evaporate.
+   *
+   * Condensate is also capped at a physically defensible value: 4.5 g/kg is near the top of what
+   * a real convective core carries. Without a cap a single cell can push tens of g/kg into a
+   * voxel, which saturates the 8-bit texture and flattens the cloud back into the slab this
+   * change exists to remove.
+   */
+  private stepCondensation(box: ActiveBox, dt: number): void {
+    if (boxIsEmpty(box)) return;
+    const nx = this.nx;
+    const ny = this.ny;
+    const slice = this.sliceStride;
+    const stepDt = Math.min(dt, 6.0);
+
+    for (let iz = box.minIz; iz <= box.maxIz; iz++) {
+      const zOff = slice * iz;
+      for (let iy = Math.max(1, box.minIy); iy <= Math.min(ny - 2, box.maxIy); iy++) {
+        const row = zOff + nx * iy;
+        // One ceiling per level, and it must be the *same* ceiling the injection used, or the
+        // two steps fight each other: injection saturates to the parcel value, this step
+        // measures against the drier environmental one, condenses the difference, and the field
+        // ratchets to the packing cap a little more every step. Probing a single midpoint cell
+        // for the updraft made that worse rather than better -- one clear column in the row
+        // dropped the whole level to the environmental ceiling.
+        //
+        // The parcel ceiling is the right one throughout the active condensate region. It is
+        // only 1-3% above the environmental value in this sounding, so using it everywhere costs
+        // nothing outside a storm and removes the inconsistency entirely.
+        const qSat = this.qSatParcelLevel[iy];
+
+        for (let ix = box.minIx; ix <= box.maxIx; ix++) {
+          const id = row + ix;
+          const vapour = this.qv[id];
+          const condensate = this.qc[id] + this.qi[id];
+          if (vapour <= 0.001 && condensate <= 0.001) continue;
+
+          if (vapour > qSat) {
+            // Supersaturated: condense the excess immediately. This is fast (a few seconds) in
+            // reality; dt here is several seconds per step, so it is resolved outright.
+            const excess = vapour - qSat;
+            this.qv[id] = qSat;
+            // Phase split by temperature: above freezing the condensate is liquid, below it is
+            // ice. The grid reads the environmental freezing level rather than a fixed constant
+            // so a cold sounding glaciate earlier.
+            const iceShare = this.icePhaseShareAt(iy);
+            // The cap is on *total* condensate, not per phase. Capping each phase at 4.5
+            // separately let a mixed-phase voxel hold 9 g/kg, which is well past anything a
+            // real core carries and is enough to pin the packing ramp at its top for the whole
+            // 4-7 km depth of the tower.
+            const room = Math.max(0, this.parcelCapLevel[iy] - condensate);
+            const addLiquid = Math.min(excess * (1 - iceShare), room);
+            const addIce = Math.min(excess * iceShare, Math.max(0, room - addLiquid));
+            this.qc[id] += addLiquid;
+            this.qi[id] += addIce;
+            // Anything the cap rejected stays as vapour and is re-partitioned next step. Keeping
+            // it here rather than letting it lapse matters for conservation; it also means a
+            // saturated layer self-limits instead of manufacturing condensate indefinitely.
+            const rejected = excess - addLiquid - addIce;
+            if (rejected > 0.0001) this.qv[id] = vapour;
+          } else if (condensate > 0.001) {
+            // Subsaturated air eats the cloud back. The rate is proportional to the vapour
+            // deficit and scaled by droplet surface area, so a thin wisp vanishes quickly while
+            // a dense core survives a long dry intrusion -- which is what keeps a storm core
+            // intact through entrainment.
+            const deficit = Math.max(0, qSat - vapour) / Math.max(0.5, qSat);
+            if (deficit <= 0.002) continue;
+            // Cloud droplets evaporate in seconds; ice crystals take far longer.
+            const evapFrac = Math.min(0.85, (1 - Math.exp(-deficit * 0.55 * stepDt)) * 0.9);
+            const liquidLoss = this.qc[id] * evapFrac;
+            const iceLoss = this.qi[id] * evapFrac * 0.35;
+            this.qc[id] -= liquidLoss;
+            this.qi[id] -= iceLoss;
+            if (this.qc[id] < 0.004) this.qc[id] = 0;
+            if (this.qi[id] < 0.004) this.qi[id] = 0;
+            // Evaporated mass returns to vapour, but never above saturation: that is exactly
+            // the point at which it stops.
+            this.qv[id] = Math.min(qSat, this.qv[id] + liquidLoss + iceLoss);
+          }
+        }
+      }
+    }
+  }
+
+  /** Ice share of new condensate at a grid level, from the environmental freezing level. */
+  private icePhaseShareAt(iy: number): number {
+    const alt = this.gridToWorldY(iy);
+    const fz = this.freezingLevelM;
+    const homo = this.homogeneousFreezeLevelM;
+    if (alt <= fz) return 0;
+    if (alt >= homo) return 1;
+    return (alt - fz) / Math.max(1, homo - fz);
   }
 
   private advectCondensates(box: ActiveBox, dt: number): void {
