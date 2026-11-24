@@ -6,7 +6,25 @@
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
-    <title>3D Autonomous Atmospheric, Convective & Electrical Simulation</title>
+    <title>MeteoLab — 3D Weather Sandbox</title>
+
+    <!-- Progressive web app -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0b1120" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="A physically grounded 3D atmospheric sandbox: convective cells, supercells, tornadoes, lightning and radar, simulated live in the browser."
+    />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/icons/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <!-- iOS ignores the manifest's display mode unless asked explicitly. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="MeteoLab" />
+
     <style>
       html, body, #root { width: 100%; height: 100%; margin: 0; background: #030712; }
       #startup-fallback { box-sizing: border-box; min-height: 100%; display: grid; place-content: center; padding: 2rem; color: #e2e8f0; font: 14px/1.5 system-ui, sans-serif; text-align: center; }

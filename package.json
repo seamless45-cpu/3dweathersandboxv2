@@ -7,7 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "build:pages": "vite build --base=/3dweathersandboxv2/ && node scripts/copyPagesBuild.mjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "icons": "node scripts/generateIcons.mjs",
+    "validate:pwa": "node scripts/validatePwa.mjs && node scripts/testServiceWorker.mjs && node scripts/testPwaClient.mjs",
+    "validate:shaders": "node scripts/validateShaders.mjs",
+    "bench": "node scripts/runSimBench.mjs",
+    "validate:pages": "node scripts/testPagesLayout.mjs"
   },
   "dependencies": {
     "@types/three": "^0.187.0",

@@ -1,0 +1,60 @@
+{
+  "id": "/",
+  "name": "MeteoLab — 3D Weather Sandbox",
+  "short_name": "MeteoLab",
+  "description": "A physically grounded 3D atmospheric sandbox: convective cells, supercells, tornadoes, lightning and radar, simulated live in the browser.",
+  "start_url": "./",
+  "scope": ".",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#030712",
+  "theme_color": "#0b1120",
+  "categories": ["education", "utilities", "weather"],
+  "lang": "en",
+  "dir": "ltr",
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "icons/screenshot-wide.png",
+      "sizes": "1280x720",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "A supercell forming over the observer's meadow"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Supercell alley",
+      "short_name": "Supercell",
+      "description": "Start the high-shear supercell preset",
+      "url": "./?preset=supercell_alley"
+    },
+    {
+      "name": "Multicell cluster",
+      "short_name": "Multicell",
+      "description": "Start the multicell plains preset",
+      "url": "./?preset=multicell_plains"
+    }
+  ]
+}

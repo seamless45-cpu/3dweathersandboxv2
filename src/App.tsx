@@ -17,6 +17,9 @@ import {
   SimulationTelemetrySnapshot,
 } from './sim/types';
 import { EventMonitor } from './ui/EventMonitor';
+import { InstallPrompt } from './ui/InstallPrompt';
+import { takePresetFromUrl } from './pwa';
+import { SOUNDING_PRESETS } from './sim/thermodynamics';
 import { RadarPanel } from './ui/RadarPanel';
 import { SettingsDrawer, SunReadout } from './ui/SettingsDrawer';
 import { TopToolbar } from './ui/TopToolbar';
@@ -81,6 +84,26 @@ export function App() {
   pausedRef.current = paused;
   const simSpeedRef = useRef(simSpeed);
   simSpeedRef.current = simSpeed;
+
+  // An installed app can be launched straight into a headline scenario from a manifest shortcut
+  // (`./?preset=supercell_alley`). The query is consumed and stripped by `takePresetFromUrl`, so a
+  // later reload does not quietly re-apply the preset over whatever the user has since changed.
+  useEffect(() => {
+    const presetId = takePresetFromUrl();
+    if (!presetId) return;
+    const preset = SOUNDING_PRESETS.find((p) => p.id === presetId);
+    if (!preset) {
+      console.warn(`[meteolab] unknown preset in launch URL: ${presetId}`);
+      return;
+    }
+    const coordinator = coordinatorRef.current!;
+    coordinator.updateConfig(preset.config);
+    coordinator.resetToClearSky();
+    setConfig({ ...coordinator.config });
+    setTelemetry(coordinator.getTelemetrySnapshot());
+    // Deliberately runs once: this is launch-time behaviour, not a reaction to state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const media = window.matchMedia('(pointer: coarse) and (max-width: 768px)');
@@ -439,6 +462,11 @@ export function App() {
                 />
               )}
             </div>
+          </div>
+
+          {/* PWA install / offline / update strip */}
+          <div className="px-2.5 pb-1.5 flex justify-center">
+            <InstallPrompt />
           </div>
 
           {/* Bottom Micro-Telemetry & Touch Walk Controls */}
