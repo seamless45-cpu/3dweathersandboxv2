@@ -96,6 +96,11 @@ export class AtmosphericSceneEngine {
   private pixelRatioScale = 1;
   private volW = 2;
   private volH = 2;
+  /**
+   * Volumetric buffer scale last requested by the quality manager. Cached so a context restore
+   * can rebuild every render target at the same resolution the user was actually running.
+   */
+  private volumetricScaleCache = 0.6;
   private frameIndex = 0;
   private realTimeElapsed = 0;
   private windOffset = new THREE.Vector3();
@@ -110,6 +115,23 @@ export class AtmosphericSceneEngine {
   private viewProj = new THREE.Matrix4();
   private prevViewProj = new THREE.Matrix4();
   private hasPrevViewProj = false;
+  /**
+   * True once `volPrevRT` actually contains a previous frame of volumetrics.
+   *
+   * Distinct from `hasPrevViewProj`: that one only says a view-projection matrix exists to
+   * reproject with, and it is set earlier in the same frame. This one says the texture being
+   * sampled as history has been rendered at least once, which is what makes it safe to blend.
+   */
+  private hasVolHistory = false;
+  /**
+   * True once the GL context has been lost. Chrome drops a context under GPU memory pressure,
+   * after a driver reset, or when the tab is backgrounded on a memory-tight mobile device; every
+   * draw call after that silently no-ops or throws, so the frame loop has to stop issuing work
+   * instead of spamming a dead context.
+   */
+  private contextLost = false;
+  /** Detaches the context-loss listeners in `dispose()`. */
+  private detachContextListeners: (() => void) | null = null;
 
   constructor(
     container: HTMLElement,
@@ -148,6 +170,33 @@ export class AtmosphericSceneEngine {
 
     this.cameraCtrl = new ObserverCameraController(this.width / this.height);
     this.cameraCtrl.attach(this.renderer.domElement);
+
+    // A lost context is not fatal: the browser restores it automatically once the GPU is
+    // available again, but every render target, texture and shader object is gone with it.
+    // three.js re-uploads on demand, so all this side has to do is stop drawing until then.
+    const canvas = this.renderer.domElement;
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      this.contextLost = true;
+      console.warn('[MeteoLab] WebGL context lost; pausing the render loop until it is restored.');
+    };
+    const onContextRestored = () => {
+      this.contextLost = false;
+      // The restored context has none of the old history: reprojecting last frame's volume onto
+      // a fresh target would smear the sky, so the temporal chain restarts from scratch.
+      this.hasPrevViewProj = false;
+      this.hasVolHistory = false;
+      this.renderer.setPixelRatio(this.dpr);
+      this.renderer.setSize(this.width, this.height);
+      this.allocateRenderTargets(this.volumetricScaleCache);
+      console.info('[MeteoLab] WebGL context restored.');
+    };
+    canvas.addEventListener('webglcontextlost', onContextLost, false);
+    canvas.addEventListener('webglcontextrestored', onContextRestored, false);
+    this.detachContextListeners = () => {
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
+    };
 
     // Create WebGL2 3D Volume Texture directly backed by simulation grid's Uint8Array
     this.volTexture3D = new THREE.Data3DTexture(
@@ -340,29 +389,59 @@ export class AtmosphericSceneEngine {
   }
 
   public allocateRenderTargets(volScale: number): void {
+    this.volumetricScaleCache = volScale;
     const pixelW = Math.max(2, Math.floor(this.width * this.dpr));
     const pixelH = Math.max(2, Math.floor(this.height * this.dpr));
     const volW = Math.max(2, Math.floor(pixelW * volScale));
     const volH = Math.max(2, Math.floor(pixelH * volScale));
+
+    // A quality change between two tiers whose volumetric scales round to the same resolution
+    // would otherwise throw away and rebuild every target for an identical result. That teardown
+    // is a hard GPU stall, so it must only happen when it buys something.
+    const sceneUnchanged =
+      this.sceneRT &&
+      this.sceneRT.width === pixelW &&
+      this.sceneRT.height === pixelH;
+    const volUnchanged =
+      this.volCurrRT &&
+      this.volCurrRT.width === volW &&
+      this.volCurrRT.height === volH;
+    if (sceneUnchanged && volUnchanged) {
+      this.volW = volW;
+      this.volH = volH;
+      this.compositeMat.uniforms.uTexelSize.value.set(1.0 / volW, 1.0 / volH);
+      this.compositeMat.uniforms.uResolution.value.set(pixelW, pixelH);
+      return;
+    }
+
     this.volW = volW;
     this.volH = volH;
 
-    if (this.sceneRT) this.sceneRT.dispose();
-    if (this.outputRT) this.outputRT.dispose();
-    if (this.volCurrRT) this.volCurrRT.dispose();
-    if (this.volPrevRT) this.volPrevRT.dispose();
+    // The scene and output targets only depend on the canvas resolution and pixel ratio. A
+    // volumetric-scale change (which is all a quality tier changes) leaves them valid, so they
+    // are rebuilt only when their own size actually moved.
+    if (!sceneUnchanged) {
+      if (this.sceneRT) this.sceneRT.dispose();
+      if (this.outputRT) this.outputRT.dispose();
+    }
+    if (!volUnchanged) {
+      if (this.volCurrRT) this.volCurrRT.dispose();
+      if (this.volPrevRT) this.volPrevRT.dispose();
+    }
 
-    const depthTexture = new THREE.DepthTexture(pixelW, pixelH);
-    depthTexture.type = THREE.UnsignedIntType;
+    if (!sceneUnchanged) {
+      const depthTexture = new THREE.DepthTexture(pixelW, pixelH);
+      depthTexture.type = THREE.UnsignedIntType;
 
-    this.sceneRT = new THREE.WebGLRenderTarget(pixelW, pixelH, {
-      type: THREE.HalfFloatType,
-      format: THREE.RGBAFormat,
-      minFilter: THREE.LinearFilter,
-      magFilter: THREE.LinearFilter,
-      depthBuffer: true,
-      depthTexture,
-    });
+      this.sceneRT = new THREE.WebGLRenderTarget(pixelW, pixelH, {
+        type: THREE.HalfFloatType,
+        format: THREE.RGBAFormat,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        depthBuffer: true,
+        depthTexture,
+      });
+    }
 
     const rtOpts: THREE.RenderTargetOptions = {
       type: THREE.HalfFloatType,
@@ -372,9 +451,13 @@ export class AtmosphericSceneEngine {
       depthBuffer: false,
     };
 
-    this.outputRT = new THREE.WebGLRenderTarget(pixelW, pixelH, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
-    this.volCurrRT = new THREE.WebGLRenderTarget(volW, volH, rtOpts);
-    this.volPrevRT = new THREE.WebGLRenderTarget(volW, volH, rtOpts);
+    if (!sceneUnchanged) {
+      this.outputRT = new THREE.WebGLRenderTarget(pixelW, pixelH, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+    }
+    if (!volUnchanged) {
+      this.volCurrRT = new THREE.WebGLRenderTarget(volW, volH, rtOpts);
+      this.volPrevRT = new THREE.WebGLRenderTarget(volW, volH, rtOpts);
+    }
 
     this.volCloudMat.uniforms.uDepthTex.value = this.sceneRT.depthTexture;
     this.compositeMat.uniforms.uSceneTex.value = this.sceneRT.texture;
@@ -386,6 +469,7 @@ export class AtmosphericSceneEngine {
     // A resolution change invalidates the previous frame's volume: its texels no longer line
     // up with the new grid, so reprojecting it would smear the whole sky for a few frames.
     this.hasPrevViewProj = false;
+    this.hasVolHistory = false;
   }
 
   /** Internal render size in device pixels, for the HUD resolution readout. */
@@ -435,6 +519,10 @@ export class AtmosphericSceneEngine {
   ): void {
     this.frameIndex++;
     this.realTimeElapsed += realDtSec;
+
+    // A dead context accepts no draw calls; skip the entire pipeline rather than paying for
+    // matrix uploads, uniform writes and sim-to-GPU packing that can never reach the screen.
+    if (this.contextLost) return;
 
     // Update camera transform
     this.cameraCtrl.update(realDtSec);
@@ -700,7 +788,13 @@ export class AtmosphericSceneEngine {
     // Reprojection is now genuinely motion-compensated, so history can carry much more weight
     // than the old same-UV resample could without ghosting. That is what lets the volume pass
     // run at a fraction of output resolution and still converge to the same image.
-    cu.uTemporalBlend.value = temporalOn && flashIntensity < 0.2 ? 0.58 : 0.0;
+    // Only blend history that is actually this engine's previous volume. On the very first frame
+    // (and the first frame after a resize or context restore) `volPrevRT` has never been written,
+    // so sampling it returns the cleared/default texel value and mixing 58% of that into the
+    // image produces a full-screen wash instead of cloud. The history chain is also reset by
+    // `hasPrevViewProj`, which is exactly the same "no valid history" condition.
+    cu.uTemporalBlend.value =
+      temporalOn && flashIntensity < 0.2 && this.hasVolHistory ? 0.58 : 0.0;
 
     this.quadMesh.material = this.compositeMat;
     this.renderer.setRenderTarget(this.outputRT);
@@ -717,17 +811,21 @@ export class AtmosphericSceneEngine {
 
     this.prevViewProj.copy(this.viewProj);
 
-    // Copy volCurrRT -> volPrevRT for next frame's temporal smoothing
+    // Copy volCurrRT -> volPrevRT for next frame's temporal smoothing. The copy also marks the
+    // history valid, which is what re-enables the temporal blend on the following frame.
     if (temporalOn) {
       this.copyMat.uniforms.uSrc.value = this.volCurrRT.texture;
       this.quadMesh.material = this.copyMat;
       this.renderer.setRenderTarget(this.volPrevRT);
       this.renderer.render(this.postScene, this.postCamera);
       this.renderer.setRenderTarget(null);
+      this.hasVolHistory = true;
     }
   }
 
   public dispose(): void {
+    this.detachContextListeners?.();
+    this.detachContextListeners = null;
     this.cameraCtrl.detach();
     this.groundRenderer.dispose();
     this.lightningRenderer.dispose();

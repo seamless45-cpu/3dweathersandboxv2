@@ -684,10 +684,22 @@ export class ConvectiveCellManager {
         // suspended either falls out or evaporates back to vapour, and its cumulative budget
         // history has to survive so the domain water balance stays closed across the whole
         // run. Without this the drift grew every time a cell dissipated.
+        // Split the water this cell is still holding by where it physically was, and charge it
+        // exactly once. The budget identity the coordinator checks is
+        //     condensed == suspended inventory + fallout + evaporated
+        // so every gram retired here has to land in one of those buckets and no gram may land in
+        // two. The previous split charged the *same* `totalHydrometeors * 0.5` to both fallout
+        // and evaporated when a cell left the domain, which inflated the accounted total and made
+        // the conservation diagnostic under-report real drift; a cell that retired in bounds was
+        // charged 100% to evaporation even though most of that water was already falling out as
+        // rain, snow and graupel. Using the suspended (cloud/ice) mass for evaporation and the
+        // precipitating mass for fallout keeps both the totals and the physics honest, and the
+        // clamp reproduces the old total if the two fields ever disagree.
+        const suspendedGKg = cell.cloudWaterGKg + cell.supercooledWaterGKg + cell.cloudIceGKg;
+        const precipitatingGKg = Math.max(0, totalHydrometeors - suspendedGKg);
         this.retiredCondensedGKg += cell.cumCondensedGKg;
-        this.retiredFalloutGKg += cell.cumFalloutGKg + totalHydrometeors * (outOfBounds ? 0.5 : 0.0);
-        this.retiredEvaporatedGKg +=
-          cell.cumEvaporatedGKg + totalHydrometeors * (outOfBounds ? 0.5 : 1.0);
+        this.retiredFalloutGKg += cell.cumFalloutGKg + precipitatingGKg;
+        this.retiredEvaporatedGKg += cell.cumEvaporatedGKg + suspendedGKg;
         this.cells.splice(i, 1);
       }
     }

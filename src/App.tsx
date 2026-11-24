@@ -544,7 +544,12 @@ export function App() {
                   </span>
                   <span className="font-mono text-red-200/85">
                     {(t.windMS * 3.6).toFixed(0)} km/h · core {Math.round(t.radiusM)}m ·{' '}
-                    {Math.abs(t.pressureDeficitPa).toFixed(0)} Pa drop · {t.phase}
+                    {Math.abs(t.pressureDeficitPa).toFixed(0)} Pa drop ·{' '}
+                    {/* Whether the condensation funnel has actually reached the ground is the
+                        difference between "rotating wall cloud" and "tornado on the ground", so
+                        it is worth the two words it costs. */}
+                    {t.funnelDrop > 0.72 ? 'on the ground' : t.funnelDrop > 0.25 ? 'funnel descending' : 'aloft'} ·{' '}
+                    {t.phase}
                   </span>
                   {telemetry.tornadoes.length > 1 && (
                     <span className="font-mono text-red-300/70">
