@@ -41,8 +41,15 @@ npm run dev            # Vite dev server; the service worker registers on localh
 npm run icons          # regenerate the PWA icon set from scripts/generateIcons.mjs
 npm run validate:pwa   # manifest, icons, worker runtime and the install-state machine
 npm run validate:shaders
-npm run bench -- 120 supercell_alley 12   # headless physics benchmark
+npm run bench -- 120 supercell_alley 12        # headless physics benchmark
+node scripts/runLagSpikes.mjs 2400 supercell_alley 12   # per-frame cost distribution
 ```
+
+`runLagSpikes.mjs` reports the p50/p90/p95/p99 of the physics step rather than just a mean,
+because a mean cannot tell "this build is slower" apart from "this build hitches every eleventh
+frame". A healthy build has p95 close to p50; a wide gap means frame cost is bunched into a few
+expensive steps. The script also buckets by frame range so JIT warm-up is separated from steady
+state, and prints a spike ratio for a quick regression check.
 
 ## GitHub Pages
 

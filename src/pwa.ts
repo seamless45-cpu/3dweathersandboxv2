@@ -45,13 +45,37 @@ function detectStandalone(): boolean {
   if (typeof window === 'undefined') return false;
   // iOS Safari predates `display-mode: standalone` in some versions and exposes navigator.standalone.
   const iosStandalone = (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
-  return window.matchMedia?.('(display-mode: standalone)').matches === true || iosStandalone;
+  let matchesMedia = false;
+  try {
+    matchesMedia = window.matchMedia?.('(display-mode: standalone)').matches === true;
+  } catch {
+    // A restricted document (sandboxed iframe, some kiosk shells) can throw here. Running as an
+    // installed app is a nice-to-have, not a reason to fail to boot.
+  }
+  return matchesMedia || iosStandalone;
+}
+
+/**
+ * Reads a persisted flag without ever throwing.
+ *
+ * `localStorage` is not merely absent in some contexts — referencing it is fine, but *calling*
+ * it throws a `SecurityError` when cookies/site-data are blocked, in Safari private browsing on
+ * older iOS, in a sandboxed iframe, and in some enterprise kiosk profiles. `initialState()` runs
+ * at module scope, before React has mounted, so an exception here aborts `main.tsx` entirely and
+ * the user is left staring at a blank white page with no error and no way to recover. That is
+ * exactly what a "white box" report looks like, so every storage access is fenced off.
+ */
+function readFlag(key: string): boolean {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem(key) === '1';
+  } catch {
+    return false;
+  }
 }
 
 function initialState(): PwaSnapshot {
   const installed = detectStandalone();
-  const dismissed =
-    typeof localStorage !== 'undefined' && localStorage.getItem(DISMISS_KEY) === '1';
+  const dismissed = readFlag(DISMISS_KEY);
   return {
     installState: installed ? 'installed' : dismissed ? 'dismissed' : 'unsupported',
     standalone: installed,
@@ -250,11 +274,22 @@ export function initPwa(): void {
   window.addEventListener('online', () => set({ offline: false }));
   window.addEventListener('offline', () => set({ offline: true }));
 
-  window
-    .matchMedia?.('(display-mode: standalone)')
-    .addEventListener?.('change', (event) => {
-      set({ standalone: event.matches, installState: event.matches ? 'installed' : snapshot.installState });
-    });
+  // Every browser event above is optional chrome on top of the simulation: if the platform
+  // refuses to hand one over, booting must still continue. This listener used to be a bare
+  // chained call, so a thrown `matchMedia` (sandboxed document, restricted profile) aborted
+  // `initPwa()` — and with it the whole of `main.tsx` — leaving a blank page.
+  try {
+    window
+      .matchMedia?.('(display-mode: standalone)')
+      .addEventListener?.('change', (event) => {
+        set({
+          standalone: event.matches,
+          installState: event.matches ? 'installed' : snapshot.installState,
+        });
+      });
+  } catch {
+    /* display-mode changes are cosmetic; ignore a document that will not report them */
+  }
 
   // The service worker must not delay first paint; the app is already interactive by the time it
   // registers, and `load` fires after the WebGL scene has had its first frame.

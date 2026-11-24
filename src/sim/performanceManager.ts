@@ -39,6 +39,19 @@ export class AdaptivePerformanceManager {
   private lowFpsDurationSec = 0;
   private highFpsDurationSec = 0;
   private isMobileDevice: boolean;
+  /**
+   * Seconds since the last automatic tier change.
+   *
+   * Without this, auto-quality is a feedback oscillator. Dropping a tier makes frames cheaper, so
+   * the smoothed fps climbs past the upgrade threshold, the tier goes back up, frames get more
+   * expensive again and it drops once more — forever. Every one of those flips calls
+   * `allocateRenderTargets`, which disposes and recreates four render targets plus a depth
+   * texture and stalls the GPU pipeline, so the visible symptom is a hitch every few seconds
+   * that never goes away. A cooldown makes a change settle before it can be reversed.
+   */
+  private timeSinceTierChangeSec = 0;
+  /** Floor between automatic changes; comfortably longer than the upgrade dwell time. */
+  private static readonly TIER_CHANGE_COOLDOWN_SEC = 20.0;
 
   constructor() {
     this.isMobileDevice =
@@ -139,8 +152,11 @@ export class AdaptivePerformanceManager {
       : null;
 
     let resolutionChanged = false;
+    this.timeSinceTierChangeSec += clampedDt;
 
     if (this.settings.autoQuality) {
+      // Downgrade: react quickly, because a genuinely overloaded machine is unusable until the
+      // cost comes down. 1.4 s of sustained sub-39 fps is long enough to reject a single hitch.
       if (this.fpsAccum < 39) {
         this.lowFpsDurationSec += clampedDt;
         this.highFpsDurationSec = 0;
@@ -150,18 +166,26 @@ export class AdaptivePerformanceManager {
           if (idx > 0) {
             this.applyManualTier(TIER_ORDER[idx - 1]);
             resolutionChanged = true;
+            this.timeSinceTierChangeSec = 0;
           }
         }
       } else if (this.fpsAccum > 56.5) {
+        // Upgrade: deliberately slow. It must survive the cooldown *and* needs 5 s of headroom,
+        // so a tier that only just became affordable does not immediately get promoted back into
+        // the load that caused the demotion.
         this.highFpsDurationSec += clampedDt;
         this.lowFpsDurationSec = 0;
         const maxAutoIdx = this.isMobileDevice ? 2 : 3;
-        if (this.highFpsDurationSec > 5.0) {
+        if (
+          this.highFpsDurationSec > 5.0 &&
+          this.timeSinceTierChangeSec >= AdaptivePerformanceManager.TIER_CHANGE_COOLDOWN_SEC
+        ) {
           this.highFpsDurationSec = 0;
           const idx = TIER_ORDER.indexOf(this.settings.tier);
           if (idx < maxAutoIdx) {
             this.applyManualTier(TIER_ORDER[idx + 1]);
             resolutionChanged = true;
+            this.timeSinceTierChangeSec = 0;
           }
         }
       } else {

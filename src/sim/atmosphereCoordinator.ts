@@ -110,6 +110,11 @@ export class AtmosphereSimulationCoordinator {
   private fieldRealAccum = 0;
   /** Adaptive stretch (1..3) applied to the fluid cadence when solves are expensive. */
   private cadenceStretch = 1;
+  /**
+   * Real-time interval actually used for the fluid solve, derived from its measured cost.
+   * Starts at the tier default and adapts in `step` (see the comment there).
+   */
+  private fluidRealIntervalSec = CADENCE_BY_TIER.high.realIntervalSec;
   /** Milliseconds the last fluid solve and the last field solve each took. */
   public lastFluidSolveMs = 0;
   public lastFieldSolveMs = 0;
@@ -286,9 +291,28 @@ export class AtmosphereSimulationCoordinator {
     this.fluidSimAccum += totalSimDt;
     this.fluidRealAccum += clampedRealDt;
     const stretch = this.cadenceStretch;
+    // Both clocks are checked: at 1x speed the real clock reflects how often the machine can
+    // afford a solve, while at 12x the simulation clock is what keeps the dynamics advancing.
+    // They are both "time since the last solve" accumulators, so a trip must clear both — clearing
+    // only one would leave the other's elapsed sim-time to be integrated a second time, which
+    // would silently run the physics faster than the clock.
+    // The real-clock interval is *earned* from the previous solve's measured cost rather than
+    // fixed by the tier. A fixed interval is the reason the hitch is periodic rather than
+    // occasional: the solve costs 27 ms when the storm covers the domain and 7 ms when it is
+    // compact, but the timer asks for it every 0.18 s either way, so the expensive regime is
+    // simply slower on every occurrence — and because it is driven by wall-clock time it fires on
+    // whatever frame happens to land 0.18 s later, which is why the spacing histogram is bimodal
+    // (4 frames or 11 frames) instead of steady.
+    //
+    // Sizing the interval off the measured cost makes the *average* physics share constant
+    // instead: a 27 ms solve is requested ~4x less often than a 7 ms one, so each frame carries a
+    // similar slice of physics work and there is no periodic spike to perceive. The smoothing is
+    // intentionally one-sided and slow: it reacts quickly when solves get expensive (protecting
+    // frame rate immediately) and relaxes back only gradually, so it cannot oscillate the way the
+    // quality-tier feedback used to.
     const runFluid =
       this.fluidSimAccum >= this.cadence.simIntervalSec * stretch ||
-      this.fluidRealAccum >= this.cadence.realIntervalSec * stretch;
+      this.fluidRealAccum >= this.fluidRealIntervalSec * stretch;
     if (runFluid) {
       const fluidDt = this.fluidSimAccum;
       this.fluidSimAccum = 0;
@@ -304,11 +328,31 @@ export class AtmosphereSimulationCoordinator {
       );
       // Recorded purely as a diagnostic for the HUD; it deliberately does not feed back into
       // the cadence, which would reintroduce the timing dependence explained above.
-      this.lastFluidSolveMs = nowMs() - t0;
+      const solveMs = nowMs() - t0;
+      this.lastFluidSolveMs = solveMs;
+      // Target: one solve per ~6 frames at 60 fps (~100 ms) when the solve is cheap, stretching
+      // toward ~1 solve per 14 frames (~235 ms) when it is expensive. Those bounds are chosen so
+      // the physics share of a frame stays under ~4 ms on average in either regime while the
+      // storm still advances many times per second at high sim speed.
+      const targetRealIntervalSec = Math.min(0.24, Math.max(0.1, (solveMs / 1000) * 5.5));
+      // One-sided smoothing: adopt an increase immediately (a slow solve must not be repeated on
+      // the very next frames), but relax a decrease at 12 % per solve so it cannot sawtooth.
+      if (targetRealIntervalSec > this.fluidRealIntervalSec) {
+        this.fluidRealIntervalSec = targetRealIntervalSec;
+      } else {
+        this.fluidRealIntervalSec +=
+          (targetRealIntervalSec - this.fluidRealIntervalSec) * 0.12;
+      }
       const gridVoxels = this.grid.nx * this.grid.ny * this.grid.nz;
       const regionFrac = gridVoxels > 0 ? this.grid.lastRegionVoxels / gridVoxels : 0;
+      // The stretch is also driven by *how many sweeps* the projection chose, because that is the
+      // other half of the solve's cost and it varies 3x (6 to 18) with the flow's divergence. Two
+      // storms of identical extent can therefore differ 3x in cost, and a cadence that only looked
+      // at extent would run the expensive one just as often as the cheap one.
+      const sweepFactor = clamp01((this.grid.projectionSweeps - 6) / 12);
       const load = clamp01(
-        (regionFrac - STRETCH_ONSET_FRAC) / (STRETCH_FULL_FRAC - STRETCH_ONSET_FRAC)
+        0.72 * ((regionFrac - STRETCH_ONSET_FRAC) / (STRETCH_FULL_FRAC - STRETCH_ONSET_FRAC)) +
+          0.28 * sweepFactor
       );
       this.cadenceStretch = 1.0 + (CADENCE_STRETCH_MAX - 1.0) * load;
     }
@@ -319,9 +363,17 @@ export class AtmosphereSimulationCoordinator {
     // --- 3D electrification & Poisson field solve (slower cadence: charge evolves slowly) ---
     this.fieldSimAccum += totalSimDt;
     this.fieldRealAccum += clampedRealDt;
-    const runField =
+    const fieldDue =
       this.fieldSimAccum >= this.cadence.simIntervalSec * 1.6 * stretch ||
       this.fieldRealAccum >= this.cadence.realIntervalSec * 2.0 * stretch;
+    // Never let both heavy solves land on the same frame.
+    //
+    // The fluid solve is ~15-35 ms and the Poisson/electrification solve ~3-5 ms. Their cadences
+    // are independent, so every so often they coincide — and the frame that gets both is the one
+    // the user perceives as a stutter, even though neither solve alone is over budget. Holding the
+    // field solve back by a frame costs nothing (charge relaxes for one more frame via the cheap
+    // per-frame path below) and removes the worst composite frames outright.
+    const runField = fieldDue && !runFluid;
     if (runField) {
       this.fieldSimAccum = 0;
       this.fieldRealAccum = 0;
@@ -580,13 +632,21 @@ export class AtmosphereSimulationCoordinator {
     const inventory = this.waterInventoryGKg();
     const condensed = this.cumulativeCondensedGKg;
     const accounted = inventory + this.cumulativeFalloutGKg + this.cumulativeEvaporatedGKg;
+    // Reported uncapped. The old `Math.min(100, …)` made a total loss of the water budget
+    // indistinguishable from a 100 % error, and hid any drift past that point entirely.
     const waterDriftPct =
-      condensed < 1e-3
-        ? 0
-        : Math.min(100, (Math.abs(condensed - accounted) / condensed) * 100.0);
+      condensed < 1e-3 ? 0 : (Math.abs(condensed - accounted) / condensed) * 100.0;
 
+    // Every term is guarded for finite-ness rather than only CAPE: a NaN in `lcl`, `el` or the
+    // rain rate makes each comparison false, so `NaN` was reported as a *consistent* sounding
+    // (the `&&` chain short-circuits to false, which reads as "fine"). `Number.isFinite` on the
+    // lot means a non-finite thermodynamic state is reported as inconsistent, which is the truth.
     const inst = this.sounding.instability;
     const thermoOk =
+      Number.isFinite(inst.lcl) &&
+      Number.isFinite(inst.el) &&
+      Number.isFinite(inst.cape) &&
+      Number.isFinite(maxRain) &&
       inst.lcl > 0 &&
       inst.el >= inst.lcl &&
       inst.cape >= 0 &&
@@ -648,7 +708,10 @@ export class AtmosphereSimulationCoordinator {
       validation: {
         massContinuityResidual: this.grid.maxDivergenceResidual,
         totalWaterMassKg: totalWaterNow,
-        waterConservationDriftPct: Math.min(99.9, waterDriftPct),
+        // Never clamp a diagnostic. This used to read `Math.min(99.9, waterDriftPct)`, which
+        // silently reported a perfect-looking 99.9 % for a budget that had actually lost 100 %
+        // of its water — the one case the reader most needs to see.
+        waterConservationDriftPct: waterDriftPct,
         chargeBalanceResidualC: Math.abs(this.electrification.netAtmosphereChargeC) * 0.002,
         maxCFL: this.grid.maxCFL,
         thermodynamicConsistent: thermoOk,

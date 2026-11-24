@@ -26,6 +26,16 @@ export interface TornadoState {
   funnelDrop: number;
   /** Cloud base of the parent storm, m ASL -- the funnel descends from here. */
   cloudBaseM: number;
+  /**
+   * Peak mesocyclone vorticity the parent has reached while this vortex has existed, s⁻¹.
+   *
+   * Genesis fires the instant the mesocyclone crosses the gate, which is early in its life; using
+   * the instantaneous value afterwards meant intensity was fixed at whatever the vorticity
+   * happened to be in that single step, and since the diagnosed vorticity does not keep climbing
+   * the vortex could never intensify. Real tornadogenesis happens *as* the low-level mesocyclone
+   * tightens, so the strength that matters is the peak it is heading for, not the reading at birth.
+   */
+  peakParentVorticityS: number;
 }
 
 /**
@@ -124,7 +134,13 @@ export class TornadoEngine {
       // Conservation of angular momentum in a stretched column gives dV/dt ~ V * (dw/dz), so
       // the growth rate is proportional to the wind already present -- which is why a tornado
       // intensifies explosively once it starts, and why it needs a seed to begin with.
-      const zeta = parent ? Math.abs(parent.mesocycloneVorticity) : 0;
+      const zetaNow = parent ? Math.abs(parent.mesocycloneVorticity) : 0;
+      if (zetaNow > t.peakParentVorticityS) t.peakParentVorticityS = zetaNow;
+      // Decay the remembered peak very slowly, so a storm that once rotated hard does not keep a
+      // dead funnel alive forever: over ~10 simulated minutes the memory relaxes toward the
+      // current value.
+      t.peakParentVorticityS += (zetaNow - t.peakParentVorticityS) * (1.0 - Math.exp(-dt / 600.0));
+      const zeta = Math.max(zetaNow, 0.72 * t.peakParentVorticityS);
       const stretch = parent ? parent.updraftMaxMS / Math.max(1400, parent.cloudTopM - parent.cloudBaseM) : 0;
       // Tornadic threshold on the mesocyclone: below it the stretching cannot maintain the core.
       const maintainable = zeta > 0.0095 && parent !== null && parent.updraftMaxMS > 11;
@@ -139,22 +155,83 @@ export class TornadoEngine {
       // ζ/scale ≈ 0.55 at genesis (the stage gate) and ≈ 2.5 for a violent supercell, so the
       // ratio is mapped onto 12-75 m/s: a marginal supercell makes a brief EF0 spin-up, and
       // only an unusually strong, well-stretched mesocyclone carries the core past 60 m/s.
+      // Map the mesocyclone onto a peak wind.
+      //
+      // The previous mapping was `(relative - 0.5) / 1.7`, where `relative` is zeta divided by the
+      // environment's own vortex scale. That looked reasonable in isolation but was wrong at the
+      // only place it mattered: genesis requires zeta above ~0.0245, which on a high-helicity
+      // sounding is `relative` ~0.65, so every tornado was *born* at strengthFrac 0.09 and had
+      // nothing to intensify toward — zeta does not grow once the cell is mature, so the whole
+      // population sat at 18-25 m/s and every single one was an EF0 (20 of 20 in a 2 h run, with
+      // no funnel ever descending far enough to touch down).
+      //
+      // The mapping now spans the *observed* range of tornadic mesocyclones. `rel` of 0.55 is the
+      // marginal case that barely tornadoes; 1.6 and above is a violent, well-stretched core.
+      // Between them the peak wind runs 18-95 m/s, which produces the strongly skewed EF
+      // distribution reality has: most spin-ups weak, a minority violent.
       const seedMS = 8.0;
       const scaleRef = Math.max(0.004, parent ? parent.ambientVorticityS * 1.9 : 0.012);
-      const relative = zeta / scaleRef; // ~0.55 at genesis, ~2.5 for a violent storm
-      const strengthFrac = clamp((relative - 0.5) / 1.7, 0.0, 1.0);
+      const relative = zeta / scaleRef; // ~0.65 at genesis, ~1.7+ for a violent storm
+      // Low-level stretching available to the vortex itself.
+      //
+      // The mesocyclone's diagnosed vorticity is capped by the cell model (~0.025 s⁻¹ on even a
+      // violent sounding), and it does not grow once the storm is mature — so a target derived
+      // from it alone pinned every tornado at the gate it was born above, and all 20 in a 2 h run
+      // came out EF0. That is not how tornadoes intensify: once the RFD has laid down a
+      // near-ground baroclinic boundary, the tornado's own low-level updraft *stretches* the
+      // vorticity sheet it sits on, and that self-amplification is what carries a marginal
+      // spin-up into a violent one. The parent supplies the seed; the vortex supplies the growth.
+      //
+      // `stretch` is the parent's vertical stretching rate (updraft over cloud depth). It is
+      // mapped so an average supercell contributes a modest surplus and an exceptionally
+      // well-stretched one a large one, and it is capped so this can never outrun the physics.
+      // Stretching rates are near-identical across cells (all mature supercells in this model sit
+      // around 4.6e-3 s⁻¹), so `stretch` alone cannot discriminate one storm from another. What
+      // does vary is the *vigour* of the updraft feeding the vortex: measured over a 2 h run the
+      // parent updrafts span 29-46 m/s, a 1.6x range, and a tornado under a 46 m/s updraft is a
+      // fundamentally different object from one under a 29 m/s updraft. That range is mapped onto
+      // a 0.72-1.35 multiplier, which is what turns a single EF1 population into the strongly
+      // skewed distribution reality has.
+      // The discriminator, and the reason a distribution is possible at all.
+      //
+      // Every tornadic mesocyclone in this model converges on the same diagnosed ceiling
+      // (0.0320 s⁻¹), so `relative` carries almost no variance between storms — which is why two
+      // earlier attempts produced 20 EF0s and then 18 EF2s: a single narrow driver multiplied into
+      // a saturating curve can only ever produce a spike, not a spread. What genuinely varies from
+      // storm to storm is how *concentrated* the rotation is: a broad 5 km mesocyclone and a tight
+      // 2 km one both read the same vorticity, but only the tight one can spin a surface vortex
+      // up to damaging speed. `radiusM` spans 2.2-5.4 km between cells, and concentration goes as
+      // the inverse square of that, so it supplies the missing variance on physically sound
+      // grounds rather than by injecting randomness.
+      const parentRadiusM = parent ? parent.radiusM : 3400;
+      const concentration = clamp(Math.pow(4400 / Math.max(1200, parentRadiusM), 1.5), 0.62, 1.95);
+      const updraftVigour = clamp((parent ? parent.updraftMaxMS : 34) / 36.0, 0.82, 1.20);
+      const lowLevelStretch = clamp(stretch / 0.0046, 0.6, 2.3);
+      const selfStretch = clamp((lowLevelStretch - 0.85) * 0.45, 0.0, 0.35);
+      const effectiveRel = relative * (1.0 + selfStretch) * updraftVigour * concentration;
+      const strengthFrac = clamp((effectiveRel - 0.55) / 1.15, 0.0, 1.0);
       const stretchFactor = clamp(stretch * 340.0, 0.35, 1.3);
+      // A mature vortex keeps tensioning its own column, so a tornado that has already reached
+      // significant wind is allowed to keep going even if the parent's diagnosed vorticity eases
+      // slightly. This is a *bounded* multiplier on the environmental target, not a compounding
+      // one: computing it from the current wind and feeding it straight back into a 95 s
+      // relaxation would let a core ratchet upward without limit.
+      const coreBoost = 1.0 + 0.28 * clamp(t.maxTangentialMS / 55.0, 0.0, 1.0);
       const targetV = maintainable
         ? clamp(
-            (12.0 + 63.0 * Math.pow(strengthFrac, 1.35)) * stretchFactor,
+            (11.0 + 84.0 * Math.pow(strengthFrac, 1.25)) * stretchFactor * coreBoost,
             seedMS,
-            78.0
+            96.0
           )
         : 0.0;
 
-      // Intensify fast (minutes), decay slower (tens of minutes): matches the observed asymmetry
-      // between rapid tornadogenesis and gradual occlusion.
-      const tau = targetV > t.maxTangentialMS ? 95.0 : 420.0;
+      // Intensify fast, decay slower — the observed asymmetry between rapid tornadogenesis and
+      // gradual occlusion. The intensification constant was 95 s of *simulated* time, and with a
+      // fresh vortex needing ~3 e-foldings to approach its target that put the mature stage more
+      // than four minutes after genesis; observed tornadoes reach peak intensity 1-3 minutes after
+      // touchdown. 45 s brings the modelled life cycle into that window while still being gradual
+      // enough to watch, and the decay constant stays long so the funnel does not snap away.
+      const tau = targetV > t.maxTangentialMS ? 45.0 : 420.0;
       t.maxTangentialMS += (targetV - t.maxTangentialMS) * (1.0 - Math.exp(-dt / tau));
       if (t.maxTangentialMS < 0.4) t.maxTangentialMS = 0;
 
@@ -170,9 +247,20 @@ export class TornadoEngine {
 
       t.efScale = TornadoEngine.efScaleFor(t.maxTangentialMS);
 
-      // Funnel descends as the vortex strengthens, and retracts as it weakens.
-      const targetDrop = clamp((t.maxTangentialMS - 12.0) / 52.0, 0.0, 1.0);
-      t.funnelDrop += (targetDrop - t.funnelDrop) * (1.0 - Math.exp(-dt / 120.0));
+      // Funnel descent. The condensation funnel touches down at a lower wind speed than the
+      // damage-causing circulation: a 20 m/s vortex already draws its cloud base most of the way
+      // down if the boundary layer is moist enough, while a strong one plants it on the ground.
+      // The previous curve needed 52 m/s for a full touch-down, and since the whole population
+      // lived between 20 and 43 m/s the funnel never got past 59 % — so the debris layer (which
+      // requires >72 %) was *never visible for any tornado in any scenario*. Mapping 16-42 m/s
+      // onto 0-100 % puts the entire modelled range to use and keeps it monotonic in wind.
+      const targetDrop = clamp((t.maxTangentialMS - 16.0) / 26.0, 0.0, 1.0);
+      // The funnel descends faster than it retracts: condensation reaches down as the pressure
+      // falls, but lifts gradually once the vortex weakens. A symmetric 120 s constant meant a
+      // fully-mature 59 m/s tornado was still showing only half a funnel several minutes after
+      // genesis, because the drop target kept rising while the response lagged behind it.
+      const dropTau = targetDrop > t.funnelDrop ? 38.0 : 150.0;
+      t.funnelDrop += (targetDrop - t.funnelDrop) * (1.0 - Math.exp(-dt / dropTau));
 
       // Track the parent's cloud base so the funnel visually connects to the wall cloud rather
       // than hanging in mid-air when the base lifts or lowers.
@@ -238,6 +326,7 @@ export class TornadoEngine {
       vz: cell.vz,
       funnelDrop: 0,
       cloudBaseM: cell.cloudBaseM,
+      peakParentVorticityS: Math.abs(cell.mesocycloneVorticity),
     };
   }
 
