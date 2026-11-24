@@ -995,6 +995,18 @@ export class AtmosphericSounding {
   public qSatGKgAt(z: number): number {
     return this.interp(this.qSatGKg, z);
   }
+  /**
+   * Condensate (g/kg) the CAPE parcel carries at altitude z.
+   *
+   * This is the physical ceiling on how much cloud a rising column can hold at a given height:
+   * it is the vapour the parcel started with minus what it can still hold once cooled to
+   * saturation at that level. It rises through the lower troposphere and peaks somewhere around
+   * the freezing level, which is also where observed storm cores are wettest.
+   */
+  public parcelCondAt(z: number): number {
+    return this.interp(this.parcelCondArr, z);
+  }
+
   /** Environmental virtual potential temperature at altitude z, K. */
   public thetaVEnvAt(z: number): number {
     return this.interp(this.thetaVArr, z);
