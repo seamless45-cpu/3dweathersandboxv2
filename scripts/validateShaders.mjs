@@ -19,10 +19,16 @@ import { fileURLToPath } from 'node:url';
 // Optional: `npm i --no-save @shaderfrog/glsl-parser` enables real GLSL parsing. Without it
 // this script still performs the uniform cross-check, which needs no dependencies.
 let parser = null;
+let parserMissing = false;
 try {
   parser = (await import('@shaderfrog/glsl-parser')).parser;
 } catch {
-  console.warn('note: @shaderfrog/glsl-parser not installed — skipping GLSL parse checks.\n');
+  parserMissing = true;
+  console.error(
+    '✗ @shaderfrog/glsl-parser is not installed.\n' +
+      '    GLSL syntax checking cannot run, so this script would report success without\n' +
+      '    checking anything. Install it with:  npm i --no-save @shaderfrog/glsl-parser\n'
+  );
 }
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -204,4 +210,11 @@ for (const [name, prog] of glsl) {
 }
 
 console.log(`\n${glsl.size} GLSL programs found, ${materials.length} ShaderMaterials, ${parsed} parses OK, ${failures} failure(s).`);
+// A run that parsed nothing is a *failed* run, not a clean one. This line used to print
+// "0 parses OK" and exit 0 whenever the parser was absent, which is exactly the shape of a
+// check that has never once verified a shader.
+if (parserMissing || parsed === 0) {
+  console.error('✗ no GLSL program was actually parsed — treat this as a failure');
+  process.exit(1);
+}
 process.exit(failures > 0 ? 1 : 0);

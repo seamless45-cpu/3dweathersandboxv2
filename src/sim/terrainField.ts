@@ -85,7 +85,55 @@ export function getTerrainHeight(x: number, z: number): number {
 /**
  * Surface thermal heterogeneity [-1..+1]: dry sunlit patches warm faster under insolation,
  * seeding realistic boundary-layer convective thermals rather than arbitrary random spawns.
+ *
+ * This is the *geographic* component -- fixed soil, vegetation and albedo contrast. On its own it
+ * made convection appear in the same places in every run, because it is the only thing the
+ * nucleation search looked at and it never changes: the same fbm hotspots every session, forever.
+ * That is exactly the "fixed patterns and fixed locations" behaviour, and it is not physical.
+ *
+ * Real surface heating is transient. Soil moisture left by earlier storms, cloud shadow drifting
+ * across the boundary layer, and gustiness from the previous generation's outflow all move the
+ * active hotspots on a timescale of tens of minutes. `getTransientThermalPotential` adds that
+ * evolution; this function remains the static substrate it is modulated around.
  */
 export function getSurfaceThermalPotential(x: number, z: number): number {
   return fbm2D(x * 0.00045 + 11.3, z * 0.00045 - 7.9, 3);
+}
+
+/**
+ * Time-evolving surface thermal potential, in [-1..+1].
+ *
+ * The static field is advected with the boundary-layer flow and superimposed with a slower,
+ * independently drifting field, so the pattern of favourable surface heating migrates the way a
+ * real boundary layer does instead of being pinned to the terrain. The result is still a smooth
+ * field of position and is fully deterministic for a given time, so a fixed seed remains
+ * reproducible.
+ *
+ * `driftX`/`driftZ` should be the boundary-layer wind displacement in metres; `phase` is any
+ * monotonically increasing time in seconds.
+ */
+export function getTransientThermalPotential(
+  x: number,
+  z: number,
+  driftX: number,
+  driftZ: number,
+  phase: number
+): number {
+  // Advected static field: the soil-moisture pattern moves with the wind.
+  const ax = x - driftX;
+  const az = z - driftZ;
+  const advected = getSurfaceThermalPotential(ax, az);
+
+  // A second, slower field that drifts on its own. Its wavelength is much longer, so it modulates
+  // *regions* of the domain (one valley warm, the next cool) rather than individual cells.
+  const slowX = (x * 0.00016 + phase * 0.0000068);
+  const slowZ = (z * 0.00016 - phase * 0.0000041);
+  const regional = fbm2D(slowX + 3.7, slowZ - 1.2, 2);
+
+  // Gustiness: fine-scale, fast-moving ripples from the previous generation's outflow settling
+  // out. Small amplitude, but it is what stops every nucleation from picking a round number of
+  // kilometres.
+  const gust = fbm2D(x * 0.0011 - phase * 0.0009, z * 0.0011 + phase * 0.0007, 2) * 0.18;
+
+  return Math.max(-1, Math.min(1, advected * 0.68 + regional * 0.34 + gust));
 }

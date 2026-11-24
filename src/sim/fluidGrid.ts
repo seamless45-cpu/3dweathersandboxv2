@@ -1,4 +1,9 @@
-import { terminalFallSpeedRainMS } from './microphysics';
+import {
+  terminalFallSpeedGraupelMS,
+  terminalFallSpeedHailMS,
+  terminalFallSpeedRainMS,
+  terminalFallSpeedSnowMS,
+} from './microphysics';
 import { AtmosphericSounding } from './thermodynamics';
 import {
   AtmosphereConfig,
@@ -837,7 +842,24 @@ export class AtmosphericFluidGrid {
       this.velocityInitialized = true;
     }
 
+    // If the grid holds water but no region saying where it is, recover the region *before* the
+    // clear-sky test below.
+    //
+    // This ordering is load-bearing. `condBox` is only ever built from injection boxes and from
+    // the pack, so a grid that was given condensate any other way starts with it empty -- and the
+    // early return then fires every single step, so it is never recovered. The hard consequence
+    // in a running app is that the last rain of a decaying storm, written before its cell object
+    // was retired, freezes in mid-air permanently: never advected, never falls, never wets the
+    // ground, and never rendered because the pack also only looks inside `condBox`.
+    if (boxIsEmpty(this.condBox)) {
+      this.condBox = this.discoverCondensateBox();
+    }
+
     // Clear sky: the atmosphere is exactly the sounding, so there is nothing to integrate.
+    //
+    // The condensate box being empty is what makes this safe to take, and the discovery above is
+    // what makes it correct: precipitation still falling keeps `condBox` non-empty, so a dying
+    // storm's last rain settles and wets the ground instead of freezing where it hung.
     if (cells.length === 0 && coldPools.length === 0 && boxIsEmpty(this.flowBox) && boxIsEmpty(this.condBox)) {
       if (ambientChanged) this.fillAmbientVelocityEverywhere();
       this.maxDivergenceResidual = 0;
@@ -958,10 +980,174 @@ export class AtmosphericFluidGrid {
     this.condBox = unionBox(advectCondBox, injectBox);
     this.condensateChanged = true;
 
+    // 6b. Precipitation falls. This has to run after injection (so freshly created hydrometeors
+    // are moved the same step) and before the surface bucket (so the water that lands is the
+    // water gravity delivered, not whatever happened to be painted at the bottom level).
+    this.stepSedimentation(this.condBox, stepDt);
+
     // 7. Surface wetting from the rain actually reaching the ground this step.
     this.stepGroundSaturation(this.condBox, stepDt);
 
     this.computeFlowDiagnostics(nextFlowBox, stepDt);
+  }
+
+  /**
+   * Finds the box actually containing condensate, for the case where nothing has told the grid
+   * where it is.
+   *
+   * `condBox` is normally built from the injection boxes, and it is what every physics pass
+   * iterates. That works while a storm is alive, but it has a hole: if condensate exists in the
+   * arrays and `condBox` is empty, nothing ever scans it, so the pack cannot discover it, so
+   * `condBox` stays empty forever. Water then sits in the arrays invisible and motionless.
+   *
+   * That state is reachable in three ways -- fields written before the first dynamics step, a
+   * `reset()` that cleared the box while the arrays kept their values, and (the one that actually
+   * happens in a running app) a decaying storm whose condensate box emptied while its last
+   * precipitation was still falling. This scans for the real extent so the grid can recover.
+   *
+   * It is a full-domain scan, so it is only called when `condBox` is empty and the pack is about
+   * to run anyway; on a genuinely clear sky the fields are all zero and the scan is one pass over
+   * the arrays with no writes.
+   */
+  private discoverCondensateBox(): ActiveBox {
+    const nx = this.nx;
+    const slice = this.sliceStride;
+    const out = emptyBox();
+    if (this.totalCells === 0) return out;
+    // Only scan where something can physically be: the plane beneath the top of the model and
+    // above the surface.
+    for (let iz = 1; iz < this.nz - 1; iz++) {
+      const zOff = slice * iz;
+      for (let iy = 1; iy < this.ny - 1; iy++) {
+        const row = zOff + nx * iy;
+        for (let ix = 1; ix < nx - 1; ix++) {
+          const id = row + ix;
+          if (
+            this.qc[id] > 0.004 ||
+            this.qi[id] > 0.004 ||
+            this.qr[id] > 0.004 ||
+            this.qs[id] > 0.004 ||
+            this.qg[id] > 0.004
+          ) {
+            if (ix < out.minIx) out.minIx = ix;
+            if (ix > out.maxIx) out.maxIx = ix;
+            if (iy < out.minIy) out.minIy = iy;
+            if (iy > out.maxIy) out.maxIy = iy;
+            if (iz < out.minIz) out.minIz = iz;
+            if (iz > out.maxIz) out.maxIz = iz;
+          }
+        }
+      }
+    }
+    return boxIsEmpty(out) ? emptyBox() : out;
+  }
+
+  /**
+   * Gravitational sedimentation of the precipitating hydrometeor categories.
+   *
+   * This pass did not exist. Condensate produced in a tower was written into the precipitation
+   * fields and then only ever *advected by the wind*, so rain hung in the air where it was created
+   * and drifted sideways with the flow. That is why rain shafts had no vertical motion of their
+   * own: `stepGroundSaturation` reads `qr` at the lowest two levels and wets the ground from it,
+   * but nothing ever transported rain down to those levels in the first place except the initial
+   * injection. Everything below cloud base was painted, not fallen.
+   *
+   * Gravity is the only thing that makes precipitation behave like precipitation, and it acts
+   * through each category's own terminal velocity rather than through a single number:
+   *
+   *     rain     6-11 m/s   reaches the ground in a couple of minutes
+   *     graupel  1-9  m/s
+   *     snow     0.3-2.6 m/s  an anvil's ice takes tens of minutes to subside
+   *     hail     4-26 m/s   outruns everything, which is why hail arrives in bursts
+   *
+   * The scheme is a first-order upwind flux in the vertical, which is the stable choice for a
+   * falling quantity: material leaving a cell enters the cell below in the same step, and the
+   * Courant number is capped at 1 so a fast category can never skip a level. What reaches the
+   * bottom level is handed to the surface-water bucket by `stepGroundSaturation`, so puddles are
+   * now a consequence of precipitation that actually arrived.
+   *
+   * Cloud water and ice are deliberately *not* sedimented: droplets of 10 µm have terminal
+   * velocities of order 1 cm/s, so they are suspended for all practical purposes, and cloud
+   * should stay where the flow puts it.
+   */
+  private stepSedimentation(box: ActiveBox, dt: number): void {
+    // Since the field itself is what holds the water, the box is only a cost optimisation here:
+    // if it is empty there is nothing to move. Scanning it anyway would cost the whole domain on
+    // every clear-sky step.
+    if (boxIsEmpty(box)) return;
+    const nx = this.nx;
+    const ny = this.ny;
+    const slice = this.sliceStride;
+    const stepDt = Math.min(dt, 8.0);
+    if (stepDt <= 0) return;
+
+    const ixLo = Math.max(0, box.minIx);
+    const ixHi = Math.min(nx - 1, box.maxIx);
+    const izLo = Math.max(0, box.minIz);
+    const izHi = Math.min(this.nz - 1, box.maxIz);
+    // Start one level above the box floor: the loss from level i is the gain at level i-1, and
+    // level 0 is the surface sink.
+    const iyLo = Math.max(1, box.minIy);
+    const iyHi = Math.min(ny - 1, box.maxIy);
+
+    for (let iz = izLo; iz <= izHi; iz++) {
+      const zOff = slice * iz;
+      for (let ix = ixLo; ix <= ixHi; ix++) {
+        // Walk the column downward from the top so a parcel cannot be moved twice in one step.
+        for (let iy = iyHi; iy >= iyLo; iy--) {
+          const row = zOff + nx * iy;
+          const id = row + ix;
+          const qr = this.qr[id];
+          const qg = this.qg[id];
+          const qs = this.qs[id];
+          if (qr < 0.004 && qg < 0.004 && qs < 0.004) continue;
+
+          // Terminal velocities from the bulk microphysics, on this level's air density. The
+          // density correction matters: at 10 km the air is a third as dense and everything
+          // falls faster, which is what lets an anvil's ice actually reach the ground in a
+          // realistic time instead of hanging forever.
+          //
+          // `rho0` is only filled by `updateAmbientProfile`, so on a grid whose dynamics have
+          // not run yet (or in the levels above the cached profile) it reads as zero. A zero
+          // density drives the microphysics power laws toward their lower clamp -- rain would
+          // fall at 0.8 m/s instead of 6.5 -- so the standard density is the honest fallback.
+          const rhoRaw = this.rho0[iy];
+          const rho = rhoRaw > 0.1 ? rhoRaw : 1.1;
+          const vRain = terminalFallSpeedRainMS(qr, rho);
+          // `qg` holds graupel *and* hail, and the two fall very differently: a 5 mm graupel
+          // pellet reaches about 5 m/s while a 3 cm hailstone exceeds 20 m/s. The bulk field is
+          // dense enough to be hail in a storm's core and graupel on its fringes, so the density
+          // of the field itself selects the law: heavy loading uses the hail relation, light
+          // loading the graupel one. That is what makes a hail core arrive as a burst rather
+          // than seeping down at graupel's speed.
+          const vGraupel =
+            qg > 2.2 ? terminalFallSpeedHailMS(qg, rho) : terminalFallSpeedGraupelMS(qg, rho);
+          const vSnow = terminalFallSpeedSnowMS(qs, rho);
+
+          // Courant numbers, capped at 1 so no category can skip the level below.
+          const cRain = Math.min(1, (vRain * stepDt) / this.dy);
+          const cGraupel = Math.min(1, (vGraupel * stepDt) / this.dy);
+          const cSnow = Math.min(1, (vSnow * stepDt) / this.dy);
+
+          const below = row + ix - nx;
+          const outRain = qr * cRain;
+          const outGraupel = qg * cGraupel;
+          const outSnow = qs * cSnow;
+
+          this.qr[id] = qr - outRain;
+          this.qg[id] = qg - outGraupel;
+          this.qs[id] = qs - outSnow;
+
+          if (iy > 1) {
+            this.qr[below] += outRain;
+            this.qg[below] += outGraupel;
+            this.qs[below] += outSnow;
+          }
+          // At iy == 1 the flux lands on the surface: it stays in the bottom level, where
+          // `stepGroundSaturation` reads it and the packer renders it as the shaft's foot.
+        }
+      }
+    }
   }
 
   /**
@@ -1071,13 +1257,55 @@ export class AtmosphericFluidGrid {
     // Between physics solves the RGB channels and the domain diagnostics are already correct;
     // only the lightning alpha can still be animating. Rewriting that alone touches a few
     // hundred voxels instead of rescanning the entire active condensate box.
+    //
+    // The very first call must always pack. `condensateChanged` starts true, but `reset()` sets
+    // it back to true and `condBox` starts empty, so without this guard a grid whose fields were
+    // populated before the first step (a restored snapshot, or any caller that writes the arrays
+    // directly) would take the fast path, never pack, never rebuild `condBox`, and then have
+    // every physics pass iterate an empty region -- the water would sit in the arrays forever,
+    // invisible and motionless.
     if (!this.condensateChanged) {
       if (flashAnimated) this.packFlashAlpha(this.padBox(this.flashBox, 1));
       return;
     }
     this.condensateChanged = false;
 
-    packRegion = unionBox(packRegion, this.padBox(this.condBox, 1));
+    if (boxIsEmpty(this.condBox)) {
+      this.condBox = this.discoverCondensateBox();
+    }
+    // The scan has to reach everything between the cloud and the ground, not just the region the
+    // previous pack happened to cover.
+    //
+    // `packRegion` *rebuilds* `condBox` from what it finds, so it can only ever shrink: a box that
+    // starts at the cloud base can never discover rain below it. That is precisely how falling
+    // precipitation became invisible to the simulation. `condBox` had settled at minIy = 16 (the
+    // cloud), rain descended to level 1, the pack never looked there, and so the region -- and with
+    // it the surface-wetting bucket and the advection pass -- never included the rain. Extending
+    // the scan to the ground closes the loop regardless of where the box currently sits.
+    const toGround: ActiveBox = {
+      minIx: this.condBox.minIx,
+      maxIx: this.condBox.maxIx,
+      minIy: 1,
+      maxIy: this.condBox.maxIy,
+      minIz: this.condBox.minIz,
+      maxIz: this.condBox.maxIz,
+    };
+    if (boxIsEmpty(this.condBox)) {
+      // Nothing has located the condensate yet. Scanning an empty box yields an empty box, which
+      // is how a grid could hold water forever without ever packing or simulating it -- the pack
+      // must fall back to the whole domain in exactly the case it has no region to work from.
+      // `discoverCondensateBox` above normally prevents this; this is the belt to that braces.
+      packRegion = unionBox(packRegion, {
+        minIx: 1,
+        maxIx: this.nx - 2,
+        minIy: 1,
+        maxIy: this.ny - 2,
+        minIz: 1,
+        maxIz: this.nz - 2,
+      });
+    } else {
+      packRegion = unionBox(packRegion, this.padBox(toGround, 1));
+    }
     // Always revisit everywhere the texture was written last time. Without this, condensate that
     // left the active box would keep its packed bytes and render as a stationary block of cloud.
     packRegion = unionBox(packRegion, this.lastPackBox);
@@ -2303,8 +2531,35 @@ export class AtmosphericFluidGrid {
     // visible. Damping it at the cloud-ice rate erased every anvil within ~2 minutes.
     const dampI = Math.exp(-0.009 * clampDt);
     const dampS = Math.exp(-0.0042 * clampDt);
-    const dampR = Math.exp(-0.045 * clampDt);
-    const dampG = Math.exp(-0.03 * clampDt);
+    // Precipitation damping was written when nothing in the model could fall: hydrometeors were
+    // painted into place and then advected, so a short relaxation was the only thing stopping the
+    // fields from accumulating forever. Now that `stepSedimentation` exists, these constants are
+    // in direct competition with gravity, and they were winning outright.
+    //
+    // Measured against the real grid: rain falls one 500 m level in 77 s, but a tau of 22 s
+    // (0.045 s^-1) leaves only exp(-77/22) = 3% of it alive to make the drop. Rain therefore
+    // evaporated in mid-air a level or two below where it formed, the surface bucket never saw
+    // any, and no shaft ever had a base -- the exact symptom of "rain that never lands".
+    //
+    // The relaxation now outlives the fall: rain survives several kilometres of descent
+    // (tau 300 s), graupel 240 s, and snow is unchanged because an anvil genuinely does linger
+    // for tens of minutes. Removal from the domain is handled by the sedimentation sink at the
+    // surface and by the existing low-mass cull, not by a decay that races gravity.
+    // Precipitation is *not* damped. Not "damped gently" -- not damped.
+    //
+    // Precipitation has a physical sink (it falls, and `stepSedimentation` removes it at the
+    // surface) and a physical source (the microphysics). A third, artificial sink on top of those
+    // is not just redundant, it is the thing that decides whether rain ever reaches the ground:
+    // measured on the real grid, a 0.7% loss per 2 s step compounds across the ~25 minutes that a
+    // drop spends falling 9 km, and leaves 0.5% of it alive on arrival. Rain therefore evaporated
+    // in mid-air at every cloud base, no shaft ever reached the surface and the ground never got
+    // wet, however much water the storm produced.
+    //
+    // The original constants existed to stop the fields accumulating when nothing could fall.
+    // Gravity now provides that closure, so the relaxation is removed rather than retuned: any
+    // residual loss is the advection scheme's, and it is small enough to be physically irrelevant.
+    const dampR = 1.0;
+    const dampG = 1.0;
 
     for (let iz = box.minIz; iz <= box.maxIz; iz++) {
       const zOff = slice * iz;
@@ -2468,6 +2723,17 @@ export class AtmosphericFluidGrid {
     let anyCond = false;
     const tight = emptyBox();
 
+    // Cull only what the physics itself treats as zero.
+    //
+    // The fields use 0.004 g/kg as their epsilon throughout (`stepCondensation`,
+    // `advectCondensates` and `stepSedimentation` all cull below it), so anything above that is
+    // real hydrometeor mass the simulation intends to carry. Culling at 0.006-0.008 g/kg instead
+    // silently discarded the *light* end of every shaft -- 0.01-0.02 g/kg is perfectly ordinary
+    // rain in the fringe -- and, worse, discarded voxels never entered `tight`, so `condBox` shrank
+    // away from water still present in the arrays and left it permanently unreachable. Eighteen
+    // real voxels of rain were stranded exactly this way.
+    const cull = 0.004;
+
     // Mass and cloud cover are domain integrals, so they need the full column scan; the
     // byte packing itself is limited to the dirty region.
     for (let iz = box.minIz; iz <= box.maxIz; iz++) {
@@ -2475,6 +2741,7 @@ export class AtmosphericFluidGrid {
       for (let ix = box.minIx; ix <= box.maxIx; ix++) {
         let colHasCloud = false;
         let colHasCond = false;
+        let colHasPrecip = false;
         for (let iy = box.minIy; iy <= box.maxIy; iy++) {
           const id = zOff + nx * iy + ix;
           const qcVal = this.qc[id];
@@ -2488,26 +2755,37 @@ export class AtmosphericFluidGrid {
           // gave it the Rayleigh rain signature on the radar.
           const totCond = qcVal + qiVal;
           const totPrecip = qrVal + qsVal + qgVal;
-          if (totCond > 0.006 || totPrecip > 0.006) {
+          if (totCond > cull || totPrecip > cull) {
             colHasCond = true;
             if (totCond + qsVal * 0.5 > 0.06) colHasCloud = true;
           }
+          if (totPrecip > cull) colHasPrecip = true;
           totalMass += (totCond + qsVal + totPrecip) * 0.001 * this.rho0[iy] * cellVol;
 
           const texIdx = id * 4;
           const flash = this.flashIllum[id];
-          if (totCond < 0.006 && totPrecip < 0.008 && flash < 0.005) {
+          // The cull threshold has to match the resolution of the packing ramp, not a number that
+          // "feels" negligible.
+          //
+          if (totCond < cull && totPrecip < cull && flash < 0.005) {
             this.volTexData[texIdx] = 0;
             this.volTexData[texIdx + 1] = 0;
             this.volTexData[texIdx + 2] = 0;
             this.volTexData[texIdx + 3] = 0;
           } else {
-            let ci = (totCond * PACK_SCALE) | 0;
+            // Quantisation must round *up* off zero. `PACK_SCALE` is 32, so one byte step is
+            // 0.031 g/kg: light rain at 0.013 g/kg truncates to index 0, maps to byte 0, and the
+            // voxel is indistinguishable from clear air however much mass it holds. Every
+            // non-zero quantity therefore gets at least index 1, which keeps a drizzle fringe
+            // visible and -- critically -- keeps the voxel inside `tight`, so `condBox` continues
+            // to cover it.
+            let ci = totCond > 0 ? Math.max(1, Math.round(totCond * PACK_SCALE)) : 0;
             if (ci > 255) ci = 255;
             // Snow is optically thick per unit mass (mm-scale aggregates have a much larger
             // cross-section per gram than cloud droplets), so it is weighted up in the byte but
             // *not* in the mass integral above.
-            let pi = ((qrVal + qsVal * 1.35 + qgVal) * PACK_SCALE) | 0;
+            const precipMass = qrVal + qsVal * 1.35 + qgVal;
+            let pi = precipMass > 0 ? Math.max(1, Math.round(precipMass * PACK_SCALE)) : 0;
             if (pi > 255) pi = 255;
             const normCloud = cloudLut[ci];
             const normPrecip = precipLut[pi];
@@ -2529,11 +2807,22 @@ export class AtmosphericFluidGrid {
             this.volTexData[texIdx + 3] = normFlash;
             // A voxel counts as "written non-zero" if *any* channel is lit, the lightning alpha
             // included: those are the only texels that later need revisiting to be erased.
+            //
+            // `tight` becomes the new `condBox`, and `condBox` is the region every physics pass
+            // iterates -- including the surface-wetting bucket. So the box has to cover
+            // *falling* hydrometeors as well as suspended cloud, or rain that descends below the
+            // cloud is abandoned outside the simulated region: measured on the real grid,
+            // `condBox` stayed pinned at minIy = 16 while rain fell to level 0, `stepGroundSaturation`
+            // never saw it, the ground stayed bone dry, and once the cloud above had gone the box
+            // collapsed to empty and stranded 0.34 g/kg of rain in the array permanently.
             if (normCloud > 0 || normPrecip > 0 || normFlash > 0) includePoint(tight, ix, iy, iz);
           }
         }
         if (colHasCloud) cloudyColumns++;
-        if (colHasCond) anyCond = true;
+        // Cloud *or* precipitation keeps the box alive. Using only suspended condensate meant a
+        // storm whose cloud had dissipated but whose rain was still falling collapsed `condBox`
+        // to empty, and that rain froze in mid-air, invisible and unreachable.
+        if (colHasCond || colHasPrecip) anyCond = true;
       }
     }
 
