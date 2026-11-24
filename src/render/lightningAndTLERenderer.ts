@@ -10,9 +10,21 @@ const BOLT_VERT = /* glsl */ `
   attribute vec2 aCorner; // x in [-1, 1] across width, y in [0, 1] along segment
   attribute float aRadius;
   attribute float aBrightness;
+  // 0 = main trunk, 1..4 = side branches. Branches are drawn thinner and dimmer, and they are
+  // revealed *after* the trunk has passed them, which is how a stepped leader actually looks.
+  attribute float aGeneration;
+  // Normalised leader arrival time for this segment, 0..1.
+  attribute float aProgressOrder;
+
+  uniform float uLeaderProgress;
+  uniform float uIsLeader;
+  uniform float uSpread;
 
   varying float vAcross;
   varying float vBrightness;
+  varying float vGeneration;
+  // Distance along the exposed length, used to fade the propagating leader tip.
+  varying float vReveal;
 
   void main() {
     vec3 worldPt = mix(aStart, aEnd, aCorner.y);
@@ -22,13 +34,42 @@ const BOLT_VERT = /* glsl */ `
     vec3 tangent = segLen > 0.001 ? segDir / segLen : vec3(0.0, 1.0, 0.0);
 
     vec3 side = normalize(cross(viewDir, tangent));
-    // Maintain minimum sub-pixel angular thickness at long distances so distant CG/IC bolts remain crisp!
     float dist = length(cameraPosition - worldPt);
-    float worldHalfWidth = max(aRadius, dist * 0.0018 * clamp(aRadius / 28.0, 0.22, 1.2));
 
-    vec3 finalWorld = worldPt + side * (aCorner.x * worldHalfWidth);
+    // ---- Leader propagation ---------------------------------------------------------------
+    // A stepped leader does not appear all at once: it advances in discrete jumps from the
+    // initiation point. During the leader phase a segment only exists once the leader front has
+    // reached it. uSpread softens that edge so the tip glows rather than popping.
+    float reveal = 1.0;
+    if (uIsLeader > 0.5) {
+      // Branches lag the trunk slightly, so the trunk visibly leads and branches fork off it.
+      float lag = aGeneration * 0.12;
+      reveal = clamp((uLeaderProgress - aProgressOrder - lag) / max(0.001, uSpread), 0.0, 1.0);
+      if (reveal <= 0.001) {
+        // Collapse to a degenerate point instead of discarding: avoids a branch/pop and costs
+        // one vertex that rasterises nothing.
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        vAcross = 0.0;
+        vBrightness = 0.0;
+        vGeneration = 0.0;
+        vReveal = 0.0;
+        return;
+      }
+    }
+
+    // ---- Width ----------------------------------------------------------------------------
+    // Maintain a minimum *angular* thickness so distant bolts stay crisp instead of aliasing
+    // away, but scale it by generation so branches are visibly subordinate to the trunk.
+    float genScale = 1.0 / (1.0 + aGeneration * 0.55);
+    float worldHalfWidth = max(aRadius * genScale, dist * 0.0018 * clamp(aRadius / 28.0, 0.22, 1.2) * genScale);
+    // Taper toward the far end: a real channel thins as it decays and branches taper to points.
+    float taper = mix(1.0, 0.45, aCorner.y * (0.35 + 0.4 * aGeneration));
+
+    vec3 finalWorld = worldPt + side * (aCorner.x * worldHalfWidth * taper);
     vAcross = aCorner.x;
     vBrightness = aBrightness;
+    vGeneration = aGeneration;
+    vReveal = reveal;
 
     gl_Position = projectionMatrix * viewMatrix * vec4(finalWorld, 1.0);
   }
@@ -39,18 +80,36 @@ const BOLT_FRAG = /* glsl */ `
 
   varying float vAcross;
   varying float vBrightness;
+  varying float vGeneration;
+  varying float vReveal;
 
   void main() {
     if (vBrightness <= 0.002) discard;
     float r = abs(vAcross);
-    // Razor-sharp 28,000K white plasma core + soft natural atmospheric violet-white corona
-    float core = exp(-r * r * 18.0);
-    float corona = exp(-r * 3.2) * 0.52;
 
-    vec3 coreColor = vec3(1.0, 0.99, 1.0) * (core * 5.5);
-    vec3 coronaColor = vec3(0.76, 0.84, 1.0) * (corona * 2.2);
+    // ---- Channel structure ---------------------------------------------------------------
+    // A return stroke is not a glowing ribbon. It is a plasma channel of a few centimetres
+    // embedded in a much wider, far dimmer corona. Two very different radial scales are what
+    // give it the hard white thread with a soft bloom around it, instead of one soft gradient.
+    //
+    // Branches are cooler in appearance: they carry much less current, so their core is
+    // narrower relative to the corona and the whole thing is dimmer and more violet.
+    float coreSharp = mix(26.0, 44.0, vGeneration * 0.25);
+    float core = exp(-r * r * coreSharp);
+    float corona = exp(-r * 3.0) * (0.52 - vGeneration * 0.10);
+
+    // Near-white 28,000 K plasma at the axis, cooler violet-blue as it cools outward. A branch
+    // barely reaches incandescence and reads as violet, which matches long-exposure photographs.
+    vec3 coreColor = mix(vec3(1.0, 0.995, 1.0), vec3(0.86, 0.90, 1.0), vGeneration * 0.18) * (core * 6.2);
+    vec3 coronaColor = mix(vec3(0.72, 0.80, 1.0), vec3(0.58, 0.50, 0.98), vGeneration * 0.30) * (corona * 2.4);
 
     vec3 radiance = (coreColor + coronaColor) * vBrightness;
+
+    // The advancing leader tip is hotter than the channel behind it, because the tip is where
+    // the field is concentrated and new ionisation is happening.
+    float tipGlow = pow(1.0 - vReveal, 3.0) * 1.4;
+    radiance += vec3(0.85, 0.92, 1.0) * tipGlow * vBrightness;
+
     float alpha = clamp((core + corona) * min(1.0, vBrightness * 1.4), 0.0, 1.0);
     gl_FragColor = vec4(radiance, alpha);
   }
@@ -156,6 +215,8 @@ export class LightningAndTLERenderer {
   private aEnd: THREE.InstancedBufferAttribute;
   private aRadius: THREE.InstancedBufferAttribute;
   private aBrightness: THREE.InstancedBufferAttribute;
+  private aGeneration: THREE.InstancedBufferAttribute;
+  private aProgressOrder: THREE.InstancedBufferAttribute;
 
   private tleMeshes: THREE.Mesh[] = [];
   private tleMaterials: THREE.ShaderMaterial[] = [];
@@ -191,15 +252,25 @@ export class LightningAndTLERenderer {
     this.aRadius = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOLT_SEGMENTS), 1);
     this.aBrightness = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOLT_SEGMENTS), 1);
 
+    this.aGeneration = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOLT_SEGMENTS), 1);
+    this.aProgressOrder = new THREE.InstancedBufferAttribute(
+      new Float32Array(MAX_BOLT_SEGMENTS),
+      1
+    );
+
     this.aStart.setUsage(THREE.DynamicDrawUsage);
     this.aEnd.setUsage(THREE.DynamicDrawUsage);
     this.aRadius.setUsage(THREE.DynamicDrawUsage);
     this.aBrightness.setUsage(THREE.DynamicDrawUsage);
+    this.aGeneration.setUsage(THREE.DynamicDrawUsage);
+    this.aProgressOrder.setUsage(THREE.DynamicDrawUsage);
 
     this.boltGeom.setAttribute('aStart', this.aStart);
     this.boltGeom.setAttribute('aEnd', this.aEnd);
     this.boltGeom.setAttribute('aRadius', this.aRadius);
     this.boltGeom.setAttribute('aBrightness', this.aBrightness);
+    this.boltGeom.setAttribute('aGeneration', this.aGeneration);
+    this.boltGeom.setAttribute('aProgressOrder', this.aProgressOrder);
     this.boltGeom.instanceCount = 0;
 
     this.boltMat = new THREE.ShaderMaterial({
@@ -209,6 +280,14 @@ export class LightningAndTLERenderer {
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       depthTest: true,
+      uniforms: {
+        // Leader propagation state. 1.0 means "fully formed", which is what every phase after
+        // the stepped leader uses so the channel is drawn whole.
+        uLeaderProgress: { value: 1.0 },
+        uIsLeader: { value: 0.0 },
+        // Softness of the advancing leader front, as a fraction of the total path.
+        uSpread: { value: 0.18 },
+      },
     });
 
     this.boltMesh = new THREE.Mesh(this.boltGeom, this.boltMat);
@@ -264,6 +343,21 @@ export class LightningAndTLERenderer {
     const endArr = this.aEnd.array as Float32Array;
     const radArr = this.aRadius.array as Float32Array;
     const brightArr = this.aBrightness.array as Float32Array;
+    const genArr = this.aGeneration.array as Float32Array;
+    const orderArr = this.aProgressOrder.array as Float32Array;
+
+    // Leader propagation is driven by the *most advanced* channel in the scene. Every discharge
+    // that is still in its stepped-leader phase reveals progressively; once a discharge reaches
+    // its return stroke the channel is fully formed and this uniform is ignored.
+    const leadDischarge = discharges.find((d) => d.phase === 'leader' || d.phase === 'connecting');
+    const leaderUniforms = this.boltMat.uniforms;
+    if (leadDischarge) {
+      leaderUniforms.uLeaderProgress.value = leadDischarge.leaderProgress;
+      leaderUniforms.uIsLeader.value = 1.0;
+    } else {
+      leaderUniforms.uLeaderProgress.value = 1.0;
+      leaderUniforms.uIsLeader.value = 0.0;
+    }
 
     for (let dIdx = 0; dIdx < discharges.length; dIdx++) {
       const d = discharges[dIdx];
@@ -302,6 +396,12 @@ export class LightningAndTLERenderer {
 
         radArr[segCursor] = (isMain ? 26.0 : 12.0) * seg.radiusWeight;
         brightArr[segCursor] = lum;
+        // Generation drives the branch hierarchy in the shader: 0 is the trunk, higher numbers
+        // are thinner, dimmer and cooler. `progressOrder` lets the vertex shader reveal the
+        // channel in the order the leader actually propagated, which is what makes a stepped
+        // leader read as an advancing front rather than the whole bolt appearing at once.
+        genArr[segCursor] = seg.generation;
+        orderArr[segCursor] = seg.progressOrder;
         segCursor++;
       }
     }
@@ -312,6 +412,8 @@ export class LightningAndTLERenderer {
       this.aEnd.needsUpdate = true;
       this.aRadius.needsUpdate = true;
       this.aBrightness.needsUpdate = true;
+      this.aGeneration.needsUpdate = true;
+      this.aProgressOrder.needsUpdate = true;
     }
 
     // 3. Update Pooled Upper-Atmospheric TLE Meshes

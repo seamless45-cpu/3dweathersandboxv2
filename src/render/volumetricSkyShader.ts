@@ -306,19 +306,53 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
     // so every shaft moved identically regardless of what was falling out of it.
     float precipDensity = 0.0;
     if (basePrecip > 0.008) {
+      // ---- Structure of a rain shaft ------------------------------------------------------
+      //
+      // A shaft is not one soft grey cylinder. It is a bundle of falling streams at different
+      // densities, and the eye reads it as *vertical* striation because each stream falls at its
+      // own terminal velocity and they advect apart. The previous version used a single 3-D
+      // noise lattice whose vertical scale gave it a ~2.4 km period, so a whole shaft was one
+      // smooth blob: no streaks, no structure, just a translucent wall.
+      //
+      // Two separate scales are needed, and they do different jobs:
+      //
+      //   · a *fine* vertical-coherent term, stretched along Y so it forms continuous strands
+      //     rather than isolated puffs. This is the visible striation.
+      //   · a *coarse* horizontal term, which groups the strands into the denser core and the
+      //     ragged edges of the curtain.
+      //
+      // The vertical phase advances at the actual fall speed and the horizontal phase at the
+      // actual wind, so hail streaks visibly faster than drizzle and the whole curtain leans
+      // downshear instead of hanging vertically in still air.
       float fallPhase = uTime * (uPrecipFallSpeed * 0.00042 + 0.0004);
-      vec3 shaftCoord = vec3(
-        wp.x * 0.0022 - (uPrecipDrift.x + uWindOffset.x) * 0.00075,
-        wp.y * 0.00042 + fallPhase,
-        wp.z * 0.0022 - (uPrecipDrift.z + uWindOffset.z) * 0.00075
+      vec3 driftShift = vec3(
+        (uPrecipDrift.x + uWindOffset.x) * 0.00075,
+        0.0,
+        (uPrecipDrift.z + uWindOffset.z) * 0.00075
       );
-      float streak = noise3D(shaftCoord * 2.6);
-      // Sharpen into curtains rather than a uniform grey veil.
-      float curtain = 0.46 + 0.54 * (streak * streak * (3.0 - 2.0 * streak));
+
+      // Fine strands: compressed horizontally, stretched vertically, so each is a long thread.
+      vec3 strandCoord = vec3(
+        wp.x * 0.0065, wp.y * 0.0011 + fallPhase, wp.z * 0.0065
+      ) - driftShift * 2.2;
+      float strand = noise3D(strandCoord * 2.2);
+      // A second, incommensurate strand layer keeps the pattern from looking tiled.
+      float strand2 = noise3D(strandCoord * vec3(1.7, 2.3, 1.7) + vec3(11.3, 4.1, 7.7));
+
+      // Coarse grouping: which parts of the shaft are dense and which are wispy.
+      vec3 curtainCoord = vec3(wp.x * 0.0022, wp.y * 0.00042 + fallPhase, wp.z * 0.0022) - driftShift;
+      float curtainN = noise3D(curtainCoord * 2.6);
+
+      // Streaks multiply the curtain: a strand at the right density is twice as opaque as the
+      // mean, a gap between strands is nearly clear.
+      float streak = mix(strand, strand2, 0.42);
+      float striation = 0.55 + 0.9 * (streak * streak * (3.0 - 2.0 * streak));
+      float curtain = 0.40 + 0.60 * (curtainN * curtainN * (3.0 - 2.0 * curtainN));
+
       // Frozen shafts are less dense-looking per unit mass: snow scatters in every direction
       // and reads as a bright diffuse veil, whereas rain reads as a dark refractive curtain.
       float frozenGain = mix(1.0, 0.72, uFrozenShare);
-      precipDensity = basePrecip * curtain * 0.34 * frozenGain;
+      precipDensity = basePrecip * curtain * striation * 0.30 * frozenGain;
     }
 
     return vec4(cloudDensity, precipDensity, iceFrac, raw.a);
@@ -352,8 +386,9 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       vec3 uvw = worldToVolumeUVW(sp);
       if (uvw.y > 1.0 || uvw.x < 0.0 || uvw.x > 1.0 || uvw.z < 0.0 || uvw.z > 1.0) break;
       vec4 sv = texture(uVolTex, uvw);
-      // Coefficients track the RGBA8 packing references (1.4 g/kg cloud, 7.0 g/kg precip).
-      opticalDepth += (sv.r * 0.62 + sv.g * 0.5) * (stepLen * 0.0018);
+      // Must track the same packing references as the main extinction term below, or a cloud
+      // shadows itself differently from how it scatters.
+      opticalDepth += (sv.r * 0.0055 * 0.55 + sv.g * 0.00019 * 0.6) * stepLen;
     }
     opticalDepth *= cheap > 0.5 ? 2.0 : 1.0;
     // Dual-octave multiple scattering approximation (Schneider 2015) so deep clouds retain realistic internal glow
@@ -513,14 +548,21 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
       float iceFrac = vol.b;
       float localFlash = vol.a;
 
-      // Extinction coefficients are calibrated against the RGBA8 packing references
-      // (1.4 g/kg cloud, 7.0 g/kg precip). Cloud droplets are ~10 µm and scatter almost
-      // conservatively, so a saturated core is optically thick within a single 500 m voxel.
-      // Rain is two orders of magnitude coarser (0.5-5 mm): its cross-section per unit mass is
-      // far smaller and it absorbs as well as scatters, so a shaft stays a translucent dark
-      // curtain you can still see terrain through. Using one coefficient for both was what made
-      // heavy shafts render as solid grey walls.
-      float totalExtinction = cloudD * 0.0026 + precipD * 0.0016;
+      // Extinction coefficients, derived from droplet optics rather than tuned by eye.
+      //
+      // sigma_ext = 3·LWC / (2·rho_w·r_eff), with the byte→mass mapping set by the packing
+      // references (5.0 g/kg cloud, 8.5 g/kg precip, see fluidGrid's buildPackLut). At full
+      // byte that gives sigma = 0.75 m^-1 for 10 µm cloud droplets and 0.0255 m^-1 for 0.5 mm
+      // raindrops -- a ratio of ~29:1, which is the whole reason a core goes opaque inside a
+      // single voxel while a rain shaft stays a translucent curtain you can see through.
+      //
+      // These were previously 0.0026 and 0.0016 against packing references of 1.4/7.0. When
+      // the cloud reference was raised to 5.0 the byte written for a given mass of condensate
+      // roughly halved, but the coefficient was left alone, so optical depth silently dropped
+      // by ~2x across the whole volume. That is what made the lighting look wrong: clouds went
+      // translucent and their bases lost the darkness a storm needs. The coefficients are now
+      // pinned to the same references the packer uses, so the two cannot drift apart again.
+      float totalExtinction = cloudD * 0.0055 + precipD * 0.00019;
       if (totalExtinction > 0.00004) {
         // Step length follows the local density: thin wisps take longer strides, opaque
         // cores take shorter ones, so the same budget resolves far more of the cloud.
@@ -529,19 +571,49 @@ export const VOLUMETRIC_CLOUD_FRAG = /* glsl */ `
 
         float lightVis = marchLightVisibility(pos, lightDir, cheap);
         float phase = dualLobePhase(cosTheta, iceFrac);
-        // Powder effect highlights billowing cloud edges
-        float powder = 1.0 - 0.45 * exp(-cloudD * 5.5);
+        // ---- Powder effect ------------------------------------------------------------------
+        // Multiple scattering makes a dense cloud *brighter* toward the edges, because a thin
+        // edge lets light in without it being absorbed on the way out. The old form froze at
+        // 0.55 for every dense sample, which flattens exactly the region that carries most of
+        // the visible cloud -- the deep cores end up uniformly lit and read as plastic. Widening
+        // the range and keying it to how much light actually survives the shadow march gives
+        // cores a real falloff instead of a constant.
+        float powder = 1.0 - 0.62 * exp(-cloudD * 4.2);
 
         float altFrac = clamp(pos.y / 13000.0, 0.0, 1.0);
         // Heavy shafts cut off the skylight that reaches below cloud base, which is why the
         // world under a storm goes grey-green before the rain arrives.
         float shaftShadow = clamp(precipD * 2.1, 0.0, 1.0);
+        // Ambient falls off inside the cloud as well: interstitial multiple scattering replaces
+        // it, but a deep interior sample should not receive full sky light at every bounce.
         vec3 ambient = mix(skyAmbientBottom, skyAmbientTop, altFrac) * mix(0.88, 0.3, shaftShadow);
 
-        vec3 direct = lightRadiance * lightVis * phase * powder * 2.45;
+        // ---- Direct sun, split into diffuse and forward-scattered components -----------------
+        //
+        // A single Henyey-Greenstein term cannot express what a real cumulonimbus looks like.
+        // Two things have to coexist:
+        //
+        //   * the *thick* body, which scatters light diffusely and is therefore brightest where
+        //     it faces the sun, and
+        //   * the *thin edge* between the observer and the sun, where light scattered once at a
+        //     small angle comes straight through with only weak extinction. That is the silver
+        //     lining, and it is why the rim of a backlit tower is almost white while its body is
+        //     slate grey.
+        //
+        // The old code folded both into a single phase*powder term, so a backlit cloud was lit
+        // way as a front-lit one and could not produce the effect at all.
+        float forwardPeak = pow(max(0.0, cosTheta), 8.0);
+        // Silver lining needs two conditions at once: looking toward the light, *and* the sun
+        // actually reaching this sample through a thin path. Multiscatter is the proxy for
+        // thinness -- a deep core has almost none, an edge has plenty.
+        float silverLining = forwardPeak * pow(max(0.0, lightVis), 1.4) * (1.0 - cloudD * 0.55);
+
+        vec3 diffuse = lightRadiance * lightVis * phase * powder * 1.95;
+        vec3 forward = lightRadiance * silverLining * 2.6;
         // Backlit rain shafts glow: large drops forward-scatter strongly, so a shaft between
         // the observer and the light source lights up instead of going flat black.
-        direct += lightRadiance * lightVis * pow(max(0.0, cosTheta), 6.0) * precipD * 0.55;
+        forward += lightRadiance * lightVis * pow(max(0.0, cosTheta), 6.0) * precipD * 0.55;
+        vec3 direct = diffuse + forward;
         vec3 lightningGlow = evaluateBoltIllumination(pos, localFlash);
 
         // Blend crisp white-slate cloud scattering with misty gray-blue rain shaft scattering

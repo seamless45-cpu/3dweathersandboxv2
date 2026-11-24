@@ -155,7 +155,22 @@ const RAIN_STREAK_FRAG = /* glsl */ `
     // A tight lobe for the sun/moon glint on the drop surface, plus a broad one for the
     // refracted light thrown through the drop, which is what makes rain look wet rather
     // than dusty.
-    float spec = pow(max(dot(N, H), 0.0), 64.0) + 0.22 * pow(max(dot(N, H), 0.0), 9.0);
+    //
+    // The tight lobe is broadened for small drops. Water has a refractive index around 1.33 at
+    // every size, but a 0.3 mm droplet is only a few pixels across, so the highlight covers
+    // most of it and reads as a soft sheen; a 4 mm drop resolves the glint as a distinct point.
+    // A single exponent made every drop glint identically and the rain looked granular.
+    float glintWidth = mix(18.0, 110.0, smoothstep(0.0007, 0.0045, vDiameter));
+    float spec = pow(max(dot(N, H), 0.0), glintWidth) * mix(0.55, 1.25, smoothstep(0.0007, 0.0045, vDiameter))
+               + 0.20 * pow(max(dot(N, H), 0.0), 8.0);
+
+    // ---- Chromatic dispersion ---------------------------------------------------------------
+    // Water disperses: blue is refracted more than red, by about 1.5% of the deviation angle.
+    // At the scale of a raindrop that is invisible as a rainbow, but it does tint the *edge*
+    // of the refracted image blue-cyan and its centre slightly warm, which is a large part of
+    // why real rain reads as water rather than as grey mist. Driven off the same Fresnel term
+    // that drives the rim so the tint lands on the silhouette, not across the whole drop.
+    float dispersion = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 2.0);
 
     // ---- Along the streak ------------------------------------------------------------------
     // sin(pi*y) made every streak a lozenge: bright in the middle, pinched at both ends. A
@@ -182,9 +197,25 @@ const RAIN_STREAK_FRAG = /* glsl */ `
     float lens = smoothstep(0.0008, 0.0055, vDiameter) * (1.0 - uFrozenShare * 0.7);
     vec3 refracted = mix(body, uHazeColor * 0.72 + uTint * 0.28, lens * 0.55);
     vec3 col = refracted + uLightColor * spec * (0.85 + uFrozenShare * 1.5);
+    // Warm the core, cool the rim. Kept small: this is a subtle physical cue, and pushing it
+    // turns the rain into rainbow confetti.
+    col *= mix(vec3(1.02, 1.0, 0.985), vec3(0.94, 1.0, 1.06), dispersion * 0.55);
     // Fresnel rim: grazing-angle reflections of the sky brighten the drop's silhouette, which
     // is the cue that makes a curtain of rain visible against a bright sky.
-    col += uHazeColor * fres * (0.35 + 0.55 * uFrozenShare) * caustic * 0.5;
+    //
+    // fres and caustic used to be referenced here without ever being declared or uploaded,
+    // which is not a subtle shading error: an undeclared identifier is a *compile* error, so
+    // this entire fragment shader failed to build and the near-field rain curtain silently
+    // rendered nothing at all. GLSL parsers accept the name (it is valid syntax) and only the
+    // driver's linker rejects it, which is why a syntax-only validator never caught it.
+    //
+    // Both terms are now computed for real. The Fresnel weight is the standard Schlick
+    // approximation on the view/surface angle, and the caustic term brightens the drop where
+    // refracted light concentrates along its axis -- the bright thread that runs down a real
+    // raindrop.
+    float fresnel = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 4.0);
+    float caustic = 0.35 + 0.65 * chord * chord;
+    col += uHazeColor * fresnel * (0.35 + 0.55 * uFrozenShare) * caustic * 0.5;
     col = mix(col, uHazeColor, haze * 0.74);
     a *= 1.0 - haze * 0.52;
     // Small drizzle drops are optically thin: they neither darken nor brighten much, they just

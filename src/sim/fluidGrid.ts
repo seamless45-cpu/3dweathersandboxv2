@@ -253,6 +253,26 @@ export class AtmosphericFluidGrid {
   public qv: Float32Array;
   private qvPrev: Float32Array;
   /**
+   * Potential-temperature perturbation, K (departure from the environmental sounding).
+   *
+   * This is the field that makes latent heating a *thing that happens* rather than a term
+   * folded into a bulk model. Condensing a gram of water releases about 2500 J, which warms a
+   * kilogram of air by roughly 2.5 K; a convective core that condenses 2 g/kg warms by ~5 K
+   * relative to its surroundings. That warmth is the entire reason a tower keeps rising, and
+   * because saturation vapour pressure is exponential in temperature it also raises qSat and
+   * lets the column hold more vapour before it condenses. Without this field the grid's
+   * condensation was thermodynamically inert: cloud formed at a rate set by the sounding alone
+   * and could never feed back on itself.
+   *
+   * Stored as a perturbation rather than a full temperature so it can be advected and damped
+   * without carrying the environmental profile around with it.
+   */
+  public thetaPert: Float32Array;
+  private thetaPertPrev: Float32Array;
+  /** Evaporative cooling is the reverse of the latent heating above; kept explicit so the sign
+   *  of the feedback is visible in the code. */
+  private static readonly LATENT_HEAT_CP = 1.0 / 2.5; // K of warming per g/kg condensed
+  /**
    * Saturation mixing ratio (g/kg) at each grid level, cached from the sounding once per step.
    *
    * One value per level is an approximation — saturation depends on temperature, and a cloud
@@ -391,6 +411,8 @@ export class AtmosphericFluidGrid {
     this.qg = new Float32Array(this.totalCells);
     this.qv = new Float32Array(this.totalCells);
     this.qvPrev = new Float32Array(this.totalCells);
+    this.thetaPert = new Float32Array(this.totalCells);
+    this.thetaPertPrev = new Float32Array(this.totalCells);
 
     this.qcPrev = new Float32Array(this.totalCells);
     this.qiPrev = new Float32Array(this.totalCells);
@@ -478,6 +500,8 @@ export class AtmosphericFluidGrid {
     this.vaporSeeded = false;
     this.qv.fill(0);
     this.qvPrev.fill(0);
+    this.thetaPert.fill(0);
+    this.thetaPertPrev.fill(0);
   }
 
   public idx(ix: number, iy: number, iz: number): number {
@@ -632,6 +656,50 @@ export class AtmosphericFluidGrid {
       minIz: Math.max(0, b.minIz - pad),
       maxIz: Math.min(this.nz - 1, b.maxIz + pad),
     };
+  }
+
+  /**
+   * Applies buoyant acceleration from the latent-heating anomaly.
+   *
+   * The thermal perturbation field would be purely diagnostic if nothing read it. This closes
+   * the feedback loop that makes a convective tower self-sustaining: air warmed by its own
+   * condensation accelerates upward, which lowers the pressure, which draws in more moist air,
+   * which condenses further. A tower without this is a plume dragged upward by the cell model
+   * and nothing else, which is why the cloud field used to look like it was being *painted*
+   * rather than growing.
+   *
+   * The acceleration is g·theta'/theta, so a 3 K anomaly gives about 0.1 m/s^2, which over a
+   * 10 km deep column is a very large energy input -- but it only acts where condensate is
+   * actually being produced, and the damping in the advection step removes it again, so the
+   * field settles rather than running away. A hard cap keeps a pathological voxel from
+   * injecting an unreasonable impulse before the projection can respond.
+   */
+  private applyBuoyancy(box: ActiveBox, dt: number): void {
+    if (boxIsEmpty(box)) return;
+    const nx = this.nx;
+    const ny = this.ny;
+    const slice = this.sliceStride;
+    const stepDt = Math.min(dt, 6.0);
+    // g/theta with theta ~ 300 K.
+    const G_OVER_THETA = 9.81 / 300.0;
+
+    for (let iz = box.minIz; iz <= box.maxIz; iz++) {
+      const zOff = slice * iz;
+      for (let iy = Math.max(1, box.minIy); iy <= Math.min(ny - 2, box.maxIy); iy++) {
+        const row = zOff + nx * iy;
+        for (let ix = box.minIx; ix <= box.maxIx; ix++) {
+          const id = row + ix;
+          const warm = this.thetaPert[id];
+          if (Math.abs(warm) < 0.02) continue;
+          // Condensate loading offsets buoyancy: airborne water is heavy. Roughly -0.02 K per
+          // g/kg, and a dense core carries 2-3 g/kg, so this is a real brake on a strong tower
+          // rather than a rounding term.
+          const loading = -(this.qc[id] + this.qi[id] + this.qs[id] * 0.6) * 0.02;
+          const accel = Math.max(-0.16, Math.min(0.16, (warm + loading) * G_OVER_THETA));
+          this.vy[id] += accel * stepDt;
+        }
+      }
+    }
   }
 
   /**
@@ -804,6 +872,9 @@ export class AtmosphericFluidGrid {
     // from the advection operator rather than from a shape function.
     this.advectVapor(advectCondBox, stepDt);
     this.stepCondensation(advectCondBox, stepDt);
+    // Buoyancy is applied before the injection and projection below, so the acceleration this
+    // step is what the projection gets to massage into a divergence-free field.
+    this.applyBuoyancy(advectCondBox, stepDt);
 
     // 2. Surface cold-pool outflow and gust-front convergence.
     if (coldPools.length > 0) {
@@ -2110,13 +2181,23 @@ export class AtmosphericFluidGrid {
         // The parcel ceiling is the right one throughout the active condensate region. It is
         // only 1-3% above the environmental value in this sounding, so using it everywhere costs
         // nothing outside a storm and removes the inconsistency entirely.
-        const qSat = this.qSatParcelLevel[iy];
+        const qSatBase = this.qSatParcelLevel[iy];
 
         for (let ix = box.minIx; ix <= box.maxIx; ix++) {
           const id = row + ix;
           const vapour = this.qv[id];
           const condensate = this.qc[id] + this.qi[id];
-          if (vapour <= 0.001 && condensate <= 0.001) continue;
+          const thetaWarm = this.thetaPert[id];
+          if (vapour <= 0.001 && condensate <= 0.001 && Math.abs(thetaWarm) < 0.01) continue;
+
+          // Saturation capacity responds to the *local* temperature, not just altitude. The
+          // Clausius-Clapeyron slope for water at tropospheric temperatures is about 6.5 % per
+          // kelvin, so a core warmed 5 K by its own latent heating can hold a third more vapour
+          // than the environment at the same height. Without this coupling a tower warmed by
+          // condensation would start re-evaporating as soon as it warmed, which is backwards.
+          // Compressed at the low end so a strongly cooled downdraft does not drive qSat to
+          // zero and dump its entire condensate in one step.
+          const qSat = qSatBase * Math.max(0.35, 1.0 + thetaWarm * 0.065);
 
           if (vapour > qSat) {
             // Supersaturated: condense the excess immediately. This is fast (a few seconds) in
@@ -2136,6 +2217,12 @@ export class AtmosphericFluidGrid {
             const addIce = Math.min(excess * iceShare, Math.max(0, room - addLiquid));
             this.qc[id] += addLiquid;
             this.qi[id] += addIce;
+            // Latent heat. Condensation warms the parcel by L/(c_p) per unit mass, which for
+            // water is about 2.5 K per g/kg. Deposition (vapour to ice) releases slightly more,
+            // because it includes the latent heat of fusion as well, so the ice share is
+            // weighted up. This is the term that makes a tower buoyant in its own right.
+            const released = addLiquid + addIce * 1.28;
+            this.thetaPert[id] += released * AtmosphericFluidGrid.LATENT_HEAT_CP;
             // Anything the cap rejected stays as vapour and is re-partitioned next step. Keeping
             // it here rather than letting it lapse matters for conservation; it also means a
             // saturated layer self-limits instead of manufacturing condensate indefinitely.
@@ -2156,6 +2243,10 @@ export class AtmosphericFluidGrid {
             this.qi[id] -= iceLoss;
             if (this.qc[id] < 0.004) this.qc[id] = 0;
             if (this.qi[id] < 0.004) this.qi[id] = 0;
+            // Evaporation absorbs the same latent heat back. This is what makes the underside of
+            // a rain shaft cold and what drives a downdraft, so it has to have the opposite
+            // sign to condensation rather than being silently dropped.
+            this.thetaPert[id] -= (liquidLoss + iceLoss * 1.28) * AtmosphericFluidGrid.LATENT_HEAT_CP;
             // Evaporated mass returns to vapour, but never above saturation: that is exactly
             // the point at which it stops.
             this.qv[id] = Math.min(qSat, this.qv[id] + liquidLoss + iceLoss);
@@ -2190,6 +2281,7 @@ export class AtmosphericFluidGrid {
         for (let ix = box.minIx; ix <= box.maxIx; ix++) {
           const id = row + ix;
           this.qcPrev[id] = this.qc[id];
+          this.thetaPertPrev[id] = this.thetaPert[id];
           this.qiPrev[id] = this.qi[id];
           this.qrPrev[id] = this.qr[id];
           this.qsPrev[id] = this.qs[id];
@@ -2201,6 +2293,11 @@ export class AtmosphericFluidGrid {
     // Per-second relaxation toward zero where the cell source stops feeding the column.
     // Cloud water tau ~ 45 s, anvil ice ~ 110 s, rain shaft ~ 22 s of simulated time.
     const dampC = Math.exp(-0.022 * clampDt);
+    // Temperature perturbations radiate and mix away on a timescale of a few minutes. Damping
+    // them explicitly is what stops the field accumulating heat without bound over a long run:
+    // condensation keeps adding, and without a sink the whole domain would slowly warm until
+    // every column was saturated.
+    const dampTheta = Math.exp(-0.0055 * clampDt);
     // Snow persists far longer than cloud ice: an anvil is a mesoscale reservoir that survives
     // tens of minutes after its parent tower has gone, and it is what keeps the cirrus deck
     // visible. Damping it at the cloud-ice rate erased every anvil within ~2 minutes.
@@ -2263,6 +2360,16 @@ export class AtmosphericFluidGrid {
               this.qcPrev[i110] * w110 + this.qcPrev[i001] * w001 + this.qcPrev[i101] * w101 +
               this.qcPrev[i011] * w011 + this.qcPrev[i111] * w111) * dampC;
           this.qc[id] = nextQc < 0.004 ? 0 : nextQc;
+
+          // The warm anomaly rises with the cloud, so it has to be advected by the same
+          // departure-point gather. Leaving it in place while the cloud moved would separate
+          // a tower from the heat that is holding it up.
+          const nextTheta =
+            (this.thetaPertPrev[i000] * w000 + this.thetaPertPrev[i100] * w100 +
+              this.thetaPertPrev[i010] * w010 + this.thetaPertPrev[i110] * w110 +
+              this.thetaPertPrev[i001] * w001 + this.thetaPertPrev[i101] * w101 +
+              this.thetaPertPrev[i011] * w011 + this.thetaPertPrev[i111] * w111) * dampTheta;
+          this.thetaPert[id] = Math.abs(nextTheta) < 0.01 ? 0 : nextTheta;
 
           const nextQi =
             (this.qiPrev[i000] * w000 + this.qiPrev[i100] * w100 + this.qiPrev[i010] * w010 +
