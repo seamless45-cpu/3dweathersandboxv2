@@ -1,7 +1,7 @@
 import { MesoscaleEnvironment } from './mesoscaleEnvironment';
 import { stepCellMicrophysics } from './microphysics';
 import { buildPlumeProfile, plumeVelocityAt, samplePlume } from './updraftModel';
-import { getSurfaceThermalPotential, getTerrainHeight } from './terrainField';
+import { getTerrainHeight, getTransientThermalPotential } from './terrainField';
 import { AtmosphericSounding } from './thermodynamics';
 import {
   AtmosphereConfig,
@@ -717,7 +717,7 @@ export class ConvectiveCellManager {
 
   private evaluateNaturalNucleation(
     checkDt: number,
-    _simTimeSec: number,
+    simTimeSec: number,
     sounding: AtmosphericSounding,
     cfg: AtmosphereConfig
   ): void {
@@ -810,7 +810,20 @@ export class ConvectiveCellManager {
       const candZ = (this.rand() * 1.7 - 1.05) * (DOMAIN_HALF_SIZE * 0.72);
 
       const terrainElev = getTerrainHeight(candX, candZ);
-      const thermalSpot = getSurfaceThermalPotential(candX, candZ);
+      // Sample the *evolving* surface field, not the static geography.
+      //
+      // Using the fixed field meant the nucleation search ranked candidate sites identically in
+      // every run and at every time, so convection appeared in the same places over and over --
+      // exactly the "fixed patterns and fixed locations" behaviour. The transient version adds the
+      // three things that actually move a boundary layer around: the soil-moisture pattern
+      // advected with the low-level wind, a slower regional field, and fine gustiness. It stays a
+      // pure function of (position, time) so a fixed seed remains reproducible.
+      //
+      // The drift is the boundary-layer wind integrated to the current simulation time, which is
+      // what makes the hotspots migrate at the speed the air actually moves.
+      const driftX = sounding.windUAt(600) * simTimeSec;
+      const driftZ = sounding.windWAt(600) * simTimeSec;
+      const thermalSpot = getTransientThermalPotential(candX, candZ, driftX, driftZ, simTimeSec);
       const orographicBonus = Math.min(0.45, terrainElev / 340.0);
 
       // Local environment at this candidate site. Where the mesoscale field has been cooled and

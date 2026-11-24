@@ -623,6 +623,10 @@ export class AtmosphericSceneEngine {
       shadowsEnabled: perfMgr.settings.enableShadows,
     });
 
+    // Debris billboards are sized in pixels, so the renderer needs the real drawing-buffer
+    // height and vertical FOV -- without them every grain is mis-scaled by the DPR.
+    this.tornadoRenderer.setViewport(this.renderHeightPx, cam.fov, this.dpr);
+
     this.tornadoRenderer.update({
       tornadoes: coordinator.tornadoes.active.map((t) => ({
         id: t.id,
