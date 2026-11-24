@@ -32,6 +32,22 @@ export function effectiveSolarInsolation(cfg: AtmosphereConfig): number {
 
 export class ConvectiveCellManager {
   public cells: ConvectiveCell[] = [];
+  /**
+   * Vorticity that counts as "rotating" for this environment, s⁻¹.
+   *
+   * Mesocyclone strength is not a universal constant — it scales with the streamwise vorticity
+   * the hodograph supplies, which is why a 40 m/s SRH sounding produces a 0.02 s⁻¹ vortex and a
+   * 60 m²/s² one cannot. Every gate that used to compare against a hard-coded 0.008/0.011/0.014
+   * now compares against this, so a straight-line hodograph is still unable to make a supercell
+   * and a strongly curved one can reach the stage without a threshold tuned to one preset.
+   */
+  private vorticityScale = 0.012;
+  /** 0-3 km storm-relative helicity of the environment (m²/s²), set from the sounding each step. */
+  private environmentSRH03 = 0;
+  /** 0-6 km bulk shear of the environment (m/s). */
+  private environmentShear06 = 0;
+  /** Environmental streamwise vorticity (s^-1) that tilting and stretching amplify. */
+  private environmentAmbientVorticityS = 0.012;
   public coldPools: ColdPool[] = [];
   public organization: StormOrganizationMode = 'Clear Sky';
 
@@ -83,6 +99,54 @@ export class ConvectiveCellManager {
     this.rngState = 13374209;
   }
 
+  /**
+   * Environmental streamwise vorticity, from the sounding and the Bunkers storm motion.
+   *
+   * This is a property of the *environment*, not of any particular cell, and it is the seed that
+   * tilting and stretching then amplify. Two things were wrong with computing it inside the
+   * per-cell update:
+   *
+   *  1. It used the cell's *own* velocity in the storm-relative wind, so the curvature term grew
+   *     as the cell accelerated away from the mean wind. A supercell ended up with an ambient
+   *     vorticity of 0.055 s⁻¹ — five times anything the hodograph supplies — and stretching
+   *     turned that into a 0.22 s⁻¹ "mesocyclone", seven times the strongest ever observed.
+   *  2. Being recomputed every step, it also fed straight back into its own amplification.
+   *
+   * ξ ≈ SRH / (2·h) over the inflow layer (Davies-Jones 1984), reduced by the fraction of the
+   * hodograph that is *curved*: straight streamwise vorticity gives a non-rotating updraft no
+   * matter how large SRH is, because the updraft has no way to tilt it into the vertical. The
+   * curvature is measured against the storm motion the sounding itself implies, which is a
+   * fixed vector for a given sounding.
+   */
+  private updateEnvironmentVorticity(sounding: AtmosphericSounding): void {
+    const inst = sounding.instability;
+    this.environmentSRH03 = inst.srh03km;
+    this.environmentShear06 = inst.bulkShear06km;
+    const srh = Math.max(0, inst.srh03km);
+    // The inflow layer (0-3 km) carries the helicity; h = 2500 m is the effective depth of a
+    // supercell's inflow, slightly less than the integration depth because the lowest 500 m is
+    // surface friction.
+    const streamwiseVorticity = srh / (2 * 2500);
+    // Storm motion from the sounding. Held as a fixed reference so this value does not depend
+    // on where any individual cell happens to be or how fast it is moving.
+    const stormU = (sounding.windUAt(200) + sounding.windUAt(3000)) * 0.5;
+    const stormW = (sounding.windWAt(200) + sounding.windWAt(3000)) * 0.5;
+    const sr0x = sounding.windUAt(200) - stormU;
+    const sr0z = sounding.windWAt(200) - stormW;
+    const sr3x = sounding.windUAt(3000) - stormU;
+    const sr3z = sounding.windWAt(3000) - stormW;
+    const n0 = Math.hypot(sr0x, sr0z) || 1;
+    const n3 = Math.hypot(sr3x, sr3z) || 1;
+    // |sin(angle between the two storm-relative winds)| — 0 on a straight hodograph.
+    const curvature = Math.abs((sr0x / n0) * (sr3z / n3) - (sr0z / n0) * (sr3x / n3));
+    const ambient = streamwiseVorticity * (0.35 + 0.65 * curvature);
+    this.environmentAmbientVorticityS = Math.max(0, Math.min(0.04, ambient));
+    // The scale a fully stretched column would reach. It gates the supercell and tornado stages,
+    // so it is derived from the environment rather than being a universal constant.
+    this.vorticityScale = Math.max(0.004, this.environmentAmbientVorticityS * 1.9);
+    for (const cell of this.cells) cell.ambientVorticityS = this.environmentAmbientVorticityS;
+  }
+
   public step(
     dt: number,
     simTimeSec: number,
@@ -95,6 +159,7 @@ export class ConvectiveCellManager {
     // a cell growing 20 km from another sees its own CAPE, CIN and cloud base rather than a value
     // averaged over the whole domain.
     const baseInst = sounding.instability;
+    this.updateEnvironmentVorticity(sounding);
     const sfc = sounding.levels[0];
     this.sfcTempK = sfc ? sfc.tempK : cfg.surfaceTempC + 273.15;
     this.sfcDewK = sfc ? sfc.dewpointK : this.sfcTempK - 4.0;
@@ -211,6 +276,7 @@ export class ConvectiveCellManager {
       // Structural archetype: biases every growth law below, so a tower, a multicell cluster, a
       // shallow cumulus and a stratiform deck all evolve from the same physics but end up as
       // visibly different clouds rather than four copies of one shape.
+      this.promoteMorphology(cell);
       const morph = ConvectiveCellManager.MORPH_FACTORS[cell.morphology];
 
       // ---- Vertical momentum balance -------------------------------------------------
@@ -259,7 +325,7 @@ export class ConvectiveCellManager {
       // Rotating updrafts are dynamically supported: the same low-pressure core that makes a
       // mesocyclone also sucks air upward through it.
       const dynamicPressureBoost =
-        Math.abs(cell.mesocycloneVorticity) > 0.006
+        Math.abs(cell.mesocycloneVorticity) > this.vorticityScale * 0.5
           ? Math.min(6.5, Math.abs(cell.mesocycloneVorticity) * 240.0)
           : 0;
 
@@ -308,6 +374,66 @@ export class ConvectiveCellManager {
       );
 
 
+      // ---- Vorticity: tilting of environmental streamwise vorticity, then stretching ---------
+      // A mesocyclone is not a property a storm can be given; it is produced. The environmental
+      // horizontal vorticity of a sheared flow is tilted into the vertical by a buoyant updraft,
+      // and the resulting vertical vorticity is then amplified by the updraft's own stretching:
+      //
+      //     dζ/dt  =  (ω_h · ∇_h w)  −  ζ·(∂w/∂z)      [tilting + stretching]
+      //     ω_h    ≈  −∂V/∂z          (baroclinic + shear, dominated by the shear term)
+      //
+      // The streamwise component of ω_h that matters is the one pointing along the storm-relative
+      // inflow, and its layer-mean magnitude is exactly SRH/2 divided by the inflow depth. That
+      // is the standard relation ξ ≈ SRH/(2·h) for the inflow layer (Davies-Jones 1984), and it
+      // is the only bridge between the sounding's hodograph and the storm's rotation.
+      //
+      // This was simply missing: `mesocycloneVorticity` was initialised to 0 and never written
+      // again, so *no storm could ever rotate*. Since the 'supercell' life-cycle classification
+      // and tornado genesis both gate on |ζ| > 0.011, the simulation could not produce a
+      // supercell at all — every preset degenerated to a multicell cluster or a single cell.
+      this.environmentSRH03 = inst.srh03km;
+      this.environmentShear06 = inst.bulkShear06km;
+      // `cell.ambientVorticityS` is an *environment* property and is set once, by
+      // `computeEnvironmentVorticity` below. It must not be recomputed per cell per step from
+      // cell-relative wind: the curvature term is a property of the hodograph, and measuring it
+      // against a moving storm's own velocity made it grow as the storm's motion drifted away
+      // from the mean wind. A cell then "discovered" an ambient vorticity of 0.055 s⁻¹ — five
+      // times what any sounding here supplies — and stretching multiplied that into a
+      // 0.22 s⁻¹ "mesocyclone", which is seven times the strongest ever measured and left the
+      // vortex injection term with no choice but to destabilise the grid.
+      // The vorticity a *supercell* needs is not a universal constant: it is set by what the
+      // environment can supply, because stretching amplifies an existing vortex rather than
+      // creating one. `this.vorticityScale` is derived once per step in
+      // `updateEnvironmentVorticity` — assigning it here as well would let the last cell in the
+      // loop overwrite the environment's value with its own.
+      // Tilting needs an updraft; stretching is proportional to ∂w/∂z over the inflow layer.
+      // Stretching amplification: dζ/dt ≈ ζ·(−∂w/∂z) integrated over the vortex tube. For a
+      // tower of depth H rising at w, ∂w/∂z ~ w/H, so over the residence time H/w the vortex is
+      // stretched by a factor of order e — i.e. the steady-state amplification is set by how
+      // long the tube survives against turbulent dissipation, not by the instantaneous shear.
+      // A mature supercell's mesocyclone reaches 1-3×10⁻² s⁻¹ (a *strong* one is 0.03), so the
+      // amplification factor has to span roughly an order of magnitude above the ambient
+      // streamwise vorticity. A cap of 1.6 left every storm at 0.011, which is a weak
+      // mesocyclone that can never satisfy a tornado-genesis threshold.
+      const stretchRate =
+        cell.cloudTopM > inst.lfc
+          ? clamp((cell.updraftMaxMS / 14.0) * ((cell.cloudTopM - cell.cloudBaseM) / 5000.0), 0, 4.2)
+          : 0;
+      const vortTarget = cell.ambientVorticityS * stretchRate * (cell.rightMoverBias < 0 ? -1 : 1);
+      // Spin-up is fast once the updraft is established (a mesocyclone forms in 10-20 minutes),
+      // spin-down is slower because the vortex decays by turbulent diffusion.
+      const tauVort = Math.abs(vortTarget) > Math.abs(cell.mesocycloneVorticity) ? 380 : 900;
+      cell.mesocycloneVorticity += (vortTarget - cell.mesocycloneVorticity) * (1.0 - Math.exp(-dt / tauVort));
+      // Hard physical ceiling. A mesocyclone is the strongest rotation the atmosphere produces
+      // outside a tornado, and the strongest ever measured is about 0.03 s⁻¹; the amplification
+      // above is a single-vortex model that can in principle run away, so the ceiling is stated
+      // explicitly rather than relying on the relaxation to settle below it.
+      cell.mesocycloneVorticity = clamp(cell.mesocycloneVorticity, -0.032, 0.032);
+      // Vorticity advection by the storm-relative flow is what makes the mesocyclone move with
+      // the right-mover rather than with the mean wind.
+      cell.rotationPhase +=
+        dt * 0.00055 * cell.mesocycloneVorticity * 1e3;
+
       // ---- Downdraft: sub-cloud evaporative/melt cooling plus precipitation loading ----
       const subCloudDepth = Math.max(350, cell.cloudBaseM);
       const subCloudTempK = Math.max(240, sounding.tempKAt(subCloudDepth * 0.5));
@@ -336,11 +462,46 @@ export class ConvectiveCellManager {
       // relax to `min(lcl, cloudTop)` and simultaneously allowed the top to be driven by a
       // morphology factor, which occasionally put a "cloud" 300 m above ground on a day with a
       // 1 km LCL.
+      //
+      // The base is a *thermodynamic level*, not a fraction of the cloud: condensation begins
+      // where a rising parcel first saturates, so for a given mixed layer the base is fixed.
+      // It is allowed to move only because the boundary layer itself changes (rain-cooled
+      // outflow lowers it, solar heating raises the LCL), which is exactly what
+      // `mesoscaleEnvironment.sampleAt()` provides. Deriving it from the top instead — the
+      // base used to follow `min(lcl, top)` and then get dragged down by the top-collapse
+      // factor during dissipation — let a mature tower's base fall from 756 m to 633 m over
+      // 100 s while its LCL sat at 1000 m, so a deep cloud stood on a base 370 m below the
+      // level at which its air could condense.
       const lclFloor = Math.max(180, inst.lcl);
-      const targetBaseM = cell.cloudTopM > lclFloor + 250 ? lclFloor : Math.min(lclFloor, cell.cloudTopM);
-      cell.cloudBaseM += (targetBaseM - cell.cloudBaseM) * (1.0 - Math.exp(-dt / 70.0));
+      let localLcl = lclFloor;
+      if (this.env) {
+        const local = this.env.sampleAt(cell.x, cell.z);
+        // The LCL is a thermodynamic level, so its motion under a boundary-layer perturbation
+        // has to be derived, not tuned. The mixed-layer dewpoint depression is D = T − T_d, and
+        // to first order (Clausius–Clapeyron, d(ln e_s)/dT = L/(R_v T²) ≈ 0.0564 per K at these
+        // temperatures) a relative change in q_v of δ moves T_d by δ/0.0564 K. The LCL itself
+        // sits where the dry adiabat meets the mixing-ratio line, so dLCL/dD ≈ 125 m per K.
+        //
+        //   δD = −δθ   (warmer surface, same moisture, larger depression)
+        //        − δq/q·(1/0.0564)   (more moisture, smaller depression)
+        //
+        // The previous version multiplied the perturbations by 120 and 95 with no derivation:
+        // a −3.4 K cold pool (a realistic value) shifted the LCL by −400 m, and since the
+        // arithmetic was linear and unbounded it could drive the base far below any level at
+        // which air can condense.
+        const qvBase = Math.max(1.0, sounding.mlQvGKg);
+        const dDewpointK = -(local.qvPert / qvBase) / 0.0564;
+        const dDepressionK = local.thetaPert + dDewpointK;
+        // A *colder* boundary layer with the same moisture has a smaller depression, so the LCL
+        // falls; this is the sign that matters for a rain-cooled outflow.
+        const lclShift = clamp(-dDepressionK * 125.0, -350, 700);
+        localLcl = clamp(lclFloor + lclShift, 300, lclFloor + 1000);
+      }
+      // Below the local LCL there is no condensate: the base cannot be under it, and a cell
+      // whose top has not yet reached it has no visible cloud at all.
+      const targetBaseM = Math.min(localLcl, cell.cloudTopM);
+      cell.cloudBaseM += (targetBaseM - cell.cloudBaseM) * (1.0 - Math.exp(-dt / 90.0));
       if (cell.cloudTopM < cell.cloudBaseM) cell.cloudBaseM = cell.cloudTopM;
-      if (cell.cloudTopM > lclFloor + 200) cell.cloudBaseM = Math.max(cell.cloudBaseM, lclFloor * 0.94);
 
       if (cell.updraftMaxMS > 0.25) {
         // ---- Cloud-top growth ------------------------------------------------------------
@@ -365,7 +526,15 @@ export class ConvectiveCellManager {
         if (cell.cloudTopM < maxPhysicalTop) {
           cell.cloudTopM = Math.min(maxPhysicalTop, cell.cloudTopM + capRise * dt);
         } else {
-          cell.cloudTopM += (maxPhysicalTop - cell.cloudTopM) * (1.0 - Math.exp(-dt / 40.0));
+          // Over the ceiling: the top is above where this cell's own buoyancy can sustain it, so
+          // anvil material is left behind and the visible top subsides. It must *subside*, not
+          // snap — the previous 40 s relaxation let an archetype ceiling 1.6 km below the tower
+          // pull a 9.2 km top down by 400 m in a single second, which reads on screen and in the
+          // radar as the storm being cut off at the knees. Anvil fallout and evaporation work at
+          // a few m/s, so cap the approach there and let the relaxation handle the rest.
+          const subsidenceMS = Math.min(6.0, 1.4 + 0.08 * (cell.cloudTopM - maxPhysicalTop));
+          const target = Math.max(maxPhysicalTop, cell.cloudTopM - subsidenceMS * dt);
+          cell.cloudTopM = target;
         }
       } else {
         // Subsidence & cloud top collapse during dissipation. An orphaned anvil evaporates from
@@ -386,9 +555,14 @@ export class ConvectiveCellManager {
       // 12 km tower is 3-5 km across. Getting this right matters twice over, because the
       // radius also sets the lateral entrainment rate (eps ~ 0.2/R) that dilutes condensate
       // and the aerodynamic drag that limits the updraft.
+      // Observed updraft cores: ~0.5 km radius for a 2 km shallow cumulus up to 3-4 km for a
+      // 12 km supercell — and a supercell's *tower* is 5-8 km across while its vortex-bearing
+      // core is 1-3 km. The previous coefficients produced a 6.8 km radius for a 9 km deep,
+      // 34 m/s tower, which in turn displaced the rear-flank downdraft by 4.9 km and made the
+      // "hook" four times wider than the storm.
       const continuityRadius =
-        340 + Math.sqrt(Math.max(0, cell.updraftMaxMS) * Math.max(300, cloudDepth)) * 15.0;
-      const depthRadius = cloudDepth * (0.19 + 0.011 * Math.sqrt(Math.max(0, cell.updraftMaxMS)));
+        320 + Math.sqrt(Math.max(0, cell.updraftMaxMS) * Math.max(300, cloudDepth)) * 9.0;
+      const depthRadius = cloudDepth * (0.13 + 0.006 * Math.sqrt(Math.max(0, cell.updraftMaxMS)));
       const targetRadius =
         cell.stage === 'dissipating'
           ? cell.radiusM * (1.0 - 0.0045 * dt)
@@ -397,7 +571,7 @@ export class ConvectiveCellManager {
                 morph.radius *
                 (1.0 + Math.min(0.35, Math.abs(cell.mesocycloneVorticity) * 9.0)),
               420,
-              7200
+              5400
             );
       cell.radiusM += (targetRadius - cell.radiusM) * (1.0 - Math.exp(-dt / 240.0));
 
@@ -423,7 +597,7 @@ export class ConvectiveCellManager {
       cell.precipCoreOffsetX += (ffdShiftX - cell.precipCoreOffsetX) * (1.0 - Math.exp(-dt / 45.0));
       cell.precipCoreOffsetZ += (ffdShiftZ - cell.precipCoreOffsetZ) * (1.0 - Math.exp(-dt / 45.0));
 
-      if (Math.abs(cell.mesocycloneVorticity) > 0.008) {
+      if (Math.abs(cell.mesocycloneVorticity) > this.vorticityScale * 0.65) {
         // Hook-echo / RFD wraps cyclonically around the rear flank of the mesocyclone.
         const wrapAngle = Math.atan2(ffdShiftZ, ffdShiftX) + 2.35;
         cell.rfdOffsetX = Math.cos(wrapAngle) * cell.radiusM * 0.72;
@@ -434,7 +608,7 @@ export class ConvectiveCellManager {
       }
 
       // Storm translation: steering flow + Bunkers deviation for rotating cells.
-      const supercellFrac = Math.min(1.0, Math.abs(cell.mesocycloneVorticity) / 0.014);
+      const supercellFrac = Math.min(1.0, Math.abs(cell.mesocycloneVorticity) / this.vorticityScale);
       const targetVx =
         cell.rightMoverBias >= 0
           ? steerU * (1.0 - supercellFrac) + inst.bunkersStormU * supercellFrac
@@ -455,7 +629,7 @@ export class ConvectiveCellManager {
         cell.downdraftMaxMS > 2.6 &&
         (cell.surfaceRainRateMMHr > 1.2 || cell.virgaFraction > 0.55)
       ) {
-        this.feedOrCreateColdPool(cell, downdraftTempDeficitK, dt);
+        this.feedOrCreateColdPool(cell, downdraftTempDeficitK, dt, sounding);
       }
 
       // Supercell splitting when strong curved shear stretches a vigorous updraft.
@@ -484,9 +658,20 @@ export class ConvectiveCellManager {
         cell.hailGKg +
         cell.rainGKg;
 
+      // Retire a cell once its *cloud* has left the simulated domain. The margin used to be
+      // 5.5 km beyond a +/-24 km grid, so a storm could sit 30 km out — invisible, unrendered,
+      // outside the fluid grid — while still counting toward the active-cell total, the
+      // organisation classifier and tornado genesis. Its radius is included because a 5 km wide
+      // tower centred at 23 km still has half of itself over the grid.
+      // Only a small margin: a storm centred much beyond the edge has no grid beneath it, so
+      // its updraft, rain, lightning and rotation are pure bookkeeping. Retire it as it leaves.
+      // (A wide cell was previously allowed 90% of its own radius of slack, which let a 5 km
+      // supercell run 28 km out — four kilometres past the last simulated voxel — and still be
+      // classified, counted and rendered.)
+      const leaveMargin = 2200;
       const outOfBounds =
-        Math.abs(cell.x) > DOMAIN_HALF_SIZE + 5500 ||
-        Math.abs(cell.z) > DOMAIN_HALF_SIZE + 5500;
+        Math.abs(cell.x) > DOMAIN_HALF_SIZE + leaveMargin ||
+        Math.abs(cell.z) > DOMAIN_HALF_SIZE + leaveMargin;
 
       if (
         outOfBounds ||
@@ -661,6 +846,29 @@ export class ConvectiveCellManager {
    * stratiform decks. This is what lets the domain show several distinct cloud structures at
    * once instead of a field of identical towers.
    */
+  /**
+   * Re-examines the archetype once a cell has proven itself.
+   *
+   * The morphology is drawn at nucleation, when nothing is known about the cell except the
+   * environment it was born into. A draw of 'stratiform' caps the cloud top at 0.44·EL — about
+   * 5.8 km on a 13.2 km sounding — so a cell that a minute later has a 30 m/s updraft and
+   * 9 km of depth is still being held down by a coin flip made at 200 m. That is what made
+   * every strong tower in the domain collapse back to 1 km within two minutes.
+   *
+   * A cell that is deep, fast and long-lived is a convective tower whatever it started as; the
+   * archetype is therefore promoted (never demoted mid-life, which would look like the storm
+   * forgetting what it was).
+   */
+  private promoteMorphology(cell: ConvectiveCell): void {
+    if (cell.morphology === 'tower') return;
+    const deep = cell.cloudTopM - cell.cloudBaseM > 5200;
+    const strong = cell.updraftMaxMS > 14;
+    if (deep && strong) cell.morphology = 'tower';
+    else if (cell.morphology === 'stratiform' && cell.updraftMaxMS > 7 && cell.cloudTopM - cell.cloudBaseM > 2600) {
+      cell.morphology = 'multicell';
+    }
+  }
+
   private pickMorphology(inst: {
     cape: number;
     bulkShear06km: number;
@@ -752,6 +960,7 @@ export class ConvectiveCellManager {
       buoyancyAccel: 0.02,
       entrainmentRate: 0.6,
       mesocycloneVorticity: 0,
+      ambientVorticityS: this.environmentAmbientVorticityS,
       rotationPhase: this.rand() * Math.PI * 2,
       splitCandidateDone: false,
       rightMoverBias: 0,
@@ -804,6 +1013,7 @@ export class ConvectiveCellManager {
       anvilRadiusM: parent.anvilRadiusM * 0.7,
       updraftMaxMS: parent.updraftMaxMS * 0.84,
       mesocycloneVorticity: -Math.abs(parent.mesocycloneVorticity) * 0.75, // Anticyclonic left-mover!
+      ambientVorticityS: parent.ambientVorticityS,
       splitCandidateDone: true,
       rightMoverBias: -1,
       cloudWaterGKg: parent.cloudWaterGKg * frac,
@@ -930,15 +1140,38 @@ export class ConvectiveCellManager {
   private feedOrCreateColdPool(
     cell: ConvectiveCell,
     downdraftTempDeficitK: number,
-    dt: number
+    dt: number,
+    sounding: AtmosphericSounding
   ): void {
     const poolCenterX = cell.x + cell.precipCoreOffsetX;
     const poolCenterZ = cell.z + cell.precipCoreOffsetZ;
 
-    // Cold pool temperature deficit tracks the evaporative deficit of the downdraft air,
-    // strengthened a little by heavy rain loading and limited by surface heating.
-    const targetDeficitK = clamp(downdraftTempDeficitK * 1.35 + cell.surfaceRainRateMMHr * 0.012, 0.6, 12.0);
-
+    // ---- Cold-pool strength from the sounding, not from a fixed coefficient ---------------
+    // The cold pool is air cooled by evaporation at roughly constant pressure, so its
+    // temperature deficit in kelvin is also its potential-temperature deficit, and its
+    // buoyancy is  B = −g·Δθ/θ_env.  What a gravity current does with that is
+    //        c = 0.78·√(−B·H)   (Benjamin 1968),
+    // so the environmental potential temperature is a real physical input: the same 6 K of
+    // evaporative cooling makes a far more violent outflow at a warm surface than a cold one.
+    //
+    // The old form was `1.35·ΔT + 0.012·rain` clamped to a flat 12 K, with no environment in it
+    // at all — every pool converged to the same strength regardless of the surface state.
+    //
+    // The *ceiling* is physical too: evaporation stops when the sub-cloud air saturates, so the
+    // deficit cannot exceed the surface wet-bulb depression, Δθ_max ≈ θ_env − θ_w. The sounding
+    // does not expose θ_w directly, but the depression is bounded by the surface relative
+    // humidity, which is available.
+    const surfaceRh = Math.max(0.05, Math.min(1.0, sounding.relativeHumidityAt(60)));
+    // A standard psychrometric relation: each 10 % of RH below saturation buys ~0.6 K of
+    // evaporative cooling in a well-mixed sub-cloud layer at these temperatures.
+    const wetBulbDepressionK = (1.0 - surfaceRh) * 6.0 + 0.6;
+    const subCloudDepth = Math.max(300, cell.cloudBaseM);
+    const rainCoolingK = clamp(cell.surfaceRainRateMMHr * 0.012 * (subCloudDepth / 1000.0), 0, 6.0);
+    const targetDeficitK = clamp(
+      downdraftTempDeficitK * 1.35 + rainCoolingK,
+      0.6,
+      Math.max(1.2, Math.min(12.0, wetBulbDepressionK))
+    );
     let existing = this.coldPools.find((p) => p.sourceCellId === cell.id);
     if (!existing) {
       if (this.coldPools.length >= 16) {
@@ -1105,10 +1338,26 @@ export class ConvectiveCellManager {
     }
     // Hard lifetime cap for non-rotating cloud. A single cell that is not a supercell is
     // consumed by its own outflow within roughly half an hour.
-    if (cell.ageSec > 2100 && Math.abs(cell.mesocycloneVorticity) < 0.011) {
+    if (cell.ageSec > 2100 && Math.abs(cell.mesocycloneVorticity) < this.vorticityScale * 0.9) {
       return 'dissipating';
     }
-    if (Math.abs(cell.mesocycloneVorticity) > 0.011 && cell.cloudTopM > freezeZ + 2200) {
+    // A supercell is a *persistent* rotating storm, and the environment has to be able to
+    // support one. Two independent conditions, because the vorticity alone is not sufficient:
+    //
+    //  * the mesocyclone must be at 0.55x the environment's own vortex scale, and
+    //  * the environment must be genuinely sheared — 0-3 km SRH of at least 100 m²/s² and
+    //    at least 15 m/s of 0-6 km shear. A 5.5 m/s shear sounding has SRH ~8 and cannot
+    //    produce a rotating updraft no matter what a single cell's vorticity number reads;
+    //    without this gate `pulse_summer` classified as a "Supercell Thunderstorm" the moment
+    //    one of its pulse storms happened to inherit a vortex.
+    const rotationalEnvironment =
+      this.environmentSRH03 >= 100 && this.environmentShear06 >= 15.0;
+    if (
+      rotationalEnvironment &&
+      Math.abs(cell.mesocycloneVorticity) > this.vorticityScale * 0.55 &&
+      cell.cloudTopM > freezeZ + 2200 &&
+      cell.ageSec > 420
+    ) {
       return 'supercell';
     }
     // A cell is mature when it has reached its equilibrium level *and* is actually precipitating

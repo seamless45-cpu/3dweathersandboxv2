@@ -427,6 +427,7 @@ export function App() {
                   sounding={coordinatorRef.current!.sounding}
                   observerX={engineRef.current?.cameraCtrl.posX ?? 0}
                   observerZ={engineRef.current?.cameraCtrl.posZ ?? 0}
+                  cells={coordinatorRef.current!.cellManager.cells}
                   onClose={() => setRadarOpen(false)}
                 />
               )}
@@ -515,7 +516,7 @@ export function App() {
                   </span>
                   <span className="font-mono text-red-200/85">
                     {(t.windMS * 3.6).toFixed(0)} km/h · core {Math.round(t.radiusM)}m ·{' '}
-                    {(t.pressureDeficitPa / 100).toFixed(0)} hPa · {t.phase}
+                    {Math.abs(t.pressureDeficitPa).toFixed(0)} Pa drop · {t.phase}
                   </span>
                   {telemetry.tornadoes.length > 1 && (
                     <span className="font-mono text-red-300/70">

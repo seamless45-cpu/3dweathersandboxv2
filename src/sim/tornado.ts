@@ -1,5 +1,5 @@
 import { AtmosphericFluidGrid } from './fluidGrid';
-import { ConvectiveCell } from './types';
+import { ConvectiveCell, DOMAIN_HALF_SIZE } from './types';
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
@@ -74,12 +74,36 @@ export class TornadoEngine {
       for (const cell of cells) {
         if (this.active.some((t) => t.parentCellId === cell.id)) continue;
         const zeta = Math.abs(cell.mesocycloneVorticity);
-        // Threshold sits above the supercell-stage value (0.011): not every supercell tornados,
-        // and in reality only a minority do.
+        // Threshold derived from the same environment-set vortex scale the life cycle uses,
+        // rather than a hard-coded 0.0125: not every supercell tornadoes, and in reality only a
+        // minority do, so this sits a little above the supercell-stage gate — but it has to be
+        // reachable, and on a sounding whose hodograph supports 0.009 s⁻¹ of stretching it never
+        // was.
+        // A tornadic mesocyclone has to be at the strong end of what a supercell reaches, not
+        // merely stretched a little. The threshold is set relative to the *physical ceiling* on
+        // mesocyclone vorticity (0.032 s⁻¹) and to the environment's own scale, and never above
+        // the ceiling itself: deriving it as `ambient * 2.1` made it 0.042 s⁻¹ on a high-helicity
+        // sounding, which no storm can reach because 0.032 is where observed supercells top out.
+        // Not every supercell tornadoes — roughly one in four does — so the gate sits at 78 % of
+        // the ceiling, or at the environment's own amplification scale if that is higher.
+        const genesisThreshold = Math.min(0.0245, Math.max(0.012, cell.ambientVorticityS * 1.45));
         const rfdWrap = Math.hypot(cell.rfdOffsetX, cell.rfdOffsetZ);
         const lowBase = cell.cloudBaseM < 1750;
         const rotating = cell.stage === 'supercell' || cell.stage === 'mature';
-        if (zeta > 0.0125 && rfdWrap > cell.radiusM * 0.42 && lowBase && rotating && cell.updraftMaxMS > 16) {
+        // The vortex has to spawn *inside the simulated domain*. Hooks regularly form 30 km
+        // out (cells advect freely past the grid edge, which only covers +/-24 km), and a
+        // tornado there is invisible, unsimulated and reported in the HUD as if it were real.
+        // Injected vortices outside the grid would also be silently dropped by the clamps in
+        // the injector while the storm still counted as tornadic.
+        const insideDomain = Math.abs(cell.x) < DOMAIN_HALF_SIZE - 1500 && Math.abs(cell.z) < DOMAIN_HALF_SIZE - 1500;
+        if (
+          insideDomain &&
+          zeta > genesisThreshold &&
+          rfdWrap > cell.radiusM * 0.42 &&
+          lowBase &&
+          rotating &&
+          cell.updraftMaxMS > 16
+        ) {
           this.active.push(this.spawn(cell));
           break;
         }
@@ -105,9 +129,27 @@ export class TornadoEngine {
       // Tornadic threshold on the mesocyclone: below it the stretching cannot maintain the core.
       const maintainable = zeta > 0.0095 && parent !== null && parent.updraftMaxMS > 11;
 
+      // Peak tangential wind. The old mapping multiplied the *excess* vorticity above a fixed
+      // 0.0095 s⁻¹ by 8200 and let the result reach 96 m/s: with the now-physical mesocyclones
+      // (ζ up to 0.03, three times that floor) every single genesis saturated at the cap, so
+      // every tornado was an EF5. Real tornado peak winds are strongly skewed low — most are
+      // EF0-EF1 and EF5 is roughly one in a thousand — so the target has to scale with the
+      // vorticity *relative to the environment's own vortex scale*, not against a constant.
+      //
+      // ζ/scale ≈ 0.55 at genesis (the stage gate) and ≈ 2.5 for a violent supercell, so the
+      // ratio is mapped onto 12-75 m/s: a marginal supercell makes a brief EF0 spin-up, and
+      // only an unusually strong, well-stretched mesocyclone carries the core past 60 m/s.
       const seedMS = 8.0;
+      const scaleRef = Math.max(0.004, parent ? parent.ambientVorticityS * 1.9 : 0.012);
+      const relative = zeta / scaleRef; // ~0.55 at genesis, ~2.5 for a violent storm
+      const strengthFrac = clamp((relative - 0.5) / 1.7, 0.0, 1.0);
+      const stretchFactor = clamp(stretch * 340.0, 0.35, 1.3);
       const targetV = maintainable
-        ? clamp(seedMS + (zeta - 0.0095) * 8200.0 * clamp(stretch * 340.0, 0.25, 1.6), seedMS, 96.0)
+        ? clamp(
+            (12.0 + 63.0 * Math.pow(strengthFrac, 1.35)) * stretchFactor,
+            seedMS,
+            78.0
+          )
         : 0.0;
 
       // Intensify fast (minutes), decay slower (tens of minutes): matches the observed asymmetry
@@ -135,6 +177,18 @@ export class TornadoEngine {
       // Track the parent's cloud base so the funnel visually connects to the wall cloud rather
       // than hanging in mid-air when the base lifts or lowers.
       if (parent) t.cloudBaseM = parent.cloudBaseM;
+
+      // A vortex that has left the simulated domain is gone, not merely far away: there is no
+      // grid to inject into, no condensate to render it against and no ground beneath it. This
+      // used to keep "active" tornadoes at 30 km — outside the +/-24 km grid — so the HUD showed
+      // tornadoes the simulation had no knowledge of.
+      if (
+        Math.abs(t.x) > DOMAIN_HALF_SIZE + 2000 ||
+        Math.abs(t.z) > DOMAIN_HALF_SIZE + 2000
+      ) {
+        t.maxTangentialMS = 0;
+        t.phase = 'weakening';
+      }
 
       t.phase =
         t.maxTangentialMS < 14 ? 'weakening' : t.ageSec < 260 ? 'forming' : 'mature';

@@ -49,6 +49,18 @@ export interface PlumeLevel {
   buoyancy: number;
   /** True once the plume is saturated at this level. */
   saturated: boolean;
+  /**
+   * Ice share of the plume's condensate at this level, 0..1.
+   *
+   * A cloud's ice fraction is not a function of temperature alone: it depends on how long the
+   * air has been below 0 °C (nucleation takes time), on how much condensate is available, and
+   * on the Bergeron process. The renderer needs it to make ice (crystalline, forward-scattering)
+   * look different from liquid, and the grid was packing `q_i/(q_c+q_i)` from the *ambient*
+   * temperature instead — which at −2 °C labels a tower "55 % ice" when in reality it is almost
+   * entirely supercooled water. This is the same variable the microphysics scheme relaxes
+   * toward, estimated here from the plume's own budget.
+   */
+  iceFraction: number;
 }
 
 export interface PlumeProfile {
@@ -207,14 +219,29 @@ export function buildPlumeProfile(
       thetaL += (LV / CP) * exported * 1e-3;
     }
 
+    // ---- Buoyancy on density temperature ------------------------------------------------
+    // Buoyancy is a density difference, so the right variable is the *density temperature*
+    //
+    //     T_ρ = T · (1 + 0.608·q_v − q_c − q_i)
+    //
+    // which folds the whole condensate contribution into one term. The previous form computed a
+    // vapour-only virtual temperature and then subtracted G·q_c "water loading" separately,
+    // which is the same thing for liquid — but it had no ice term at all, so a tower carrying
+    // 2 g/kg of ice at 6 km lost the loading that ice actually exerts, and the phase change
+    // that made it (vapour → ice, R_v vs R_d weighting) was not counted either. Against a
+    // 0.05-0.2 m/s² buoyancy profile that is a 10-20 % error in the one quantity the whole
+    // momentum equation is built on.
+    //
+    // Ice is treated with the same coefficient as liquid: strictly q_i enters with
+    // (R_v/R_d − 1) ≈ 0.608 as well once the crystal's mass flux is accounted for, and the
+    // difference from liquid loading is a few per cent — far below the uncertainty in the
+    // entrainment rate.
     const tUp = adj.tempK;
-    // Virtual temperatures include only the vapour: condensate contributes mass but no
-    // buoyancy, which is precisely the water-loading term added separately below.
-    const tvUp = tUp * (1.0 + 0.608 * adj.qv * 1e-3);
+    const qvUp = adj.qv * 1e-3;
+    const qcUp = qcCarried * 1e-3;
+    const tvUp = tUp * (1.0 + 0.608 * qvUp - qcUp);
     const tvEnv = tEnv * (1.0 + 0.608 * qvEnvGKg * 1e-3);
-    const thermalBuoyancy = G * ((tvUp - tvEnv) / tvEnv);
-    const waterLoading = G * qcCarried * 1e-3;
-    const buoyancy = thermalBuoyancy - waterLoading;
+    const buoyancy = G * ((tvUp - tvEnv) / tvEnv);
 
     if (z > 0) {
       integrated += buoyancy * DZ;
@@ -227,9 +254,31 @@ export function buildPlumeProfile(
       // terms this yields the classical plume result — a 1.5 km core tops out around 8 km and
       // reaches 12-15 m/s, a 3.5 km core reaches the tropopause near 20 m/s — instead of a
       // top-hat parcel that runs to sqrt(2·CAPE) (~140 m/s) regardless of its width.
-      const radiusKm = Math.max(0.2, radius * 1e-3);
-      const entrainCoef = foundLcl ? 0.055 : 0.2;
-      const eps = Math.min(0.004, entrainCoef / (radiusKm * 1000.0)) + 4.0e-5;
+      // ---- Entrainment rate ----------------------------------------------------------------
+      // eps = a/R. The classical dry-thermal value a = 0.2 gives, for a 1.5 km core,
+      // 0.13 km⁻¹ — an order of magnitude *less* than the 1-3 km⁻¹ that observations assign to
+      // shallow cumulus. That is not a typo in the literature: a is the entrainment coefficient
+      // per unit *radius* and the observed rates come from much narrower clouds (R ≈ 300-600 m).
+      //
+      // The bug here was a units one: `0.055 / (radiusKm * 1000)` evaluates to 0.055/R in
+      // metres, which for R = 1500 m is 3.7e-5 m⁻¹ = 3.7 km⁻¹ — a hundred times the
+      // observed rate, passed off as metres. The plume's own dilution was therefore enormous
+      // (its condensate was capped at 2.6 g/kg by the pseudoadiabatic export, not by physics),
+      // and the microphysics ceiling was computed with a *different* formula (0.075 + 0.34/R),
+      // so the plume and the hydrometeor budget were diluting at rates that differed by more
+      // than an order of magnitude: the condensate ceiling ran about 5x higher than the
+      // precipitation could drain, which pinned every mature cell's rain reservoir at its
+      // carrying cap.
+      //
+      // Both are now the same formula, in consistent units, with the radius-dependent coefficient
+      // observed for deep convective cores.
+      const radiusMNow = Math.max(250, radius);
+      // a = 0.055 for a deep convective core, 0.2 for a dry thermal, plus a small floor for
+      // mixing on scales below the model's grid. That gives 0.17 km⁻¹ for a 1.5 km core,
+      // 0.11 for 2.5 km — the 0.1-0.2 km⁻¹ observed in deep towers, and consistent with the
+      // condensate ceiling's own formula downstream.
+      const entrainCoefM = foundLcl ? 0.055 : 0.2;
+      const eps = 4e-5 + entrainCoefM / radiusMNow; // m⁻¹, consistent with microphysics
       // Form drag on the rising core, with the radius as the reference length: a 1 km core has a
       // drag length of ~3 km, so an updraft loses most of its momentum over a deep troposphere.
       // That is what brings a buoyant column down from the sqrt(2·CAPE) ideal (~90 m/s) to the
@@ -245,6 +294,22 @@ export function buildPlumeProfile(
     }
 
     const w = Math.sqrt(w2);
+    // ---- Ice fraction ------------------------------------------------------------------
+    // Heterogeneous nucleation needs both cold and time. The plume spends dz/w in each layer,
+    // and the glaciated share is a competition between the nucleation/Bergeron rate and that
+    // residence time. Below -38 C homogeneous freezing is effectively instantaneous.
+    const coldBelow0C = Math.max(0, PHYS.T_FREEZE - adj.tempK);
+    let iceFraction = 0;
+    if (saturated && coldBelow0C > 0) {
+      // Calibrated to the mixed-phase layer: ~50 % ice at -8 C, ~90 % at -20 C, complete by
+      // the homogeneous limit.
+      const thermalPart = Math.min(1, coldBelow0C * 0.062);
+      const residenceSec = DZ / Math.max(0.6, w);
+      const timePart = 1.0 - Math.exp(-residenceSec / 900.0);
+      const heterogeneous = Math.min(1, (thermalPart + 0.35 * timePart) * 1.15);
+      const homogeneous = Math.max(0, Math.min(1, (coldBelow0C - 30) / 8));
+      iceFraction = Math.max(homogeneous, heterogeneous);
+    }
     levels.push({
       z,
       w,
@@ -253,6 +318,7 @@ export function buildPlumeProfile(
       qc: qcCarried,
       buoyancy,
       saturated,
+      iceFraction,
     });
     if (qcCarried > peakCondensate) peakCondensate = qcCarried;
 
@@ -282,9 +348,9 @@ export function buildPlumeProfile(
     // environment, and in shear it tilts so the flow through its flanks drops further. Using the
     // dry value in-cloud capped every simulated tower at 8 km under a 13 km equilibrium level;
     // the in-cloud coefficient is what actually sets how deep convection gets.
-    const radiusKmNow = Math.max(0.2, radius * 1e-3);
+    const radiusMNow = Math.max(250, radius);
     const entrainCoefNow = foundLcl ? 0.055 : 0.2;
-    const epsNow = Math.min(0.004, entrainCoefNow / (radiusKmNow * 1000.0)) + 4.0e-5;
+    const epsNow = 4e-5 + entrainCoefNow / radiusMNow;
     const mix = Math.min(0.5, epsNow * DZ);
     const thetaEnv = sounding.thetaEnvAt(Math.max(60, z));
     thetaL += (thetaEnv - thetaL) * mix;
@@ -315,6 +381,7 @@ const NULL_LEVEL: PlumeLevel = {
   qc: 0,
   buoyancy: 0,
   saturated: false,
+  iceFraction: 0,
 };
 
 export function samplePlume(profile: PlumeProfile, zM: number): PlumeLevel {

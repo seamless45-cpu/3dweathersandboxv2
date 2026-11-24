@@ -121,13 +121,21 @@ export function stepCellMicrophysics(
     const rhMid = clamp(sounding.relativeHumidityAt(Math.max(120, baseZ)), 0.05, 1.0);
     const evapRate = 0.010 + 0.085 * (1.0 - rhMid); // 1/s
     const evapFrac = 1.0 - Math.exp(-evapRate * stepDt);
+    // Each reservoir is drained by its own fraction of the *combined* ice mass, and the split
+    // is taken in proportion to what is actually there. Scaling cloud ice by the total
+    // (ice + snow) removed more ice than the reservoir held and drove it negative while snow
+    // absorbed the whole loss.
+    const iceTotal = cell.cloudIceGKg + cell.snowGKg;
+    const goneIce = iceTotal > 1e-9 ? iceTotal * evapFrac : 0;
+    const iceShare = iceTotal > 1e-9 ? cell.cloudIceGKg / iceTotal : 0;
+    const goneCloudIce = goneIce * iceShare;
+    const goneSnow = goneIce * (1.0 - iceShare);
     const goneCloud = cell.cloudWaterGKg * evapFrac;
     const goneSlw = cell.supercooledWaterGKg * evapFrac;
-    const goneIce = (cell.cloudIceGKg + cell.snowGKg) * evapFrac;
-    cell.cloudWaterGKg -= goneCloud;
-    cell.supercooledWaterGKg -= goneSlw;
-    cell.cloudIceGKg -= goneIce;
-    cell.snowGKg -= cell.snowGKg * evapFrac;
+    cell.cloudWaterGKg = Math.max(0, cell.cloudWaterGKg - goneCloud);
+    cell.supercooledWaterGKg = Math.max(0, cell.supercooledWaterGKg - goneSlw);
+    cell.cloudIceGKg = Math.max(0, cell.cloudIceGKg - goneCloudIce);
+    cell.snowGKg = Math.max(0, cell.snowGKg - goneSnow);
 
     const rhoLow = Math.max(0.2, sounding.densityAt(Math.max(60, baseZ * 0.4)));
     const vRain = terminalFallSpeedRainMS(cell.rainGKg, rhoLow);
@@ -167,16 +175,37 @@ export function stepCellMicrophysics(
   // ---------------- 1. Entrainment, dilution ceiling and column residence time ----------------
   // Observed lateral entrainment: ~1-3 km^-1 for shallow cumulus, 0.1-0.5 km^-1 for the
   // cores of deep convective towers. eps ~ 0.1 + 0.62/R captures that radius dependence.
+  // Must match the plume's own entrainment law, or the two models disagree about how much
+  // condensate the column can hold. eps = a/R + floor, with a = 0.055 for a convective core,
+  // is 0.11 km⁻¹ at R = 2 km and 0.2 at 500 m — the range observed in deep towers. The old
+  // form (0.075 + 0.34/R) is a *shallow cumulus* law and diluted a 3 km core at 0.19 km⁻¹
+  // against the plume's 0.04, which let the microphysical ceiling sit ~5x above what the
+  // precipitation could drain.
   const radiusKm = Math.max(0.22, cell.radiusM * 1e-3);
-  const epsKmInv = clamp(0.075 + 0.34 / radiusKm, 0.09, 1.6);
+  const epsKmInv = clamp(0.04 + 0.055 / radiusKm, 0.06, 1.2);
   cell.entrainmentRate = epsKmInv;
 
   const supplyTopZ = Math.max(topZ, Math.min(supplyTopM ?? topZ, sounding.levels[sounding.levels.length - 1].z));
   // Transit time through the *supplying* depth, which is what sets how fast the condensate
   // reservoirs fill. Bounded so a stalled cell still relaxes and a fast one does not overshoot.
   const supplyDepth = Math.max(300, supplyTopZ - baseZ);
-  const tauResidence = clamp(supplyDepth / Math.max(1.2, w), 90, 2400); // s, base -> top transit
-  const relax = 1.0 - Math.exp(-stepDt / tauResidence);
+  // Transit time is ∫dz/w, not (depth / w_at_top). The updraft is *slowest* near cloud base —
+  // 2-4 m/s just above the LFC — and accelerates to 20-30 m/s at mid levels, so the layer-mean
+  // speed is roughly a third of the peak. Using the top speed made the reservoir fill 2-3x too
+  // fast: the condensate ceiling was reached in ~150 s instead of the 6-8 minutes a real
+  // updraft takes to process that depth, which left every mature cell with a rain reservoir
+  // three times what its own sedimentation could drain.
+  const meanUpdraftMS = Math.max(1.2, 0.42 * w);
+  const tauResidence = clamp(supplyDepth / meanUpdraftMS, 120, 2400); // s, base -> top transit
+  // A convective column does not retain all the condensate it produces: precipitation
+  // efficiency (the fraction of the condensate that reaches the ground rather than being
+  // re-evaporated by entrained dry air) is 0.4-0.6 in a typical mid-latitude thunderstorm, and
+  // only the retained part belongs in the *suspended* reservoirs. Without this factor
+  // `qCeiling` is an adiabatic-with-dilution integral, i.e. the mass condensed, not the mass
+  // held, and the rain reservoir equilibrates at ~4 g/kg against a 5.2 g/kg cap: every mature
+  // cell sat pinned near the ceiling and read 140-160 mm/h regardless of its actual supply.
+  const precipEfficiency = clamp(0.30 + 0.5 * (1.0 - Math.exp(-w / 14.0)), 0.32, 0.72);
+  const relax = (1.0 - Math.exp(-stepDt / tauResidence)) * precipEfficiency;
 
   // Strict physical ceiling: the adiabatic condensate a saturated parcel produces over the
   // cloud depth. Entrainment dilutes a *parcel* along the path it actually travels, and the
@@ -193,6 +222,12 @@ export function stepCellMicrophysics(
   const condensateEfficiency = qAdiabaticGKg > 1e-6 ? clamp(qCeilingGKg / qAdiabaticGKg, 0.02, 1.0) : 1.0;
 
   // ---------------- 2. Phase partition, weighted by where condensate is actually produced ----
+  // The layer that matters is the one the *supply* came from, not the visible tower: `qCeiling`
+  // is an integral from cloud base to the plume's top, so partitioning it by the phase
+  // distribution over the (lagging, therefore shorter) visible tower mixed two different depths.
+  // On a 9 km cell whose top sat at the freezing level that put ~100 % of a 9 g/kg ceiling into
+  // warm cloud water, which the rain reservoir's 5.2 g/kg cap could not drain and which therefore
+  // saturated every mature cell at the cap.
   const SAMPLES = 6;
   let weightSum = 0;
   let warmWeight = 0;
@@ -200,7 +235,7 @@ export function stepCellMicrophysics(
   let glaciatedWeight = 0;
   let iceWeightInMixed = 0;
   for (let k = 0; k < SAMPLES; k++) {
-    const z = baseZ + (depth * (k + 0.5)) / SAMPLES;
+    const z = baseZ + (supplyDepth * (k + 0.5)) / SAMPLES;
     const production = sounding.condGKgPerKmAt(z);
     if (production <= 1e-9) continue;
     const tempC = sounding.tempCAt(z);
@@ -375,7 +410,7 @@ export function stepCellMicrophysics(
   if (rhIceMid < 0.93 && topZ > freezeZ) {
     const kSub = 2.4e-4 * (1.0 - rhIceMid) * 6.0;
     const dSub = Math.min(cell.cloudIceGKg * 0.4, cell.cloudIceGKg * (1.0 - Math.exp(-kSub * stepDt)));
-    cell.cloudIceGKg -= dSub;
+    cell.cloudIceGKg = Math.max(0, cell.cloudIceGKg - dSub);
     latentJPerKg -= dSub * 1e-3 * PHYS.L_S;
     cell.cumEvaporatedGKg += dSub;
   }
@@ -389,9 +424,17 @@ export function stepCellMicrophysics(
   const vGraupel = terminalFallSpeedGraupelMS(cell.graupelGKg, rhoMid);
   const vHail = terminalFallSpeedHailMS(cell.hailGKg, rhoMid);
 
-  // Mean height each category starts its descent from (sets both the fallout time scale and
-  // how much of the fall path lies below the 0 °C isotherm).
-  const hRain = Math.max(800, baseZ + depth * 0.42);
+  // Fall path length for each category: the distance from where it is *held* to the ground,
+  // which is what sets both the fallout time scale and how much of the path lies below the
+  // 0 °C isotherm.
+  //
+  // For rain this is the whole column, not the depth of some mid-level reservoir. Rain is
+  // produced aloft and leaves the cell at cloud base; treating it as a well-mixed layer whose
+  // bottom sits at 0.42·depth meant a 4 km tower with 4.5 g/kg of rain drained at
+  // v/h ≈ 1.7e-3 s⁻¹ — a 10-minute residence time — so the reservoir saturated against its
+  // carrying ceiling and stayed there. The shaft then read 5.2 g/kg (the ceiling) with a
+  // surface rate that bore no relation to the mass actually in the column.
+  const hRain = Math.max(900, baseZ + depth * 0.55);
   const hSnow = Math.max(800, 0.5 * (Math.max(baseZ, freezeZ) + Math.min(topZ, Math.max(baseZ, freezeZ) + 3200)));
   const hGraupel = Math.max(1000, Math.min(topZ - 300, freezeZ + 900));
   const hHail = Math.max(1200, Math.min(topZ - 300, freezeZ + 1400));
@@ -419,6 +462,23 @@ export function stepCellMicrophysics(
     rho * (dqGKg * 1e-3) * hM * invDt; // kg m^-2 s^-1
 
   const fluxRain = columnMassFlux(fallRain, hRain, rhoSurface);
+  // The carrying cap has to hold for *every* source, not only for autoconversion: the ice
+  // categories drain into rain via melting in step 9, and a heavy melting shaft can push the
+  // reservoir past the ceiling on its own.
+  //
+  // The overflow is *precipitated out*, not recycled. Returning it to cloud water (the obvious
+  // move, since cloud water is the rain reservoir's parent) closes the water budget but creates
+  // a positive feedback: the cloud water then re-autoconverts into rain on the next step, which
+  // overflows again, and the cell settles with cloud water and rain both pinned at their
+  // ceilings — which is exactly the 5.199 g/kg every mature cell was reporting.
+  //
+  // Physically the truncation represents drops large enough that collection outruns supply, and
+  // those drops fall out. So the excess is counted as fallout and leaves the column.
+  let rainOverflowGKg = 0;
+  if (cell.rainGKg > RAIN_MAX_GKG) {
+    rainOverflowGKg = cell.rainGKg - RAIN_MAX_GKG;
+    cell.rainGKg = RAIN_MAX_GKG;
+  }
   const fluxSnow = columnMassFlux(fallSnow, hSnow, rhoSurface);
   const fluxGraupel = columnMassFlux(fallGraupel, hGraupel, rhoSurface);
   const fluxHail = columnMassFlux(fallHail, hHail, rhoSurface);
@@ -474,8 +534,9 @@ export function stepCellMicrophysics(
   // step. That mass either reaches the surface or evaporates below cloud base; splitting it
   // by the evaporated *fraction of the liquid flux* keeps the two terms exactly complementary
   // so cumCondensed == inventory + cumFallout + cumEvaporated to round-off.
-  const drainedGKg = fallRain + fallSnow + fallGraupel + fallHail;
-  const liquidDrainedGKg = fallRain + fallSnow * meltSnow + fallGraupel * meltGraupel + fallHail * meltHail;
+  const drainedGKg = fallRain + fallSnow + fallGraupel + fallHail + rainOverflowGKg;
+  const liquidDrainedGKg =
+    fallRain + rainOverflowGKg + fallSnow * meltSnow + fallGraupel * meltGraupel + fallHail * meltHail;
   const evaporatedGKg = drainedGKg > 1e-12 ? liquidDrainedGKg * evapFraction : 0;
   cell.cumFalloutGKg += drainedGKg - evaporatedGKg;
   cell.cumEvaporatedGKg += evaporatedGKg + grossDilutionEvapGKg;

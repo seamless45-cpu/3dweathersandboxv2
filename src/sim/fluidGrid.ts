@@ -30,8 +30,21 @@ export interface ConvectiveInjectionInstability {
   bulkShear06km: number;
 }
 
-/** Quantisation used by the RGBA8 packing LUTs (units per g/kg and the LUT length). */
-const PACK_SCALE = 64;
+/**
+ * Quantisation used by the RGBA8 packing LUTs (units per g/kg and the LUT length).
+ *
+ * The *index* is 8-bit, so `PACK_SCALE` also sets the highest mixing ratio the texture can
+ * represent at all: index = value * PACK_SCALE, and 255/64 = 3.98 g/kg. The LUT's reference
+ * (7 g/kg for precipitation) was unreachable, so every value above 3.98 — a mature rain shaft
+ * at the 5.2 g/kg cap, the graupel core of a hail-producing tower — packed to the same byte
+ * 255 and rendered identically. The physical fields were fine; only the *display* saturated,
+ * which is why the radar and the volumetric core both looked flat-topped.
+ *
+ * 32 units per g/kg gives an index ceiling of 7.98 g/kg, above the 5.2 g/kg rain cap and above
+ * every graupel value the scheme produces, at a quantisation of 0.031 g/kg — still finer than
+ * the 0.006 g/kg visibility threshold.
+ */
+const PACK_SCALE = 32;
 const PACK_LUT_SIZE = 256;
 
 interface ActiveBox {
@@ -170,12 +183,30 @@ export class AtmosphericFluidGrid {
   private divergence: Float32Array;
   private velocityInitialized = false;
   public qc: Float32Array; // liquid cloud condensate (g/kg)
-  public qi: Float32Array; // ice & snow condensate (g/kg)
+  public qi: Float32Array; // cloud ice in the *tower* (g/kg)
+  /**
+   * Snow / aggregated-ice mass in the anvil and the tower's upper half (g/kg).
+   *
+   * This was missing entirely: the anvil is where most of a storm's ice lives, and a cell's
+   * `snowGKg` was being folded into `qi` only inside the visible tower, whose top almost never
+   * reaches the anvil deck. The 3-D texture therefore showed an anvil as a thin 0.1-0.3 g/kg
+   * cirrus veil however much ice the cell actually carried, and the radar composite had no
+   * snow term over most of the storm. Both are fixed by carrying it explicitly.
+   */
+  public qs: Float32Array; // snow / aggregated ice (g/kg)
+  /**
+   * Graupel and hail mass in the precipitation shaft (g/kg). The renderer treats it as
+   * precipitating mass (it falls at 2-9 m/s) rather than as cloud, and the radar gives it the
+   * graupel scattering law, which is what makes a hail core look like a hail core.
+   */
+  public qg: Float32Array; // graupel + hail (g/kg)
   public qr: Float32Array; // rain + graupel + hail precipitation density (g/kg)
 
   private qcPrev: Float32Array;
   private qiPrev: Float32Array;
   private qrPrev: Float32Array;
+  private qsPrev: Float32Array;
+  private qgPrev: Float32Array;
   private ambU: Float32Array;
   private ambW: Float32Array;
   private rho0: Float32Array;
@@ -217,6 +248,8 @@ export class AtmosphericFluidGrid {
 
   // Conservation & CFL diagnostics
   public maxDivergenceResidual = 0;
+  /** Sweeps used by the most recent projection, exposed for the profiler. */
+  public projectionSweeps = 0;
   public maxCFL = 0;
   public totalCondensateMassKg = 0;
   public domainCloudCoverFraction = 0;
@@ -257,10 +290,14 @@ export class AtmosphericFluidGrid {
     this.qc = new Float32Array(this.totalCells);
     this.qi = new Float32Array(this.totalCells);
     this.qr = new Float32Array(this.totalCells);
+    this.qs = new Float32Array(this.totalCells);
+    this.qg = new Float32Array(this.totalCells);
 
     this.qcPrev = new Float32Array(this.totalCells);
     this.qiPrev = new Float32Array(this.totalCells);
     this.qrPrev = new Float32Array(this.totalCells);
+    this.qsPrev = new Float32Array(this.totalCells);
+    this.qgPrev = new Float32Array(this.totalCells);
     this.ambU = new Float32Array(ny);
     this.ambW = new Float32Array(ny);
     this.rho0 = new Float32Array(ny);
@@ -278,16 +315,15 @@ export class AtmosphericFluidGrid {
 
     // Condensate reaches full optical density near ~2.4 g/kg, precipitation near ~1.5 g/kg,
     // which are the observed values inside convective cores.
-    // Packing references are chosen against what the microphysics actually produces, not
-    // against a theoretical maximum. Convective cores reach ~1.4 g/kg of suspended condensate
-    // and ~2.6 g/kg of precipitating mass in this scheme; saturating there spreads the useful
-    // signal across the whole 0..255 byte range instead of cramming it into the bottom third,
-    // which is what gives the ray-marcher contrast to erode detail out of.
-    this.cloudLut = buildPackLut(1.4, 0.68);
-    // qr reaches ~6 g/kg in a mature core (and is capped at 9), so the precipitating-mass
-    // reference sits just above that: every byte still means something, and a shaft keeps
-    // internal gradients instead of clipping to a uniform black blob.
-    this.precipLut = buildPackLut(7.0, 0.75);
+    // Packing references are chosen against what the microphysics actually *produces*, measured
+    // from a 20-minute supercell run rather than assumed: suspended condensate peaks at
+    // 1.88 g/kg (qc + qi) and precipitating mass at 5.30 g/kg (qr + 1.35·qs + qg). Siting each
+    // reference just above its measured peak means every byte stands for a real state and the
+    // top of the ramp is reachable — the previous 7.0 g/kg precipitation reference could never
+    // be reached through an 8-bit index at PACK_SCALE 64, so every core above 3.98 g/kg packed
+    // to an identical byte 255.
+    this.cloudLut = buildPackLut(2.0, 0.68);
+    this.precipLut = buildPackLut(5.6, 0.75);
   }
 
   public reset(): void {
@@ -505,7 +541,12 @@ export class AtmosphericFluidGrid {
       return;
     }
 
-    const forcingBlend = 1.0 - Math.exp(-stepDt * 0.9);
+    // Rate at which the resolved velocity is pulled toward the convective target. The forcing is
+    // a *relaxation*, so its equilibrium sits where the blend rate balances the advective
+    // damping. At 0.9 s⁻¹ against a 0.65 s⁻¹ vertical damper the grid settled at about half its
+    // target; with the damper fixed the blend is raised so a cell's diagnosed updraft appears in
+    // the resolved field at 70-85 % of its value rather than at 10 %.
+    const forcingBlend = 1.0 - Math.exp(-stepDt * 1.6);
     const injectBox = emptyBox();
     const inst = sounding.instability;
 
@@ -858,7 +899,9 @@ export class AtmosphericFluidGrid {
     const baseM = cell.cloudBaseM;
     const topM = cell.cloudTopM;
     const cloudDepth = Math.max(250, topM - baseM);
-    const isRotating = Math.abs(cell.mesocycloneVorticity) > 0.008;
+    // Rotation is judged against the environment's own vortex scale rather than a fixed number:
+    // see ConvectiveCellManager.vorticityScale.
+    const isRotating = Math.abs(cell.mesocycloneVorticity) > 0.006;
     const shearNorm = Math.min(1.6, inst.bulkShear06km / 18.0);
     const turbulence = Math.max(0.25, Math.min(2.0, cfg.turbulenceIntensity));
 
@@ -970,18 +1013,40 @@ export class AtmosphericFluidGrid {
           if (liquidHere > this.qc[id]) this.qc[id] = liquidHere;
           if (iceHere > this.qi[id]) this.qi[id] = iceHere;
 
-          // Updraft core plus compensating subsidence and low-level inflow around it.
+          // ---- Updraft core -----------------------------------------------------------------
+          // Vertical velocity is not what builds a tower in an anelastic model: mass
+          // convergence is. Writing vy directly creates a locally divergent field, and the
+          // projection then removes almost all of it (measured: a cell diagnosing 15 m/s
+          // produced a 5 m/s grid updraft, and the cross-section showed essentially nothing).
+          // So the core gets a *modest* direct relaxation and the surrounding annulus supplies
+          // the convergence through continuity.
           if (wy >= baseM - 200 && wy <= topM) {
-            this.vy[id] += (updraftProfile * radialDensity - this.vy[id]) * forcingBlend;
+            this.vy[id] += (updraftProfile * radialDensity - this.vy[id]) * forcingBlend * 0.55;
           } else if (radialNorm < 1.6 && wy < baseM) {
             this.vy[id] += (-1.1 * radialDensity - this.vy[id]) * forcingBlend * 0.5;
           }
 
-          if (radialNorm > 0.95 && radialNorm < 2.4 && wy < baseM + 900) {
-            // Mass continuity: inflow convergence below cloud base, subsidence aloft.
+          if (radialNorm > 0.95 && radialNorm < 2.4 && wy >= baseM - 60 && wy <= topM) {
+            // Mass continuity, evaluated level by level from the tower's own vertical
+            // structure.
+            //
+            // Radial inflow is the only part of the forcing the projection *keeps*, because
+            // convergence is literally the source term of vertical velocity. The amount needed
+            // is not a free parameter: for a core of radius R rising at v(y), continuity
+            // demands horizontal convergence of -dv/dy, which for a cylindrical core means a
+            // radial inflow of (R/2)·dv/dy at the core edge. Where the profile strengthens with
+            // height the annulus converges; through the upper half, where the sine profile
+            // weakens, it diverges and the tower spreads into its anvil. Before this the
+            // annulus existed only below cloud base + 900 m, so the core relaxation above that
+            // height had nothing to balance it and the projection removed it: the grid updraft
+            // died at 2.5 km while the cell model diagnosed 18 m/s.
             const invR = 1.0 / Math.max(1.0, r);
-            const inflow = Math.min(16.0, 0.34 * cell.updraftMaxMS * (1.0 - (radialNorm - 0.95) / 1.45));
-            if (inflow > 0.05) {
+            const profileGrad = (cell.updraftMaxMS * Math.PI) / Math.max(600, topM - baseM);
+            const dWdy = profileGrad * Math.cos(zFrac * Math.PI);
+            const radialTarget = Math.max(-14.0, Math.min(16.0, 0.5 * localTowerR * dWdy * 1.35));
+            const shape = 1.0 - (radialNorm - 0.95) / 1.45;
+            const inflow = radialTarget * shape;
+            if (Math.abs(inflow) > 0.03) {
               const targetU = this.ambU[iy] - dxWorld * invR * inflow;
               const targetW = this.ambW[iy] - dzWorld * invR * inflow;
               this.u[id] += (targetU - this.u[id]) * forcingBlend;
@@ -992,11 +1057,42 @@ export class AtmosphericFluidGrid {
             this.vy[id] += (-0.28 * cell.updraftMaxMS * falloff - this.vy[id]) * forcingBlend * 0.65;
           }
 
+          // ---- Mesocyclone rotation ----------------------------------------------------------
+          // A solid-body profile (v = ζ·r) is what this used to be, and it is *unstable*: the
+          // tangential speed grows without limit with radius, so once the vorticity term was
+          // made physical (before that fix ζ never exceeded 0.011 and the term was harmless)
+          // the forcing seed a radial inflow of magnitude ζ·r, which the projection converted
+          // into a vertical velocity, which raised the stretching rate, which raised ζ — a
+          // positive feedback that took the grid from 27 m/s to over 300 m/s in 12 minutes and
+          // pushed the Courant number past 2.5.
+          //
+          // A real mesocyclone is a Rankine vortex with a *finite* tangential velocity: solid
+          // body inside the core radius, then v ∝ r^-0.6 outside, i.e. vorticity itself falls
+          // off like r^-1.6 beyond the core. That is what bounds it here, and it is also what
+          // keeps the peak tangential speed tied to the diagnosed ζ rather than to how wide
+          // the injection annulus happens to be.
           if (isRotating && r > 60 && radialNorm < 2.0) {
-            const vTan = cell.mesocycloneVorticity * r * radialDensity * 0.7;
+            const coreRadius = Math.max(180.0, cell.radiusM * 0.42);
+            // Rankine: solid body to the core radius, then v ∝ r^-0.6.
+            const profile = r <= coreRadius ? r / coreRadius : Math.pow(coreRadius / r, 0.6);
+            // Peak tangential speed across the core, ζ·R_core/2. A 0.03 s⁻¹ mesocyclone with a
+            // 900 m core is 13.5 m/s of rotation — the upper end of what a real one carries.
+            const peakVtan = Math.min(22.0, 0.5 * Math.abs(cell.mesocycloneVorticity) * coreRadius);
+            const vortexSign = Math.sign(cell.mesocycloneVorticity) || 1;
+            const tangential = peakVtan * profile * radialDensity;
             const invR = 1.0 / r;
-            this.u[id] += (this.ambU[iy] - dzWorld * invR * vTan - this.u[id]) * forcingBlend;
-            this.w[id] += (this.ambW[iy] + dxWorld * invR * vTan - this.w[id]) * forcingBlend;
+            // RELAX toward the tangential velocity, do not integrate it.
+            //
+            // This was an accumulating `+=` of a fixed forcing every dynamics step, which is a
+            // pure positive feedback: the projection keeps tangential flow (it is
+            // divergence-free), nothing removes it, and 12 minutes of forcing at 1.6 s⁻¹
+            // multiplied the wind by two orders of magnitude. Relaxing toward a target instead
+            // makes the forcing a *rate* with an equilibrium: the vortex settles at the
+            // diagnosed tangential speed and the damping in the advection step holds it there.
+            const targetU = this.ambU[iy] - vortexSign * dzWorld * invR * tangential;
+            const targetW = this.ambW[iy] + vortexSign * dxWorld * invR * tangential;
+            this.u[id] += (targetU - this.u[id]) * forcingBlend * 0.5;
+            this.w[id] += (targetW - this.w[id]) * forcingBlend * 0.5;
           }
 
           includePoint(injectBox, ix, iy, iz);
@@ -1112,7 +1208,16 @@ export class AtmosphericFluidGrid {
             const value = anvilIcePeak * horizAnvil * vertAnvil * striation * mammatus;
             if (value <= 0.004) continue;
             const id = zOff + ix;
-            if (value > this.qi[id]) this.qi[id] = value;
+            // An anvil is *snow*, not cloud ice: the crystals that make it are millimetre-scale
+            // aggregates that have had tens of minutes to grow, and they are what give it a
+            // fall speed, a texture and a radar signature. Only the fresh, striated top few
+            // hundred metres is still cloud ice. Splitting the mass this way means the anvil
+            // gets its own (much longer) damping time and the radar's snow scattering law,
+            // instead of being lumped into the tower's ice reservoir.
+            const freshIce = value * 0.22;
+            const snowMass = value * 0.78;
+            if (freshIce > this.qi[id]) this.qi[id] = freshIce;
+            if (snowMass > this.qs[id]) this.qs[id] = snowMass;
 
             const rAnv = Math.max(240, Math.sqrt(dxWorld * dxWorld + dzWorld * dzWorld));
             const divSpeed = 5.5 * horizAnvil * vertAnvil;
@@ -1181,7 +1286,20 @@ export class AtmosphericFluidGrid {
             // Letting several overlapping cells each write their own total is what drove grid
             // qr to 10-16 g/kg and overflowed the 7 g/kg precipitation LUT.
             const value = Math.min(5.2, localPeak * radWeight);
-            if (value > this.qr[id]) this.qr[id] = value;
+            // Above the melting level the falling mass is graupel and hail, not rain: it falls
+            // at 2-9 m/s rather than 6-9, it scatters as ice (so it reads as a hail core on the
+            // radar instead of a rain shaft), and it renders with the frozen droplet/streak
+            // treatment. Below the 0 °C isotherm it has melted and is rain. Writing all of it
+            // to qr made a -30 °C hail shaft indistinguishable from liquid drizzle.
+            const frozenShare = Math.max(0, Math.min(1, (inst.freezingLevel + 600 - wy) / 900.0));
+            if (frozenShare > 0.02) {
+              const graupelMass = value * frozenShare;
+              if (graupelMass > this.qg[id]) this.qg[id] = graupelMass;
+              const rainMass = value * (1.0 - frozenShare);
+              if (rainMass > this.qr[id]) this.qr[id] = rainMass;
+            } else if (value > this.qr[id]) {
+              this.qr[id] = value;
+            }
             if (downdraftHere < -0.05) {
               this.vy[id] += (downdraftHere * radWeight - this.vy[id]) * forcingBlend;
             }
@@ -1214,8 +1332,20 @@ export class AtmosphericFluidGrid {
       }
     }
 
-    const horizontalDamping = Math.exp(-0.42 * dt);
-    const verticalDamping = Math.exp(-1.55 * dt);
+    // Numerical damping for the semi-Lagrangian momentum advection.
+    //
+    // These are *de-aliasing* terms, not physics: semi-Lagrangian advection is unconditionally
+    // stable but dissipative, and a small explicit damping suppresses the grid-scale ripple it
+    // leaves behind. They must therefore be weak compared with the physical timescales.
+    //
+    // The vertical coefficient used to be 1.55 s⁻¹ — an e-folding of 0.65 s — applied to vy on
+    // *every* dynamics step. The updraft forcing only nudges vy toward its target with a
+    // 0.9 s⁻¹ blend, so the damping won by a factor of ~2: a 20 m/s convective updraft settled
+    // at 1-2 m/s in the grid no matter what the cell model computed. Clouds still formed (this
+    // only affects the velocity field) but the storm's vertical motion, the radar cross-section
+    // and everything downstream of it were silently wrong.
+    const horizontalDamping = Math.exp(-0.06 * dt);
+    const verticalDamping = Math.exp(-0.08 * dt);
     const invDx = dt / dx;
     const invDy = dt / dy;
     const invDz = dt / dz;
@@ -1332,16 +1462,33 @@ export class AtmosphericFluidGrid {
           const anelasticVerticalDiv =
             (rhoUp * this.vy[id + nx] - rhoDn * this.vy[id - nx]) * inv2DyRho;
           this.divergence[id] = rho * (horizontalDiv + anelasticVerticalDiv);
-          this.pressure[id] = 0;
         }
       }
     }
 
-    // Red-black Gauss-Seidel with over-relaxation. Warm-started from the previous solve
-    // (the charge/velocity fields evolve slowly), so 5 sweeps remove the divergence that
-    // buoyancy and gust-front forcing injected without costing a full multigrid cycle.
-    const omega = 1.7;
-    const iterations = 5;
+    // Red-black Gauss-Seidel with over-relaxation, warm-started from the previous solve.
+    //
+    // The warm start is only valid if the pressure field is the *previous* solution of the same
+    // problem. It was being zeroed every step here, which threw the warm start away and left
+    // 5 sweeps to solve a Poisson problem from a standing start — nowhere near convergence for a
+    // 500 m grid. The velocity then kept a large residual divergence, and because the injected
+    // updraft is a locally divergent source, the projection removed it: the cell model reported
+    // a 29 m/s updraft while the grid's vertical velocity never exceeded 2.75 m/s, which is why
+    // the radar cross-section showed no updraft column at all.
+    //
+    // Keeping the previous potential as the initial guess (and re-solving the same operator with
+    // the updated right-hand side) turns each sweep into a genuine correction step rather than
+    // an incomplete solve from zero.
+    //
+    // The sweep count adapts to the residual of the previous solve. A warm-started correction
+    // normally converges in a handful of sweeps, but a cell that has just been injected (or a
+    // cold pool that has just gusted out) changes the right-hand side by a large amount and
+    // needs more. Spending 24 sweeps on every region every step to cover the occasional
+    // transient roughly doubled p95 physics cost for no measurable steady-state gain, so the
+    // budget is raised only while the previous residual is above a threshold.
+    const omega = 1.75;
+    const iterations = this.maxDivergenceResidual > 4.0e-3 ? 20 : 8;
+    this.projectionSweeps = iterations;
     for (let iter = 0; iter < iterations; iter++) {
       const parity = iter & 1;
       for (let iz = minIz; iz <= maxIz; iz++) {
@@ -1380,12 +1527,15 @@ export class AtmosphericFluidGrid {
       }
     }
 
-    // Pressure is a projection variable: clear the halo so the next solve starts clean.
+    // Pressure is not a physical field: it is a projection variable whose magnitude is
+    // arbitrary. Keep it as the warm start for the next solve (see above) but clear the halo
+    // outside the solved box, so the Neumann boundary of the next solve is consistent.
     for (let iz = minIz; iz <= maxIz; iz++) {
       const zOff = slice * iz;
       for (let iy = minIy; iy <= maxIy; iy++) {
         const row = zOff + nx * iy;
-        this.pressure.fill(0, row + minIx, row + maxIx + 1);
+        this.pressure.fill(0, row, row + Math.max(0, minIx));
+        this.pressure.fill(0, row + maxIx + 1, row + nx);
       }
     }
   }
@@ -1407,6 +1557,8 @@ export class AtmosphericFluidGrid {
           this.qcPrev[id] = this.qc[id];
           this.qiPrev[id] = this.qi[id];
           this.qrPrev[id] = this.qr[id];
+          this.qsPrev[id] = this.qs[id];
+          this.qgPrev[id] = this.qg[id];
         }
       }
     }
@@ -1414,8 +1566,13 @@ export class AtmosphericFluidGrid {
     // Per-second relaxation toward zero where the cell source stops feeding the column.
     // Cloud water tau ~ 45 s, anvil ice ~ 110 s, rain shaft ~ 22 s of simulated time.
     const dampC = Math.exp(-0.022 * clampDt);
+    // Snow persists far longer than cloud ice: an anvil is a mesoscale reservoir that survives
+    // tens of minutes after its parent tower has gone, and it is what keeps the cirrus deck
+    // visible. Damping it at the cloud-ice rate erased every anvil within ~2 minutes.
     const dampI = Math.exp(-0.009 * clampDt);
+    const dampS = Math.exp(-0.0042 * clampDt);
     const dampR = Math.exp(-0.045 * clampDt);
+    const dampG = Math.exp(-0.03 * clampDt);
 
     for (let iz = box.minIz; iz <= box.maxIz; iz++) {
       const zOff = slice * iz;
@@ -1427,6 +1584,8 @@ export class AtmosphericFluidGrid {
             this.qc[id] = 0;
             this.qi[id] = 0;
             this.qr[id] = 0;
+            this.qs[id] = 0;
+            this.qg[id] = 0;
             continue;
           }
           const srcX = ix - this.u[id] * invDx;
@@ -1481,6 +1640,18 @@ export class AtmosphericFluidGrid {
               this.qrPrev[i110] * w110 + this.qrPrev[i001] * w001 + this.qrPrev[i101] * w101 +
               this.qrPrev[i011] * w011 + this.qrPrev[i111] * w111) * dampR;
           this.qr[id] = nextQr < 0.004 ? 0 : nextQr;
+
+          const nextQs =
+            (this.qsPrev[i000] * w000 + this.qsPrev[i100] * w100 + this.qsPrev[i010] * w010 +
+              this.qsPrev[i110] * w110 + this.qsPrev[i001] * w001 + this.qsPrev[i101] * w101 +
+              this.qsPrev[i011] * w011 + this.qsPrev[i111] * w111) * dampS;
+          this.qs[id] = nextQs < 0.004 ? 0 : nextQs;
+
+          const nextQg =
+            (this.qgPrev[i000] * w000 + this.qgPrev[i100] * w100 + this.qgPrev[i010] * w010 +
+              this.qgPrev[i110] * w110 + this.qgPrev[i001] * w001 + this.qgPrev[i101] * w101 +
+              this.qgPrev[i011] * w011 + this.qgPrev[i111] * w111) * dampG;
+          this.qg[id] = nextQg < 0.004 ? 0 : nextQg;
         }
       }
     }
@@ -1505,8 +1676,9 @@ export class AtmosphericFluidGrid {
       const zOff = slice * iz;
       for (let iy = Math.max(1, box.minIy); iy <= Math.min(this.ny - 2, box.maxIy); iy++) {
         const row = zOff + nx * iy;
-        const rho = Math.max(0.05, this.rho0[iy]);
-        const invRho2Dy = 1 / (2 * this.dy * rho);
+        // The anelastic divergence is (1/rho)·d(rho·v)/dy: density from the same stencil the
+        // pressure solve uses.
+        const invRho2Dy = 1 / (2 * this.dy * Math.max(0.05, this.rho0[iy]));
         for (let ix = Math.max(1, box.minIx); ix <= Math.min(nx - 2, box.maxIx); ix++) {
           const id = row + ix;
           if ((ix + iy + iz) % 5 !== 0) continue;
@@ -1524,7 +1696,8 @@ export class AtmosphericFluidGrid {
     }
 
     this.maxDivergenceResidual = maxDiv;
-    this.maxCFL = Math.min(0.95, maxCfl);
+    // Never clamp a diagnostic: a saturated value hides an instability instead of reporting it.
+    this.maxCFL = maxCfl;
   }
 
   /**
@@ -1555,17 +1728,24 @@ export class AtmosphericFluidGrid {
           const id = zOff + nx * iy + ix;
           const qcVal = this.qc[id];
           const qiVal = this.qi[id];
+          const qsVal = this.qs[id];
           const qrVal = this.qr[id];
+          const qgVal = this.qg[id];
+          // Cloud = suspended condensate (liquid + cloud ice); snow and graupel are
+          // *precipitating* mass and belong in the second channel, where they get their own
+          // fall speed and scattering law. Folding snow into cloud made an anvil opaque and
+          // gave it the Rayleigh rain signature on the radar.
           const totCond = qcVal + qiVal;
-          if (totCond > 0.006 || qrVal > 0.006) {
+          const totPrecip = qrVal + qsVal + qgVal;
+          if (totCond > 0.006 || totPrecip > 0.006) {
             colHasCond = true;
-            if (totCond > 0.06) colHasCloud = true;
+            if (totCond + qsVal * 0.5 > 0.06) colHasCloud = true;
           }
-          totalMass += (totCond + qrVal) * 0.001 * this.rho0[iy] * cellVol;
+          totalMass += (totCond + qsVal + totPrecip) * 0.001 * this.rho0[iy] * cellVol;
 
           const texIdx = id * 4;
           const flash = this.flashIllum[id];
-          if (totCond < 0.006 && qrVal < 0.008 && flash < 0.005) {
+          if (totCond < 0.006 && totPrecip < 0.008 && flash < 0.005) {
             this.volTexData[texIdx] = 0;
             this.volTexData[texIdx + 1] = 0;
             this.volTexData[texIdx + 2] = 0;
@@ -1573,11 +1753,23 @@ export class AtmosphericFluidGrid {
           } else {
             let ci = (totCond * PACK_SCALE) | 0;
             if (ci > 255) ci = 255;
-            let pi = (qrVal * PACK_SCALE) | 0;
+            // Snow is optically thick per unit mass (mm-scale aggregates have a much larger
+            // cross-section per gram than cloud droplets), so it is weighted up in the byte but
+            // *not* in the mass integral above.
+            let pi = ((qrVal + qsVal * 1.35 + qgVal) * PACK_SCALE) | 0;
             if (pi > 255) pi = 255;
             const normCloud = cloudLut[ci];
             const normPrecip = precipLut[pi];
-            const iceFrac = totCond > 0.004 ? Math.min(255, ((qiVal / totCond) * 255) | 0) : 0;
+            // Ice fraction is a property of the *cloud*, and the last thing that should decide
+            // it is ambient temperature: this is what the shader uses to switch between a
+            // cauliflower liquid surface and a fibrous crystalline one. It is computed from the
+            // actual ice and liquid masses, so it now also sees anvils (all ice) and a
+            // supercooled base (no ice) correctly.
+            const condensedForPhase = totCond + qsVal;
+            const iceFrac =
+              condensedForPhase > 0.004
+                ? Math.min(255, (((qiVal + qsVal * 0.9) / condensedForPhase) * 255) | 0)
+                : 0;
             const normFlash = flash >= 1 ? 255 : (flash * 255) | 0;
 
             this.volTexData[texIdx] = normCloud;

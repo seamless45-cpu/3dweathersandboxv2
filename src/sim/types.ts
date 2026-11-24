@@ -226,6 +226,13 @@ export interface ConvectiveCell {
   entrainmentRate: number; // km^-1 lateral mixing dilution
   mesocycloneVorticity: number; // s^-1 vertical vorticity (zeta)
   rotationPhase: number; // rad integrated rotation angle of updraft inflows
+  /**
+   * Background vertical vorticity the environment supplies to this cell, s⁻¹, from the storm-
+   * relative hodograph (SRH/2 over the inflow-layer depth). The cell's own vorticity relaxes
+   * toward `vorticityStrength × this` as the updraft stretches it; a straight-line hodograph
+   * gives ~0 and the storm can never rotate no matter how strong its updraft is.
+   */
+  ambientVorticityS: number;
   splitCandidateDone: boolean; // whether cell has already undergone supercell splitting
   rightMoverBias: number; // +1 right-mover, -1 left-mover, 0 neutral
 
